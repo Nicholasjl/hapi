@@ -37,6 +37,7 @@ import { useSlashCommands } from '@/hooks/queries/useSlashCommands'
 import { useSkills } from '@/hooks/queries/useSkills'
 import { getSessionTitle } from '@/lib/sessionTitle'
 import { buildSessionReferenceText, matchSessionsForMention } from '@/lib/sessionReference'
+import { createDeferredSuggestions } from '@/lib/deferredSuggestions'
 import type { Suggestion, SuggestionRequestContext } from '@/hooks/useActiveSuggestions'
 import { useSendMessage, type SendErrorInfo } from '@/hooks/mutations/useSendMessage'
 import type { ComposerSendError } from '@/components/AssistantChat/HappyComposer'
@@ -659,6 +660,8 @@ function SessionPage() {
         return t('machine.unknown')
     }, [mentionMachineLabelsById, t])
 
+    const fileSuggestions = useMemo(() => createDeferredSuggestions(), [api, sessionId, agentType])
+
     const getAutocompleteSuggestions = useCallback(async (query: string, context: SuggestionRequestContext) => {
         if (query.startsWith('@')) {
             const search = query.slice(1)
@@ -686,13 +689,11 @@ function SessionPage() {
             })
 
             if ((agentType === 'codex' || agentType === 'copilot') && api && sessionId) {
-                // Do not let a remote file search block local session suggestions or
-                // the next query. The hook guards publication and cancels old searches.
-                void Promise.resolve().then(async () => {
-                    if (context.signal.aborted) return
+                return fileSuggestions(JSON.stringify([sessionId, agentType, search]), sessionHits, async () => {
                     const response = await api.searchSessionFiles(sessionId, search, 50, context.signal)
+                    if (!response.success) throw new Error(response.error ?? 'File search failed')
                     const fileHits: Suggestion[] = []
-                    if (response.success && response.files) {
+                    if (response.files) {
                         for (const file of response.files) {
                             // Codex App Server expects @"path"; Copilot CLI uses @path (relative preferred).
                             const mentionText = agentType === 'copilot'
@@ -706,10 +707,8 @@ function SessionPage() {
                             })
                         }
                     }
-                    context.publish([...sessionHits, ...fileHits])
-                }).catch(() => {
-                    // Session candidates remain useful when the runner is unavailable.
-                })
+                    return fileHits
+                }, context)
             }
             return sessionHits
         }
@@ -719,6 +718,7 @@ function SessionPage() {
         return await getSlashSuggestions(query)
     }, [
         agentType,
+        fileSuggestions,
         api,
         sessionId,
         allSessions,
