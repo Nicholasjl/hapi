@@ -1063,9 +1063,10 @@ describe('ApiSessionClient attachment links', () => {
             for (const [name, text] of Object.entries(files)) await writeFile(join(workspace, name), text)
             const normalized = { type: 'message', message: '[report](normalized.txt)' }
             const claude = { type: 'assistant' as const, uuid: 'assistant-file-link', message: { role: 'assistant', content: [{ type: 'text', text: '[table](claude.csv)' }] } }
+            const agy = { type: 'agy_message', content: '[document](agy.md)' }
             client.sendAgentMessage(normalized)
             client.sendClaudeSessionMessage(claude)
-            client.sendAgySessionMessage({ type: 'PLANNER_RESPONSE', content: '[document](agy.md)' })
+            client.sendAgentMessage(agy)
             expect(await client.flush({ timeoutMs: 1000 })).toBe(true)
 
             const payloads = socket.emitted.filter(entry => entry.event === 'message').map(entry => entry.args[0] as {
@@ -1073,6 +1074,7 @@ describe('ApiSessionClient attachment links', () => {
             })
             expect(payloads.some(payload => payload.message.content.data === normalized)).toBe(true)
             expect(payloads.some(payload => payload.message.content.data === claude)).toBe(true)
+            expect(payloads.some(payload => payload.message.content.data === agy)).toBe(true)
             const media = payloads.map(payload => payload.message.content.data).filter(data => data.type === 'generated-image')
             expect(media.map(data => data.fileName).sort()).toEqual(Object.keys(files).sort())
             for (const item of media) expect(getGeneratedImage(item.imageId as string)?.content.toString()).toBe(files[item.fileName as string])
