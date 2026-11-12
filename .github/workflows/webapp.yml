@@ -25,14 +25,23 @@ jobs:
             - uses: actions/checkout@v4
             - uses: oven-sh/setup-bun@v2
             - run: bun install --frozen-lockfile
+            - name: Setup Pages
+              id: pages
+              uses: actions/configure-pages@v5
+              with:
+                  enablement: true
             - name: Build web app
               env:
                   VITE_REQUIRE_HUB_URL: '1'
+                  VITE_BASE_URL: ${{ steps.pages.outputs.base_path || '/' }}
               run: bun run --cwd web build
             - name: Add CNAME for custom domain
-              run: echo "app.hapi.run" > web/dist/CNAME
-            - name: Setup Pages
-              uses: actions/configure-pages@v5
+              run: |
+                  if [ "${{ github.repository }}" = "tiann/hapi" ]; then
+                      echo "app.hapi.run" > web/dist/CNAME
+                  elif [ -n "${{ vars.PAGES_CNAME }}" ]; then
+                      echo "${{ vars.PAGES_CNAME }}" > web/dist/CNAME
+                  fi
             - name: Upload artifact
               uses: actions/upload-pages-artifact@v3
               with:
