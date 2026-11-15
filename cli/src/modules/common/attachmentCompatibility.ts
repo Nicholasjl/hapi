@@ -4,25 +4,48 @@ import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { detectDisplayMediaMimeType, getGeneratedImage, MAX_GENERATED_IMAGE_BYTES, readBoundedRegularFile, registerGeneratedImage } from './generatedImages'
 
+const ATTACHMENT_EXTENSION_RE = /\.(?:pdf|docx?|xlsx?|pptx?|csv|tsv|txt|md|zip|tar|gz|png|jpe?g|gif|webp|svg|mp4|webm|mp3|wav|ogg|flac)$/i
+
+function normalizeAttachmentTarget(rawTarget: string): string | null {
+    let target = rawTarget.trim()
+    if (!target) return null
+    try {
+        if (target.startsWith('file:')) target = fileURLToPath(target)
+        else target = decodeURIComponent(target.replace(/^sandbox:/, ''))
+    } catch {
+        return null
+    }
+    if (/^[a-z][a-z\d+.-]*:/i.test(target) && !/^[A-Za-z]:[\\/]/.test(target)) return null
+    if (target.startsWith('//') || /[\x00-\x1f#?]/.test(target)) return null
+    // Source citations with line numbers remain ordinary links.
+    if (/:\d+(?::\d+)?$/.test(target)) return null
+    if (!ATTACHMENT_EXTENSION_RE.test(target)) return null
+    return target
+}
+
 /** Only explicit delivery links, never tool output, reasoning, or bare file citations. */
 export function attachmentLinks(text: string): string[] {
-    const prose = text.replace(/^\s*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\s*\1[^\n]*$/gm, '')
-        .replace(/(`+)[^\n]*?\1/g, '')
+    const withoutFences = text.replace(/^\s*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\s*\1[^\n]*$/gm, '')
+    const prose = withoutFences.replace(/(`+)[^\n]*?\1/g, '')
     const paths = new Set<string>()
     const links = /!?\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s()]+(?:\([^()]*\)[^\s()]*)*))\s*(?:["'][^\n]*?["']\s*)?\)/g
     for (const match of prose.matchAll(links)) {
-        let target = match[1] ?? match[2]
-        try {
-            if (target.startsWith('file:')) target = fileURLToPath(target)
-            else target = decodeURIComponent(target.replace(/^sandbox:/, ''))
-        } catch { continue }
-        if (/^[a-z][a-z\d+.-]*:/i.test(target) && !/^[A-Za-z]:[\\/]/.test(target)) continue
-        if (target.startsWith('//') || /[\x00-\x1f#?]/.test(target)) continue
-        // Source citations with line numbers remain ordinary links.
-        if (/:\d+(?::\d+)?$/.test(target)) continue
-        if (!/\.(?:pdf|docx?|xlsx?|pptx?|csv|tsv|txt|md|zip|tar|gz|png|jpe?g|gif|webp|svg|mp4|webm|mp3|wav|ogg|flac)$/i.test(target)) continue
+        const target = normalizeAttachmentTarget(match[1] ?? match[2])
+        if (!target) continue
         paths.add(target)
         if (paths.size === 16) break
+    }
+    if (paths.size < 16) {
+        const inlineCode = /`([^`\n]+)`/g
+        for (const match of withoutFences.matchAll(inlineCode)) {
+            const raw = match[1].trim()
+            if (!raw || /^!?\[.*\]\(.*\)$/.test(raw)) continue
+            if (!/[\\/]/.test(raw)) continue
+            const target = normalizeAttachmentTarget(raw)
+            if (!target) continue
+            paths.add(target)
+            if (paths.size === 16) break
+        }
     }
     return [...paths]
 }

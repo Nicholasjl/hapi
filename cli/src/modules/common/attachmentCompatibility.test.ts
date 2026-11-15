@@ -11,6 +11,10 @@ it('recognizes common delivery links', () => {
 it('ignores external links, citations, and code', () => {
     expect(attachmentLinks('[web](https://example.org/a.pdf) [source](a.md:12) [bad](javascript:a.pdf) [unc](//host/a.pdf) `[inline](a.pdf)`\n```md\n[example](a.pdf)\n```')).toEqual([])
 })
+it('recognizes inline-code local paths with directory separators while ignoring bare filenames', () => {
+    expect(attachmentLinks('Cover: `D:\\3d\\out\\cover.png` Video: `./out/video.mp4` Bare: `photo_05.jpg`'))
+        .toEqual(['D:\\3d\\out\\cover.png', './out/video.mp4'])
+})
 it('only extracts settled assistant prose', () => {
     expect(assistantAttachmentText({ type: 'assistant', message: { content: [{ type: 'text', text: 'hello' }, { type: 'thinking', text: 'secret' }] } })).toBe('hello')
     expect(assistantAttachmentText({ type: 'message', message: 'hello' })).toBe('hello')
