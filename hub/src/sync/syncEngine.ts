@@ -76,6 +76,7 @@ import {
     type RpcListOpencodeModelVariantsResponse,
     type RpcListGrokModelsResponse,
     type RpcListDshModelsResponse,
+    type RpcListHermesModelsResponse,
     type RpcListCopilotModelsResponse,
     type RpcListKimiModelsResponse,
     type RpcListGrokReasoningEffortOptionsResponse,
@@ -125,6 +126,7 @@ export type {
     RpcListOpencodeModelVariantsResponse,
     RpcListGrokModelsResponse,
     RpcListDshModelsResponse,
+    RpcListHermesModelsResponse,
     RpcListCopilotModelsResponse,
     RpcListKimiModelsResponse,
     RpcListGrokReasoningEffortOptionsResponse,
@@ -4909,6 +4911,7 @@ export class SyncEngine {
         if (flavor === 'agy') return metadata.agySessionId ?? null
         if (flavor === 'cursor') return metadata.cursorSessionId ?? null
         if (flavor === 'kimi') return metadata.kimiSessionId ?? null
+        if (flavor === 'hermes') return metadata.hermesSessionId ?? null
         if (flavor === 'copilot') return metadata.copilotSessionId ?? null
         if (flavor === 'pi') return metadata.piSessionId ?? null
         // Current DSH ACP profiles resume persisted sessions through their
@@ -6245,6 +6248,7 @@ export class SyncEngine {
             && (prev?.cursorSessionId ?? null) === (next.cursorSessionId ?? null)
             && (prev?.piSessionId ?? null) === (next.piSessionId ?? null)
             && (prev?.kimiSessionId ?? null) === (next.kimiSessionId ?? null)
+            && (prev?.hermesSessionId ?? null) === (next.hermesSessionId ?? null)
             && (prev?.agySessionId ?? null) === (next.agySessionId ?? null)
             && (prev?.copilotSessionId ?? null) === (next.copilotSessionId ?? null)
     }
@@ -6860,6 +6864,22 @@ export class SyncEngine {
             () => this.rpcGateway.listDshModelsForSession(sessionId),
             SyncEngine.modelListCacheable
         ) as RpcListDshModelsResponse
+    }
+
+    async listHermesModelsForMachine(machineId: string): Promise<RpcListHermesModelsResponse> {
+        return await this.modelListCache.get(
+            `${machineId}|hermes-models`,
+            () => this.rpcGateway.listHermesModelsForMachine(machineId),
+            SyncEngine.modelListCacheable
+        ) as RpcListHermesModelsResponse
+    }
+
+    async listHermesModelsForSession(sessionId: string): Promise<RpcListHermesModelsResponse> {
+        return await this.modelListCache.get(
+            `${sessionId}|hermes-models`,
+            () => this.rpcGateway.listHermesModelsForSession(sessionId),
+            SyncEngine.modelListCacheable
+        ) as RpcListHermesModelsResponse
     }
 
     async listGrokReasoningEffortOptionsForSession(sessionId: string): Promise<RpcListGrokReasoningEffortOptionsResponse> {
