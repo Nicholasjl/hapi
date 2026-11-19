@@ -1,0 +1,42 @@
+name: Sync Upstream Main
+
+on:
+    schedule:
+        - cron: '17 */2 * * *'
+    workflow_dispatch:
+
+concurrency:
+    group: sync-upstream-main
+    cancel-in-progress: false
+
+jobs:
+    sync:
+        if: github.repository == 'Nicholasjl/hapi' && github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: main
+                  fetch-depth: 0
+                  token: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+
+            - name: Merge upstream tiann/hapi main into personal main
+              run: |
+                  set -euo pipefail
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+                  git remote add upstream https://github.com/tiann/hapi.git
+                  git fetch upstream main
+
+                  AHEAD=$(git rev-list --count HEAD..upstream/main)
+                  echo "Upstream commits to sync: $AHEAD"
+                  if [ "$AHEAD" -eq 0 ]; then
+                      echo "Personal main is already up to date with tiann/hapi:main."
+                      exit 0
+                  fi
+
+                  git merge --no-edit upstream/main
+                  git push origin main

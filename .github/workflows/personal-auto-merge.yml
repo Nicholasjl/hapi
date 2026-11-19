@@ -1,0 +1,37 @@
+name: Personal PR Auto Merge
+
+on:
+    pull_request:
+        branches: [main]
+        types: [opened, synchronize, reopened, labeled, unlabeled]
+    workflow_dispatch:
+        inputs:
+            pr_number:
+                description: 'PR number on Nicholasjl/hapi to merge into personal main'
+                required: true
+                type: string
+
+concurrency:
+    group: personal-auto-merge-${{ github.event.pull_request.number || inputs.pr_number }}
+    cancel-in-progress: false
+
+jobs:
+    auto-merge:
+        if: >-
+            github.repository == 'Nicholasjl/hapi' &&
+            (github.event_name == 'workflow_dispatch' ||
+             (github.event.pull_request.user.login == github.repository_owner &&
+              github.event.pull_request.head.repo.full_name == 'Nicholasjl/hapi' &&
+              !contains(github.event.pull_request.labels.*.name, 'hold')))
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            pull-requests: write
+        steps:
+            - name: Merge PR into personal main
+              env:
+                  GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+                  PR_NUM: ${{ github.event.pull_request.number || inputs.pr_number }}
+              run: |
+                  set -euo pipefail
+                  gh pr merge "$PR_NUM" --repo "$GITHUB_REPOSITORY" --merge
