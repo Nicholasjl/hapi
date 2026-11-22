@@ -5446,6 +5446,9 @@ export class SyncEngine {
             initialSession = this.sessionCache.getSessionByNamespace(access.sessionId, namespace) ?? initialSession
         }
         if (initialSession.active) {
+            if (initialSession.metadata?.agyImportedAt != null && !this.sessionReadyIds.has(access.sessionId)) {
+                return { type: 'error', message: 'Antigravity has not confirmed native resume yet', code: 'resume_failed' }
+            }
             return { type: 'success', sessionId: access.sessionId }
         }
 
