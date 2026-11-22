@@ -1,6 +1,7 @@
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { parseToolCallLifetimeId } from '@/agent/backends/acp/toolCallLifetimes';
 import type { AgentMessage } from '@/agent/types';
 import { AGY_BACKGROUND_COMMAND_RESULT } from './agyToolCards';
 
@@ -61,11 +62,36 @@ export interface AgyOpenBackgroundCommand {
     taskId?: string;
     afterStepIndex?: number;
     ordinalInTurn?: number;
+    reservedOrdinals?: number[];
     maxStepIndex?: number;
     stepIndex?: number;
     synthetic?: boolean;
+    dismissedFromIndicator?: boolean;
     commandLine?: string;
     nativeArgs?: Record<string, unknown>;
+}
+
+export interface AgyCompletedBackgroundTask {
+    taskId: string;
+    body: string;
+    exitCode?: number;
+}
+
+export interface AgyTranscriptCommandRecord {
+    taskId?: string;
+    commandLine?: string;
+}
+
+export interface AgyTranscriptBackgroundSettlement {
+    callId: string;
+    taskId?: string;
+    reason: 'completed' | 'killed';
+    toolResult?: Extract<AgentMessage, { type: 'tool_result' }>;
+}
+
+/** Reports whether compact transcript `content` is truncated and still awaits `transcript_full.jsonl`. */
+export function isAgyStepContentTruncated(step: AgyTranscriptStep): boolean {
+    return Array.isArray(step.truncated_fields) && step.truncated_fields.includes('content');
 }
 
 export interface AgyLiveBackgroundCompletionLookup {
@@ -478,39 +504,157 @@ function isCompletedOrBackgroundedBatchAction(
     );
 }
 
-/**
- * Extracts `taskId` (or `undefined` for non-backgrounded / not-yet-flushed rows)
- * for every `run_command` tool call in `steps` in call-ordinal order, so an
- * earlier command completing during a steer does not shift later ordinals.
- */
-export function extractAgyBackgroundTaskIds(steps: AgyTranscriptStep[]): Array<string | undefined> {
-    const ids: Array<string | undefined> = [];
+function collectPlannerActionSteps(
+    steps: AgyTranscriptStep[],
+    plannerIndex: number,
+    toolCallCount: number
+): {
+    actionSteps: AgyTranscriptStep[];
+    skippedSystemSteps: AgyTranscriptStep[];
+    nextIndex: number;
+} {
+    const actionSteps: AgyTranscriptStep[] = [];
+    const skippedSystemSteps: AgyTranscriptStep[] = [];
+    let cursor = plannerIndex + 1;
+    while (cursor < steps.length && actionSteps.length < toolCallCount) {
+        const candidate = steps[cursor]!;
+        if (candidate.source === 'SYSTEM' && candidate.type === 'SYSTEM_MESSAGE') {
+            skippedSystemSteps.push(candidate);
+            cursor += 1;
+            continue;
+        }
+        if (candidate.source !== 'MODEL' || candidate.type === 'PLANNER_RESPONSE') {
+            break;
+        }
+        actionSteps.push(candidate);
+        cursor += 1;
+    }
+    return {
+        actionSteps,
+        skippedSystemSteps,
+        nextIndex: cursor - 1
+    };
+}
+
+function killedTaskFromToolCall(
+    call: AgyTranscriptToolCall,
+    action: AgyTranscriptStep | undefined
+): string | undefined {
+    if (call.name !== 'manage_task') return undefined;
+    if (action?.status !== 'DONE') return undefined;
+    const args = decodeAgyTranscriptArgs(call.args);
+    if (args.Action !== 'kill') return undefined;
+    const taskId = typeof args.TaskId === 'string' ? args.TaskId.trim() : '';
+    return taskId.length > 0 ? taskId : undefined;
+}
+
+/** Extracts `TaskId` values from completed `manage_task(Action="kill")` calls in `steps`. */
+export function extractKilledBackgroundTasks(steps: AgyTranscriptStep[]): Set<string> {
+    const killed = new Set<string>();
     for (let i = 0; i < steps.length; i += 1) {
         const step = steps[i]!;
         if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') continue;
         const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
         if (toolCalls.length === 0) continue;
 
-        const actionSteps: AgyTranscriptStep[] = [];
-        let cursor = i + 1;
-        while (
-            cursor < steps.length
-            && actionSteps.length < toolCalls.length
-            && steps[cursor]!.source === 'MODEL'
-            && steps[cursor]!.type !== 'PLANNER_RESPONSE'
-        ) {
-            actionSteps.push(steps[cursor]!);
-            cursor += 1;
-        }
-        i = cursor - 1;
+        const { actionSteps, nextIndex } = collectPlannerActionSteps(steps, i, toolCalls.length);
+        i = nextIndex;
 
         for (let callIdx = 0; callIdx < toolCalls.length; callIdx += 1) {
-            if (toolCalls[callIdx]!.name === 'run_command') {
-                ids.push(extractAgyBackgroundTaskId(actionSteps[callIdx]?.content));
+            const taskId = killedTaskFromToolCall(toolCalls[callIdx]!, actionSteps[callIdx]);
+            if (taskId) killed.add(taskId);
+        }
+    }
+    return killed;
+}
+
+/**
+ * Extracts `taskId` and decoded `CommandLine` (when present) for every
+ * `run_command` tool call in `steps` in call-ordinal order, so an earlier
+ * command completing during a steer does not shift or misbind later ordinals.
+ */
+export function extractAgyBackgroundCommandRecords(
+    steps: AgyTranscriptStep[]
+): AgyTranscriptCommandRecord[] {
+    const records: AgyTranscriptCommandRecord[] = [];
+    for (let i = 0; i < steps.length; i += 1) {
+        const step = steps[i]!;
+        if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') continue;
+        const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
+        if (toolCalls.length === 0) continue;
+
+        const { actionSteps, nextIndex } = collectPlannerActionSteps(steps, i, toolCalls.length);
+        i = nextIndex;
+
+        for (let callIdx = 0; callIdx < toolCalls.length; callIdx += 1) {
+            const call = toolCalls[callIdx]!;
+            if (call.name !== 'run_command') continue;
+            const taskId = extractAgyBackgroundTaskId(actionSteps[callIdx]?.content);
+            const args = decodeAgyTranscriptArgs(call.args);
+            const commandLine = typeof args.CommandLine === 'string' && args.CommandLine.trim().length > 0
+                ? args.CommandLine
+                : undefined;
+            records.push({
+                ...(taskId ? { taskId } : {}),
+                ...(commandLine ? { commandLine } : {})
+            });
+        }
+    }
+    return records;
+}
+
+/**
+ * Matches an open command's preferred ordinal and optional command line against
+ * extracted `run_command` transcript records without claiming any task ID already
+ * assigned in `excludeTaskIds`.
+ */
+export function matchAgyBackgroundTaskId(
+    records: AgyTranscriptCommandRecord[],
+    preferredOrdinal: number | undefined,
+    commandLine: string | undefined,
+    excludeTaskIds: ReadonlySet<string>,
+    reservedOrdinals?: ReadonlySet<number>
+): string | undefined {
+    if (
+        preferredOrdinal !== undefined
+        && preferredOrdinal >= 0
+        && preferredOrdinal < records.length
+        && !(reservedOrdinals?.has(preferredOrdinal))
+    ) {
+        const direct = records[preferredOrdinal]!;
+        const cmdCompatible = !commandLine || !direct.commandLine || direct.commandLine === commandLine;
+        if (cmdCompatible) {
+            if (direct.taskId && !excludeTaskIds.has(direct.taskId)) {
+                return direct.taskId;
+            }
+            // Wait for this ordinal's own action row to flush rather than
+            // borrowing an earlier identical command's task ID.
+            if (!direct.taskId) {
+                return undefined;
             }
         }
     }
-    return ids;
+    if (commandLine) {
+        const matches = records.filter((record, index) =>
+            record.taskId !== undefined
+            && !excludeTaskIds.has(record.taskId)
+            && !(reservedOrdinals?.has(index))
+            && record.commandLine === commandLine
+        );
+        if (matches.length === 1) {
+            return matches[0]!.taskId;
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Extracts `taskId` (or `undefined` for non-backgrounded / not-yet-flushed rows)
+ * for every `run_command` tool call in `steps` in call-ordinal order, so an
+ * earlier command completing during a steer does not shift later ordinals.
+ */
+export function extractAgyBackgroundTaskIds(steps: AgyTranscriptStep[]): Array<string | undefined> {
+    return extractAgyBackgroundCommandRecords(steps).map((record) => record.taskId);
 }
 
 /**
@@ -526,15 +670,28 @@ export function resolveAgyBackgroundTaskIds(
     const unresolved = openBackgroundCommands.filter((entry) => !entry.taskId);
     if (unresolved.length === 0) return;
 
-    const taskIdsByWindow = new Map<string, Array<string | undefined>>();
+    const claimedTaskIds = new Set<string>(
+        openBackgroundCommands
+            .map((entry) => entry.taskId)
+            .filter((taskId): taskId is string => Boolean(taskId))
+    );
+
+    // Exact step-indexed entries identify a single action row unambiguously;
+    // claim them before matching windowed ordinal entries.
     for (const entry of unresolved) {
-        if (entry.stepIndex !== undefined) {
-            const steps = readAgyTranscriptStepsAfter(brainDir, sessionId, entry.stepIndex - 1);
-            const exactStep = steps.find((step) => step.step_index === entry.stepIndex);
-            const taskId = extractAgyBackgroundTaskId(exactStep?.content);
-            if (taskId) entry.taskId = taskId;
-            continue;
+        if (entry.stepIndex === undefined) continue;
+        const steps = readAgyTranscriptStepsAfter(brainDir, sessionId, entry.stepIndex - 1);
+        const exactStep = steps.find((step) => step.step_index === entry.stepIndex);
+        const taskId = extractAgyBackgroundTaskId(exactStep?.content);
+        if (taskId) {
+            entry.taskId = taskId;
+            claimedTaskIds.add(taskId);
         }
+    }
+
+    const recordsByWindow = new Map<string, AgyTranscriptCommandRecord[]>();
+    for (const entry of unresolved) {
+        if (entry.taskId || entry.stepIndex !== undefined) continue;
         if (entry.afterStepIndex === undefined || entry.ordinalInTurn === undefined) {
             continue;
         }
@@ -542,18 +699,38 @@ export function resolveAgyBackgroundTaskIds(
             ? Math.min(entry.maxStepIndex, upperStepIndex)
             : (entry.maxStepIndex ?? upperStepIndex);
         const key = `${entry.afterStepIndex}:${maxStep ?? 'inf'}`;
-        let taskIds = taskIdsByWindow.get(key);
-        if (!taskIds) {
+        let records = recordsByWindow.get(key);
+        if (!records) {
             let steps = readAgyTranscriptStepsAfter(brainDir, sessionId, entry.afterStepIndex);
             if (maxStep !== undefined) {
                 steps = steps.filter((step) => step.step_index <= maxStep);
             }
-            taskIds = extractAgyBackgroundTaskIds(steps);
-            taskIdsByWindow.set(key, taskIds);
+            records = extractAgyBackgroundCommandRecords(steps);
+            recordsByWindow.set(key, records);
         }
-        const resolved = taskIds[entry.ordinalInTurn];
+        const reservedOrdinals = new Set<number>(entry.reservedOrdinals ?? []);
+        for (const sibling of openBackgroundCommands) {
+            if (
+                sibling === entry
+                || sibling.taskId
+                || sibling.afterStepIndex !== entry.afterStepIndex
+                || sibling.ordinalInTurn === undefined
+                || sibling.ordinalInTurn === entry.ordinalInTurn
+            ) {
+                continue;
+            }
+            reservedOrdinals.add(sibling.ordinalInTurn);
+        }
+        const resolved = matchAgyBackgroundTaskId(
+            records,
+            entry.ordinalInTurn,
+            entry.commandLine,
+            claimedTaskIds,
+            reservedOrdinals
+        );
         if (resolved) {
             entry.taskId = resolved;
+            claimedTaskIds.add(resolved);
         }
     }
 }
@@ -688,22 +865,43 @@ export function advanceAgyTurnTranscriptCursor(
     return cursor;
 }
 
-function parseCompletedBackgroundTask(
+/** Checks whether a live/manage_task id matches a transcript `sessionId/task-N` id. */
+export function matchesBackgroundTaskId(candidateId: string, taskId: string): boolean {
+    const normalized = candidateId.trim();
+    if (!normalized) return false;
+    const baseId = parseToolCallLifetimeId(normalized) ?? normalized;
+    const shortTask = taskId.includes('/')
+        ? taskId.slice(taskId.lastIndexOf('/') + 1)
+        : taskId;
+    return baseId === taskId || baseId === shortTask;
+}
+
+/** Parses all background task completion entries in a `SYSTEM_MESSAGE` step. */
+export function parseCompletedBackgroundTasks(
     systemMessageContent: string | undefined,
     sessionId: string
-): { taskId: string; body: string; exitCode?: number } | null {
-    if (!systemMessageContent) return null;
+): AgyCompletedBackgroundTask[] {
+    if (!systemMessageContent) return [];
+    const normalized = systemMessageContent.replace(/\r\n/g, '\n');
     const escapedSession = sessionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const messageHeader = `\\[Message\\] (?:timestamp=\\S+ )?sender=\\S+(?:\\s+priority=\\S+)?(?:\\s+content=|\\n+)`;
+    const taskStartPrefix = `(?:<SYSTEM_MESSAGE>\\s*(?:${messageHeader})?|(?:\\n+Log: file:\\/\\/\\/[^\\n]*)?\\n+${messageHeader}|\\n+Log: file:\\/\\/\\/[^\\n]*\\n+)`;
+    const nextTaskBoundary = `(?:(?:\\n+Log: file:\\/\\/\\/[^\\n]*)?\\n+${messageHeader}|\\n+Log: file:\\/\\/\\/[^\\n]*\\n+)Task id "${escapedSession}\\/task-\\d+" finished with result:`;
+    const nextNonTaskMessageBoundary = `\\n+Log: file:\\/\\/\\/[^\\n]*\\n+${messageHeader}`;
+    const endFrameBoundary = `(?:\\n+Log: file:\\/\\/\\/[^\\n]*)?\\s*<\\/SYSTEM_MESSAGE>`;
     const pattern = new RegExp(
-        `Task id "(${escapedSession}\\/task-\\d+)" finished with result:\\n([\\s\\S]*?)(?:\\nLog: file:\\/\\/\\/[^\\n]*)?\\s*<\\/SYSTEM_MESSAGE>`
+        `${taskStartPrefix}Task id "(${escapedSession}\\/task-\\d+)" finished with result:\\n([\\s\\S]*?)(?=${nextTaskBoundary}|${nextNonTaskMessageBoundary}|${endFrameBoundary})`,
+        'g'
     );
-    const match = systemMessageContent.match(pattern);
-    if (!match) return null;
-    const taskId = match[1]!;
-    const body = match[2]!.trimEnd();
-    const exitMatch = body.match(/^Command exited with code (-?\d+)\./);
-    const exitCode = exitMatch ? Number(exitMatch[1]) : undefined;
-    return { taskId, body, ...(Number.isFinite(exitCode) ? { exitCode } : {}) };
+    const results: AgyCompletedBackgroundTask[] = [];
+    for (const match of normalized.matchAll(pattern)) {
+        const taskId = match[1]!;
+        const body = match[2]!.trimEnd();
+        const exitMatch = body.match(/^Command exited with code (-?\d+)\./);
+        const exitCode = exitMatch ? Number(exitMatch[1]) : undefined;
+        results.push({ taskId, body, ...(Number.isFinite(exitCode) ? { exitCode } : {}) });
+    }
+    return results;
 }
 
 function normalizeAgyCommandBody(text: string): { stdout: string; exitCode?: number } {
@@ -786,28 +984,27 @@ export function inspectSyntheticBackgroundCommandMatch(
     turnStartStepIndex: number,
     lookupOrCommandLine?: string | AgyLiveBackgroundCompletionLookup
 ): AgySyntheticCommandMatch {
-    const candidates = openBackgroundCommands.filter((entry) => entry.synthetic === true);
-    if (candidates.length === 0) return { kind: 'none' };
-
-    resolveAgyBackgroundTaskIds(brainDir, sessionId, candidates);
+    if (openBackgroundCommands.length === 0) return { kind: 'none' };
 
     const lookup: AgyLiveBackgroundCompletionLookup = typeof lookupOrCommandLine === 'string'
         ? { commandLine: lookupOrCommandLine }
         : (lookupOrCommandLine ?? {});
+
+    resolveAgyBackgroundTaskIds(brainDir, sessionId, openBackgroundCommands);
+
+    if (lookup.liveCallId) {
+        const exactById = openBackgroundCommands.filter(
+            (entry) => entry.taskId !== undefined && matchesBackgroundTaskId(lookup.liveCallId!, entry.taskId)
+        );
+        if (exactById.length === 1) return { kind: 'matched', entry: exactById[0]! };
+    }
+
+    const candidates = openBackgroundCommands.filter((entry) => entry.synthetic === true);
+    if (candidates.length === 0) return { kind: 'none' };
+
     const liveArgs = lookup.nativeArgs;
     const liveCommandLine = lookup.commandLine
         ?? (typeof liveArgs?.CommandLine === 'string' ? liveArgs.CommandLine : undefined);
-
-    if (lookup.liveCallId) {
-        const exactById = candidates.filter((entry) => {
-            if (!entry.taskId) return false;
-            const shortTask = entry.taskId.includes('/')
-                ? entry.taskId.slice(entry.taskId.lastIndexOf('/') + 1)
-                : entry.taskId;
-            return lookup.liveCallId === entry.taskId || lookup.liveCallId === shortTask;
-        });
-        if (exactById.length === 1) return { kind: 'matched', entry: exactById[0]! };
-    }
 
     const compatible = candidates.filter((entry) =>
         areCommandArgsCompatible(entry, liveArgs, liveCommandLine)
@@ -823,9 +1020,8 @@ export function inspectSyntheticBackgroundCommandMatch(
     const recentSteps = readAgyTranscriptStepsAfter(brainDir, sessionId, Math.max(-1, earliestStep - 1));
     const completedTasks = new Map<string, { stdout: string; exitCode?: number }>();
     for (const step of recentSteps) {
-        if (step.source === 'SYSTEM' && step.type === 'SYSTEM_MESSAGE') {
-            const parsed = parseCompletedBackgroundTask(step.content, sessionId);
-            if (parsed) {
+        if (step.source === 'SYSTEM' && step.type === 'SYSTEM_MESSAGE' && !isAgyStepContentTruncated(step)) {
+            for (const parsed of parseCompletedBackgroundTasks(step.content, sessionId)) {
                 const normalized = normalizeAgyCommandBody(parsed.body);
                 const exitCode = parsed.exitCode ?? normalized.exitCode;
                 completedTasks.set(parsed.taskId, {
@@ -848,34 +1044,52 @@ export function inspectSyntheticBackgroundCommandMatch(
         (entry) => entry.taskId === undefined || !completedTasks.has(entry.taskId)
     );
 
-    const turnPlannedCompatibleCommand = recentSteps.some((step) => {
-        if (step.step_index <= turnStartStepIndex) return false;
-        if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') return false;
-        return (step.tool_calls ?? []).some((call) => {
-            if (call.name !== 'run_command') return false;
+    const candidateStepIndexes = new Set(
+        candidates
+            .map((entry) => entry.stepIndex)
+            .filter((idx): idx is number => idx !== undefined)
+    );
+    const actionsByStep = new Map(recentSteps.map(step => [step.step_index, step]));
+    const freshActions: Array<AgyTranscriptStep | undefined> = [];
+    for (const step of recentSteps) {
+        if (step.step_index <= turnStartStepIndex) continue;
+        if (candidateStepIndexes.has(step.step_index)) continue;
+        if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') continue;
+        (step.tool_calls ?? []).forEach((call, index) => {
+            if (call.name !== 'run_command') return;
             const args = decodeAgyTranscriptArgs(call.args);
             const plannedCmd = typeof args.CommandLine === 'string' ? args.CommandLine : undefined;
-            if (liveCommandLine !== undefined && plannedCmd !== liveCommandLine) return false;
+            if (liveCommandLine !== undefined && plannedCmd !== liveCommandLine) return;
             if (liveArgs) {
                 for (const [key, val] of Object.entries(liveArgs)) {
                     if (typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
                         continue;
                     }
-                    if (args[key] !== undefined && args[key] !== val) return false;
+                    if (args[key] !== undefined && args[key] !== val) return;
                 }
             }
-            return true;
+            freshActions.push(actionsByStep.get(step.step_index + index + 1));
         });
-    });
+    }
+
+    // A different persisted output distinguishes an older replay even when
+    // both commands have identical arguments. Until the result arrives, defer.
+    if (freshActions.length && (completedCandidates.length === 0 || freshActions.some(action => {
+        if (!action || action.type !== 'RUN_COMMAND' || action.status !== 'DONE' || !action.content || isAgyStepContentTruncated(action)) return true;
+        const fresh = normalizeAgyCommandBody(action.content);
+        return (liveResult?.stdout !== undefined && fresh.stdout === liveResult.stdout
+            && (liveResult.exitCode === undefined || fresh.exitCode === liveResult.exitCode));
+    }))) {
+        return { kind: 'none' };
+    }
 
     // Argument compatibility alone never establishes a synthetic alias:
     // without `tool_result` evidence, hold compatible calls provisionally
-    // unless the current turn has already persisted a matching planned command
-    // with no completed synthetic candidates.
+    // unless the current turn has already persisted a matching planned command.
     if (!hasResultSignal) {
         if (
             completedCandidates.length > 0
-            || (!turnPlannedCompatibleCommand && unpersistedCompatible.length > 0)
+            || unpersistedCompatible.length > 0
             || lookup.callStatus === 'completed'
             || lookup.callStatus === 'failed'
         ) {
@@ -933,13 +1147,13 @@ export function inspectSyntheticBackgroundCommandMatch(
             }
             return { kind: 'ambiguous' };
         }
-        if (!turnPlannedCompatibleCommand && unpersistedCompatible.length > 0) {
+        if (freshActions.length === 0 && unpersistedCompatible.length > 0) {
             return { kind: 'ambiguous' };
         }
         return { kind: 'none' };
     }
 
-    if (turnPlannedCompatibleCommand) {
+    if (freshActions.length > 0) {
         return { kind: 'none' };
     }
     if (unpersistedCompatible.length > 0) {
@@ -1002,6 +1216,130 @@ function buildGenericToolOutput(
     };
 }
 
+/** Builds the terminal `tool_result` event for a background command finished in transcript. */
+export function buildAgyBackgroundCompletionToolResult(
+    callId: string,
+    completed: AgyCompletedBackgroundTask
+): Extract<AgentMessage, { type: 'tool_result' }> {
+    const failed = completed.exitCode !== undefined && completed.exitCode !== 0;
+    return {
+        type: 'tool_result',
+        id: callId,
+        status: failed ? 'failed' : 'completed',
+        output: {
+            output: completed.body,
+            ...(completed.exitCode !== undefined ? { exit_code: completed.exitCode } : {})
+        }
+    };
+}
+
+/** Builds the terminal `tool_result` event for a background command stopped via `manage_task`. */
+export function buildAgyBackgroundKilledToolResult(
+    callId: string
+): Extract<AgentMessage, { type: 'tool_result' }> {
+    return {
+        type: 'tool_result',
+        id: callId,
+        status: 'completed',
+        output: { output: 'Background task stopped.' }
+    };
+}
+
+function applyCompletedSystemMessageStep(
+    step: AgyTranscriptStep,
+    sessionId: string,
+    openBackgroundCommands: AgyOpenBackgroundCommand[],
+    messages: AgentMessage[]
+): void {
+    if (isAgyStepContentTruncated(step)) return;
+    for (const completedBg of parseCompletedBackgroundTasks(step.content, sessionId)) {
+        if (openBackgroundCommands.length === 0) break;
+        const matchIdx = openBackgroundCommands.findIndex(
+            (entry) => entry.taskId !== undefined && entry.taskId === completedBg.taskId
+        );
+        if (matchIdx >= 0) {
+            const matched = openBackgroundCommands.splice(matchIdx, 1)[0]!;
+            messages.push(buildAgyBackgroundCompletionToolResult(matched.callId, completedBg));
+        }
+    }
+}
+
+/**
+ * Settles open background commands whose completion `SYSTEM_MESSAGE` or
+ * `manage_task` kill has already landed in `transcript.jsonl` up to
+ * `maxStepIndex`, mutating `openBackgroundCommands` in place and returning
+ * settlement records in open-entry order.
+ */
+export function settleCompletedBackgroundCommandsFromTranscript(
+    brainDir: string,
+    sessionId: string,
+    openBackgroundCommands: AgyOpenBackgroundCommand[],
+    maxStepIndex?: number
+): AgyTranscriptBackgroundSettlement[] {
+    if (openBackgroundCommands.length === 0) return [];
+
+    resolveAgyBackgroundTaskIds(brainDir, sessionId, openBackgroundCommands, maxStepIndex);
+
+    let earliestAfterStep = Number.POSITIVE_INFINITY;
+    for (const entry of openBackgroundCommands) {
+        if (entry.stepIndex !== undefined) {
+            earliestAfterStep = Math.min(earliestAfterStep, entry.stepIndex - 1);
+        }
+        if (entry.afterStepIndex !== undefined) {
+            earliestAfterStep = Math.min(earliestAfterStep, entry.afterStepIndex);
+        }
+    }
+    const afterStep = Number.isFinite(earliestAfterStep) ? Math.max(-1, earliestAfterStep) : -1;
+    let steps = readAgyTranscriptStepsAfter(brainDir, sessionId, afterStep);
+    if (maxStepIndex !== undefined) {
+        steps = steps.filter((step) => step.step_index <= maxStepIndex);
+    }
+    if (steps.length === 0) return [];
+
+    const completedByTaskId = new Map<string, AgyCompletedBackgroundTask>();
+    for (const step of steps) {
+        if (step.source !== 'SYSTEM' || step.type !== 'SYSTEM_MESSAGE' || isAgyStepContentTruncated(step)) {
+            continue;
+        }
+        for (const parsed of parseCompletedBackgroundTasks(step.content, sessionId)) {
+            completedByTaskId.set(parsed.taskId, parsed);
+        }
+    }
+    const killedTaskIds = extractKilledBackgroundTasks(steps);
+
+    const settled: AgyTranscriptBackgroundSettlement[] = [];
+    for (let idx = openBackgroundCommands.length - 1; idx >= 0; idx -= 1) {
+        const entry = openBackgroundCommands[idx]!;
+        const completed = entry.taskId !== undefined ? completedByTaskId.get(entry.taskId) : undefined;
+        if (completed) {
+            openBackgroundCommands.splice(idx, 1);
+            settled.push({
+                callId: entry.callId,
+                ...(entry.taskId ? { taskId: entry.taskId } : {}),
+                reason: 'completed',
+                toolResult: buildAgyBackgroundCompletionToolResult(entry.callId, completed)
+            });
+            continue;
+        }
+        const killed = [...killedTaskIds].some(
+            (killedId) =>
+                killedId === entry.callId
+                || (entry.taskId !== undefined && matchesBackgroundTaskId(killedId, entry.taskId))
+        );
+        if (killed) {
+            openBackgroundCommands.splice(idx, 1);
+            settled.push({
+                callId: entry.callId,
+                ...(entry.taskId ? { taskId: entry.taskId } : {}),
+                reason: 'killed',
+                toolResult: buildAgyBackgroundKilledToolResult(entry.callId)
+            });
+        }
+    }
+    settled.reverse();
+    return settled;
+}
+
 /**
  * Converts a completed reactive wakeup transcript slice into canonical
  * `AgentMessage` events and aggregated token usage.
@@ -1009,7 +1347,8 @@ function buildGenericToolOutput(
 export function convertAgyReactiveSteps(
     sessionId: string,
     steps: AgyTranscriptStep[],
-    openBackgroundCommands: AgyOpenBackgroundCommand[]
+    openBackgroundCommands: AgyOpenBackgroundCommand[],
+    alreadySettledTaskIds?: ReadonlySet<string>
 ): {
     messages: AgentMessage[];
     usage: UsageMessage | null;
@@ -1033,25 +1372,7 @@ export function convertAgyReactiveSteps(
     for (let i = 0; i < steps.length; i += 1) {
         const step = steps[i]!;
         if (step.source === 'SYSTEM' && step.type === 'SYSTEM_MESSAGE') {
-            const completedBg = parseCompletedBackgroundTask(step.content, sessionId);
-            if (completedBg && openBackgroundCommands.length > 0) {
-                const matchIdx = openBackgroundCommands.findIndex(
-                    (entry) => entry.taskId !== undefined && entry.taskId === completedBg.taskId
-                );
-                if (matchIdx >= 0) {
-                    const matched = openBackgroundCommands.splice(matchIdx, 1)[0]!;
-                    const failed = completedBg.exitCode !== undefined && completedBg.exitCode !== 0;
-                    messages.push({
-                        type: 'tool_result',
-                        id: matched.callId,
-                        status: failed ? 'failed' : 'completed',
-                        output: {
-                            output: completedBg.body,
-                            ...(completedBg.exitCode !== undefined ? { exit_code: completedBg.exitCode } : {})
-                        }
-                    });
-                }
-            }
+            applyCompletedSystemMessageStep(step, sessionId, openBackgroundCommands, messages);
             continue;
         }
 
@@ -1088,35 +1409,41 @@ export function convertAgyReactiveSteps(
         const toolCalls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
         if (toolCalls.length === 0) continue;
 
-        const actionSteps: AgyTranscriptStep[] = [];
-        let cursor = i + 1;
-        while (
-            cursor < steps.length
-            && actionSteps.length < toolCalls.length
-            && steps[cursor]!.source === 'MODEL'
-            && steps[cursor]!.type !== 'PLANNER_RESPONSE'
-        ) {
-            actionSteps.push(steps[cursor]!);
-            cursor += 1;
-        }
-        i = cursor - 1;
+        const { actionSteps, skippedSystemSteps, nextIndex } = collectPlannerActionSteps(steps, i, toolCalls.length);
+        i = nextIndex;
 
         for (let callIdx = 0; callIdx < toolCalls.length; callIdx += 1) {
             const call = toolCalls[callIdx]!;
             const action = actionSteps[callIdx];
             const decodedArgs = decodeAgyTranscriptArgs(call.args);
+            const killedTaskId = killedTaskFromToolCall(call, action);
+            if (killedTaskId) {
+                const killIdx = openBackgroundCommands.findIndex(
+                    (entry) =>
+                        entry.callId === killedTaskId
+                        || (entry.taskId !== undefined && matchesBackgroundTaskId(killedTaskId, entry.taskId))
+                );
+                if (killIdx >= 0) {
+                    const killed = openBackgroundCommands.splice(killIdx, 1)[0]!;
+                    messages.push(buildAgyBackgroundKilledToolResult(killed.callId));
+                }
+            }
             const id = `agy-wakeup-${sessionId}-${step.step_index}-${callIdx}`;
             const resultInfo = action
                 ? buildGenericToolOutput(call.name, action)
                 : { output: '', status: 'completed' as const, backgrounded: false };
             // agy task ids are unique per session. A backgrounded command whose
-            // task is already open was streamed by a live turn before this slice
-            // was replayed: a second card and a second entry would leave one of
-            // the two open after the task's single completion.
+            // task is already open (or was already settled on `timed_out`) was
+            // streamed before this slice was replayed: a second card and entry
+            // would duplicate the card or leave one open after completion.
             const backgroundTaskId = resultInfo.backgrounded && action
                 ? extractAgyBackgroundTaskId(action.content)
                 : undefined;
-            if (backgroundTaskId && openBackgroundCommands.some((entry) => entry.taskId === backgroundTaskId)) {
+            if (
+                backgroundTaskId
+                && (openBackgroundCommands.some((entry) => entry.taskId === backgroundTaskId)
+                    || alreadySettledTaskIds?.has(backgroundTaskId))
+            ) {
                 continue;
             }
             messages.push({
@@ -1150,6 +1477,10 @@ export function convertAgyReactiveSteps(
                     });
                 }
             }
+        }
+
+        for (const sysStep of skippedSystemSteps) {
+            applyCompletedSystemMessageStep(sysStep, sessionId, openBackgroundCommands, messages);
         }
     }
 
