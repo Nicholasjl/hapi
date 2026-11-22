@@ -1140,7 +1140,11 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                         mcpServers: this.acpMcpServers,
                         ...(sessionMeta ? { meta: sessionMeta } : {})
                     });
+                    if (session.client.getMetadata?.()?.agyImportedAt != null && acpSessionId !== resumeSessionId) {
+                        throw new Error('Antigravity did not resume the imported conversation');
+                    }
                 } catch (error) {
+                    if (session.client.getMetadata?.()?.agyImportedAt != null) throw error;
                     logger.warn('[agy-acp] resume failed, starting a new conversation', error);
                     session.sendSessionEvent({
                         type: 'message',
