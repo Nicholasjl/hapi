@@ -4,7 +4,7 @@ import type { LocalTranscript, LocalTranscriptSummary } from '@hapi/protocol/loc
 import type { Machine, SyncEngine } from '../../../sync/syncEngine'
 import type { WebAppEnv } from '../../middleware/auth'
 import { Store } from '../../../store'
-import { CLAUDE_LOCAL_SESSION_SOURCE, CODEX_LOCAL_SESSION_SOURCE, OPENCODE_LOCAL_SESSION_SOURCE, PI_LOCAL_SESSION_SOURCE } from './sources'
+import { AGY_LOCAL_SESSION_SOURCE, CLAUDE_LOCAL_SESSION_SOURCE, CODEX_LOCAL_SESSION_SOURCE, OPENCODE_LOCAL_SESSION_SOURCE, PI_LOCAL_SESSION_SOURCE } from './sources'
 import { createLocalSessionRoutes } from './createLocalSessionRoutes'
 import { fetchLocalTranscriptSummaries, fetchLocalTranscriptsByIds } from './fetchLocalTranscripts'
 
@@ -260,6 +260,749 @@ describe('generic local session routes', () => {
         expect(body.success).toBe(false)
         expect(body.error).toContain('200')
         expect(calls).toHaveLength(0)
+    })
+
+    it('lists and imports local Antigravity sessions with permissionMode and model', async () => {
+        const agySummary: LocalTranscriptSummary = {
+            flavor: 'agy',
+            id: 'agy-1',
+            title: 'Antigravity session',
+            lastUserMessage: 'hello agy',
+            cwd: '/tmp/agy-project',
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-1/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10
+        }
+        const agyTranscript: LocalTranscript = {
+            ...agySummary,
+            messages: [{
+                id: 'agy:agy-1:step:0:0',
+                createdAt: 10,
+                content: { role: 'user', content: { type: 'text', text: 'hello agy' }, meta: { sentFrom: 'cli' } },
+                anchor: 'step:0:0'
+            }]
+        }
+        const { app, store, appliedConfigs } = harness({
+            sources: [AGY_LOCAL_SESSION_SOURCE],
+            summaries: [agySummary],
+            transcripts: [agyTranscript]
+        })
+        stores.push(store)
+
+        const listRes = await app.request('/api/agy/sessions')
+        expect(listRes.status).toBe(200)
+        const listBody = await listRes.json() as { success: boolean; sessions: Array<Record<string, unknown>> }
+        expect(listBody.success).toBe(true)
+        expect(listBody.sessions).toHaveLength(1)
+        expect(listBody.sessions[0]).toMatchObject({ id: 'agy-1', title: 'Antigravity session' })
+
+        const importRes = await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-1'], model: 'gemini-3-pro', effort: 'high', permissionMode: 'request-review' })
+        })
+        expect(importRes.status).toBe(200)
+        const importBody = await importRes.json() as { success: boolean; results: Array<Record<string, unknown>> }
+        expect(importBody.success).toBe(true)
+        expect(importBody.results[0]).toMatchObject({ agySessionId: 'agy-1', action: 'created', appended: 1 })
+        expect(appliedConfigs).toEqual([{ model: 'gemini-3-pro', effort: 'high', permissionMode: 'request-review' }])
+
+        const secondListRes = await app.request('/api/agy/sessions')
+        const secondListBody = await secondListRes.json() as { sessions: Array<Record<string, unknown>> }
+        expect(secondListBody.sessions[0]).toMatchObject({ id: 'agy-1', hapiSessionId: importBody.results[0]!.hapiSessionId })
+    })
+
+    it('refuses transcript-only Antigravity imports without a working directory instead of saving .system_generated/logs', async () => {
+        const agySummary: LocalTranscriptSummary = {
+            flavor: 'agy',
+            id: 'agy-no-cwd',
+            title: 'No workspace session',
+            lastUserMessage: 'hi',
+            cwd: null,
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-no-cwd/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10
+        }
+        const agyTranscript: LocalTranscript = {
+            ...agySummary,
+            messages: [{
+                id: 'agy:agy-no-cwd:step:0:0',
+                createdAt: 10,
+                content: { role: 'user', content: { type: 'text', text: 'hi' }, meta: { sentFrom: 'cli' } },
+                anchor: 'step:0:0'
+            }]
+        }
+        const { app, store } = harness({
+            sources: [AGY_LOCAL_SESSION_SOURCE],
+            summaries: [agySummary],
+            transcripts: [agyTranscript]
+        })
+        stores.push(store)
+
+        const res = await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-no-cwd'] })
+        })
+        expect(res.status).toBe(200)
+        const body = await res.json() as { success: boolean; results: Array<{ error?: { code: string } }> }
+        expect(body.success).toBe(false)
+        expect(body.results[0]?.error?.code).toBe('missing_cwd')
+        expect(store.sessions.getSessionsByNamespace('default')).toHaveLength(0)
+    })
+
+    it('appends late action steps onto an already-imported Antigravity session without divergence', async () => {
+        const baseSummary: LocalTranscriptSummary = {
+            flavor: 'agy',
+            id: 'agy-grow',
+            title: 'Growing session',
+            lastUserMessage: 'run checks',
+            cwd: '/tmp/agy-project',
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-grow/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10
+        }
+        const plannerCall0 = {
+            id: 'agy:agy-grow:step:1:call:0',
+            createdAt: 11,
+            content: { role: 'agent', content: { type: 'codex', data: { type: 'tool-call', name: 'Read', callId: 'c0', input: { file_path: 'a.ts' }, status: 'completed' } }, meta: { sentFrom: 'cli' } },
+            anchor: 'step:1:call:0'
+        } as const
+        const plannerCall1 = {
+            id: 'agy:agy-grow:step:1:call:1',
+            createdAt: 11,
+            content: { role: 'agent', content: { type: 'codex', data: { type: 'tool-call', name: 'Read', callId: 'c1', input: { file_path: 'b.ts' }, status: 'completed' } }, meta: { sentFrom: 'cli' } },
+            anchor: 'step:1:call:1'
+        } as const
+        const initial: LocalTranscript = { ...baseSummary, messages: [plannerCall0, plannerCall1] }
+        const grown: LocalTranscript = {
+            ...baseSummary,
+            messages: [
+                plannerCall0,
+                plannerCall1,
+                {
+                    id: 'agy:agy-grow:step:2:0',
+                    createdAt: 12,
+                    content: { role: 'agent', content: { type: 'codex', data: { type: 'tool-call-result', callId: 'c0', output: 'file A', is_error: false } }, meta: { sentFrom: 'cli' } },
+                    anchor: 'step:2:0'
+                }
+            ]
+        }
+        let current = initial
+        const store = new Store(':memory:')
+        stores.push(store)
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async (_machineId: string, payload: { sessionIds?: string[] | null }) => {
+                if (payload.sessionIds) return { success: true, sessions: [current] }
+                const { messages: _messages, ...summary } = current
+                return { success: true, sessions: [summary] }
+            },
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({ store, getSyncEngine: () => engine, sources: [AGY_LOCAL_SESSION_SOURCE] }))
+
+        const first = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-grow'] })
+        })).json() as { results: Array<Record<string, unknown>> }
+        expect(first.results[0]).toMatchObject({ action: 'created', appended: 2 })
+
+        current = grown
+        const second = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-grow'] })
+        })).json() as { results: Array<Record<string, unknown>> }
+        expect(second.results[0]).toMatchObject({ agySessionId: 'agy-grow', action: 'updated', appended: 1 })
+    })
+
+    it('uses body cwd on first import of a transcript-only Antigravity session and preserves it on re-import from another directory', async () => {
+        const initial: LocalTranscript = {
+            flavor: 'agy',
+            id: 'agy-no-cwd',
+            title: 'Transcript-only session',
+            lastUserMessage: 'first prompt',
+            cwd: null,
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-no-cwd/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10,
+            messages: [
+                { id: 'agy:agy-no-cwd:step:0:0', createdAt: 10, content: { role: 'user', content: { type: 'text', text: 'first prompt' }, meta: { sentFrom: 'cli' } }, anchor: 'step:0:0' }
+            ]
+        }
+        const grown: LocalTranscript = {
+            ...initial,
+            lastUserMessage: 'second prompt',
+            modifiedAt: 20,
+            messages: [
+                ...initial.messages,
+                { id: 'agy:agy-no-cwd:step:1:0', createdAt: 20, content: { role: 'user', content: { type: 'text', text: 'second prompt' }, meta: { sentFrom: 'cli' } }, anchor: 'step:1:0' }
+            ]
+        }
+        let current = initial
+        const store = new Store(':memory:')
+        stores.push(store)
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async (_machineId: string, payload: { sessionIds?: string[] | null }) => {
+                if (payload.sessionIds) return { success: true, sessions: [current] }
+                const { messages: _messages, ...summary } = current
+                return { success: true, sessions: [summary] }
+            },
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({ store, getSyncEngine: () => engine, sources: [AGY_LOCAL_SESSION_SOURCE] }))
+
+        const first = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-no-cwd'], cwd: '/proj-a' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string }> }
+        expect(first.results[0]).toMatchObject({ action: 'created' })
+        const sessionId = first.results[0]!.hapiSessionId!
+        expect((store.sessions.getSessionByNamespace(sessionId, 'default')?.metadata as { path?: string }).path).toBe('/proj-a')
+
+        current = grown
+        const second = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-no-cwd'], cwd: '/proj-b' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(second.results[0]).toMatchObject({ hapiSessionId: sessionId, action: 'updated', appended: 1 })
+        expect((store.sessions.getSessionByNamespace(sessionId, 'default')?.metadata as { path?: string }).path).toBe('/proj-a')
+
+        const listed = await (await app.request('/api/agy/sessions')).json() as {
+            sessions: Array<{ id: string; cwd: string | null; savedCwd?: string; hapiSessionId?: string }>
+        }
+        expect(listed.sessions[0]).toMatchObject({
+            id: 'agy-no-cwd',
+            cwd: null,
+            savedCwd: '/proj-a',
+            hapiSessionId: sessionId
+        })
+    })
+
+    it('keeps a mixed Antigravity batch going when one transcript is still flushing, reconciles live HAPI turns on re-import, and does not apply fallbackCwd to Claude', async () => {
+        const makeAgyTranscript = (id: string): LocalTranscript => ({
+            flavor: 'agy',
+            id,
+            title: `Antigravity ${id}`,
+            lastUserMessage: 'first prompt',
+            cwd: '/work',
+            file: `/tmp/.gemini/antigravity-cli/brain/${id}/.system_generated/logs/transcript.jsonl`,
+            modifiedAt: 10,
+            messages: [
+                {
+                    id: `agy:${id}:step:0:user`,
+                    createdAt: 10,
+                    content: { role: 'user', content: { type: 'text', text: 'first prompt' }, meta: { sentFrom: 'cli' } },
+                    anchor: 'step:0:user'
+                }
+            ]
+        })
+        const flushing: LocalTranscript = {
+            ...makeAgyTranscript('agy-flushing'),
+            messages: [],
+            extra: { importError: 'Antigravity full transcript is still flushing; please retry import shortly' }
+        }
+        let agyContinued: LocalTranscript = makeAgyTranscript('agy-continued')
+        const claudeNullCwd: LocalTranscript = {
+            flavor: 'claude',
+            id: 'claude-null-cwd',
+            title: 'Claude without cwd',
+            lastUserMessage: 'hello claude',
+            cwd: null,
+            file: '/claude-projects/my-proj/claude-null-cwd.jsonl',
+            modifiedAt: 10,
+            messages: [
+                {
+                    id: 'claude:uuid-1',
+                    createdAt: 10,
+                    content: { role: 'user', content: { type: 'text', text: 'hello claude' }, meta: { sentFrom: 'cli' } }
+                }
+            ]
+        }
+        const store = new Store(':memory:')
+        stores.push(store)
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async (_machineId: string, payload: { flavor: string }) => ({
+                success: true,
+                sessions: payload.flavor === 'claude' ? [claudeNullCwd] : [flushing, agyContinued]
+            }),
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({
+            store,
+            getSyncEngine: () => engine,
+            sources: [AGY_LOCAL_SESSION_SOURCE, CLAUDE_LOCAL_SESSION_SOURCE]
+        }))
+
+        const batchRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-flushing', 'agy-continued'], cwd: '/work' })
+        })).json() as {
+            success: boolean
+            results: Array<{ agySessionId: string; hapiSessionId?: string; action?: string; error?: { code: string; message: string } }>
+        }
+        expect(batchRes.success).toBe(false)
+        expect(batchRes.results).toEqual([
+            expect.objectContaining({
+                agySessionId: 'agy-flushing',
+                error: {
+                    code: 'transcript_flushing',
+                    message: 'Antigravity full transcript is still flushing; please retry import shortly'
+                }
+            }),
+            expect.objectContaining({
+                agySessionId: 'agy-continued',
+                action: 'created'
+            })
+        ])
+        const hapiId = batchRes.results[1]!.hapiSessionId!
+
+        // Simulate a live turn sent in HAPI on the imported session (stored without agy: localIds),
+        // with two batched user messages (first has an attachment) and a background tool call placeholder.
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: 'live follow-up from HAPI',
+                    attachments: [{ path: '/uploads/screen.png', name: 'screen.png', mimeType: 'image/png', size: 100 }]
+                },
+                meta: { sentFrom: 'web' }
+            },
+            'web-live-uuid-1'
+        )
+        store.messages.addMessage(
+            hapiId,
+            { role: 'user', content: { type: 'text', text: 'queued second prompt' }, meta: { sentFrom: 'web' } },
+            'web-live-uuid-2'
+        )
+        store.messages.markMessagesInvoked(hapiId, ['web-live-uuid-1', 'web-live-uuid-2'], 20)
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: 'Live answer from agy' } },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            21
+        )
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'tool-call',
+                        callId: 'live-call-1',
+                        name: 'Bash',
+                        input: { command: 'sleep 1' }
+                    }
+                },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            21
+        )
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: {
+                        type: 'tool-call-result',
+                        callId: 'live-call-1',
+                        output: { stdout: 'Running in the background. The result appears when agy reports it.' }
+                    }
+                },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            22
+        )
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: { type: 'event', data: { type: 'round-summary', summary: { provider: 'agy' } } },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            23
+        )
+
+        // Native transcript now includes that combined formatted live turn.
+        agyContinued = {
+            ...agyContinued,
+            messages: [
+                ...agyContinued.messages,
+                {
+                    id: 'agy:agy-continued:step:2:user',
+                    createdAt: 20,
+                    content: {
+                        role: 'user',
+                        content: {
+                            type: 'text',
+                            text: '@/uploads/screen.png\n\nlive follow-up from HAPI\nqueued second prompt'
+                        },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:2:user'
+                },
+                {
+                    id: 'agy:agy-continued:step:3:text',
+                    createdAt: 21,
+                    content: {
+                        role: 'agent',
+                        content: { type: 'codex', data: { type: 'message', message: 'Live answer from agy' } },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:3:text'
+                },
+                {
+                    id: 'agy:agy-continued:step:3:call:0',
+                    createdAt: 21,
+                    content: {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call',
+                                callId: 'agy-wakeup-agy-continued-3-0',
+                                name: 'Bash',
+                                input: { command: 'sleep 1' }
+                            }
+                        },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:3:call:0'
+                },
+                {
+                    id: 'agy:agy-continued:step:4:0',
+                    createdAt: 22,
+                    content: {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call-result',
+                                callId: 'agy-wakeup-agy-continued-3-0',
+                                output: { stdout: 'Running in the background. The result appears when agy reports it.' }
+                            }
+                        },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:4:0'
+                }
+            ]
+        }
+
+        const reimportSame = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(reimportSame.success).toBe(true)
+        expect(reimportSame.results[0]).toMatchObject({
+            hapiSessionId: hapiId,
+            action: 'unchanged',
+            appended: 0
+        })
+
+        // A late native background tool completion arrives in the transcript without a new user prompt,
+        // and its callId must be rewritten from `agy-wakeup-agy-continued-3-0` to `live-call-1`!
+        agyContinued = {
+            ...agyContinued,
+            messages: [
+                ...agyContinued.messages,
+                {
+                    id: 'agy:agy-continued:step:5:0',
+                    createdAt: 25,
+                    content: {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call-result',
+                                callId: 'agy-wakeup-agy-continued-3-0',
+                                output: { stdout: 'done', exit_code: 0 }
+                            }
+                        },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:5:0'
+                }
+            ]
+        }
+        const reimportLateToolResult = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(reimportLateToolResult.success).toBe(true)
+        expect(reimportLateToolResult.results[0]).toMatchObject({
+            hapiSessionId: hapiId,
+            action: 'updated',
+            appended: 1
+        })
+        const storedAfterLateResult = store.messages.getAllMessages(hapiId)
+        const importedLateResult = storedAfterLateResult.find((m) => m.localId === 'agy:agy-continued:step:5:0')
+        expect(importedLateResult?.content).toMatchObject({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'tool-call-result',
+                    callId: 'live-call-1',
+                    output: { stdout: 'done', exit_code: 0 }
+                }
+            }
+        })
+
+        // Re-importing again with the rewritten callId already stored must report unchanged!
+        const reimportAfterLateResultAgain = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(reimportAfterLateResultAgain.success).toBe(true)
+        expect(reimportAfterLateResultAgain.results[0]).toMatchObject({
+            hapiSessionId: hapiId,
+            action: 'unchanged',
+            appended: 0
+        })
+
+        // Two user prompts queued in HAPI before the first turn produces output, delivered in two separate turns,
+        // where a native background completion also lands before a matched assistant text in the second turn!
+        store.messages.addMessage(
+            hapiId,
+            { role: 'user', content: { type: 'text', text: 'turn A prompt' }, meta: { sentFrom: 'web' } },
+            'web-live-turn-a'
+        )
+        store.messages.addMessage(
+            hapiId,
+            { role: 'user', content: { type: 'text', text: 'turn B prompt' }, meta: { sentFrom: 'web' } },
+            'web-live-turn-b'
+        )
+        store.messages.markMessagesInvoked(hapiId, ['web-live-turn-a'], 26)
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: 'Turn A answer' } },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            27
+        )
+        store.messages.markMessagesInvoked(hapiId, ['web-live-turn-b'], 28)
+        store.messages.addMessage(
+            hapiId,
+            {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: 'Turn B answer' } },
+                meta: { sentFrom: 'cli' }
+            },
+            undefined,
+            undefined,
+            29
+        )
+
+        agyContinued = {
+            ...agyContinued,
+            messages: [
+                ...agyContinued.messages,
+                {
+                    id: 'agy:agy-continued:step:6:user',
+                    createdAt: 26,
+                    content: { role: 'user', content: { type: 'text', text: 'turn A prompt' }, meta: { sentFrom: 'cli' } },
+                    anchor: 'step:6:user'
+                },
+                {
+                    id: 'agy:agy-continued:step:7:text',
+                    createdAt: 27,
+                    content: {
+                        role: 'agent',
+                        content: { type: 'codex', data: { type: 'message', message: 'Turn A answer' } },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:7:text'
+                },
+                {
+                    id: 'agy:agy-continued:step:8:user',
+                    createdAt: 28,
+                    content: { role: 'user', content: { type: 'text', text: 'turn B prompt' }, meta: { sentFrom: 'cli' } },
+                    anchor: 'step:8:user'
+                },
+                {
+                    id: 'agy:agy-continued:step:9:0',
+                    createdAt: 28,
+                    content: {
+                        role: 'agent',
+                        content: {
+                            type: 'codex',
+                            data: {
+                                type: 'tool-call-result',
+                                callId: 'agy-wakeup-agy-continued-3-0',
+                                output: { stdout: 'preceding native completion', exit_code: 0 }
+                            }
+                        },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:9:0'
+                },
+                {
+                    id: 'agy:agy-continued:step:10:text',
+                    createdAt: 29,
+                    content: {
+                        role: 'agent',
+                        content: { type: 'codex', data: { type: 'message', message: 'Turn B answer' } },
+                        meta: { sentFrom: 'cli' }
+                    },
+                    anchor: 'step:10:text'
+                }
+            ]
+        }
+
+        const reimportPrecedingResult = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(reimportPrecedingResult.success).toBe(true)
+        expect(reimportPrecedingResult.results[0]).toMatchObject({
+            hapiSessionId: hapiId,
+            action: 'updated',
+            appended: 1
+        })
+        const importedPrecedingResult = store.messages.getAllMessages(hapiId)
+            .find((m) => m.localId === 'agy:agy-continued:step:9:0')
+        expect(importedPrecedingResult?.content).toMatchObject({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'tool-call-result',
+                    callId: 'live-call-1',
+                    output: { stdout: 'preceding native completion', exit_code: 0 }
+                }
+            }
+        })
+
+        // External CLI appends one more turn after the HAPI turn.
+        agyContinued = {
+            ...agyContinued,
+            messages: [
+                ...agyContinued.messages,
+                {
+                    id: 'agy:agy-continued:step:4:user',
+                    createdAt: 30,
+                    content: { role: 'user', content: { type: 'text', text: 'external cli turn' }, meta: { sentFrom: 'cli' } },
+                    anchor: 'step:4:user'
+                }
+            ]
+        }
+        const reimportAfterExternal = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(reimportAfterExternal.success).toBe(true)
+        expect(reimportAfterExternal.results[0]).toMatchObject({
+            hapiSessionId: hapiId,
+            action: 'updated',
+            appended: 1
+        })
+
+        // Claude with cwd: null keeps dirname(transcript.file) instead of request fallbackCwd.
+        const claudeRes = await (await app.request('/api/claude/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['claude-null-cwd'], cwd: '/form-unrelated-dir' })
+        })).json() as { success: boolean; results: Array<{ hapiSessionId?: string }> }
+        expect(claudeRes.success).toBe(true)
+        const claudeHapiId = claudeRes.results[0]!.hapiSessionId!
+        expect((store.sessions.getSessionByNamespace(claudeHapiId, 'default')?.metadata as { path?: string }).path)
+            .toBe('/claude-projects/my-proj')
+    })
+
+    it('keeps imported Antigravity sessions with the same native ID distinct across two machines', async () => {
+        const store = new Store(':memory:')
+        stores.push(store)
+        const m1 = machine('m-1')
+        const m2 = machine('m-2')
+        const engine = {
+            getOnlineMachinesByNamespace: () => [m1, m2],
+            listLocalSessionsForMachine: async (machineId: string) => ({
+                success: true,
+                sessions: [{
+                    flavor: 'agy' as const,
+                    id: 'agy-shared-conv',
+                    title: 'Shared conv',
+                    lastUserMessage: `from ${machineId}`,
+                    cwd: '/work',
+                    file: '/tmp/.gemini/antigravity-cli/brain/agy-shared-conv/.system_generated/logs/transcript.jsonl',
+                    modifiedAt: 10,
+                    messages: [{
+                        id: 'agy:agy-shared-conv:step:0:user',
+                        createdAt: 10,
+                        content: { role: 'user', content: { type: 'text', text: `from ${machineId}` }, meta: { sentFrom: 'cli' } },
+                        anchor: 'step:0:user'
+                    }]
+                }]
+            }),
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({
+            store,
+            getSyncEngine: () => engine,
+            sources: [AGY_LOCAL_SESSION_SOURCE]
+        }))
+
+        const importM1 = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-shared-conv'], machineId: 'm-1', cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string }> }
+        const importM2 = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-shared-conv'], machineId: 'm-2', cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string }> }
+
+        const hapiM1 = importM1.results[0]!.hapiSessionId!
+        const hapiM2 = importM2.results[0]!.hapiSessionId!
+        expect(hapiM1).not.toBe(hapiM2)
+        expect(store.messages.getAllMessages(hapiM1)[0]?.content).toMatchObject({
+            content: { text: 'from m-1' }
+        })
+        expect(store.messages.getAllMessages(hapiM2)[0]?.content).toMatchObject({
+            content: { text: 'from m-2' }
+        })
     })
 
 })

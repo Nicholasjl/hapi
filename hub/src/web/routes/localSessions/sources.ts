@@ -37,6 +37,7 @@ export type LocalSessionNativeIdKey =
     | 'opencodeSessionId'
     | 'claudeSessionId'
     | 'claudeSessionIdHistory'
+    | 'agySessionId'
     | 'codexSessionId'
     | 'codexSourceSessionId'
 
@@ -53,10 +54,14 @@ export type HubLocalSessionSource = {
         cursorKey?: 'piHistoryLeafEntryId'
         /** Maps stored and transcript content to the fields that must stay equal. */
         canonicalContent?: (content: unknown) => unknown
+        /** Reconciles non-imported live HAPI turns after the imported prefix against native transcript turns. */
+        reconcileLiveContinuation?: boolean
     }
         | { strategy: 'contentPrefix'; compareKey?: (content: unknown) => string | null }
     /** Lifecycle stamped on create. */
     lifecycleOnCreate: 'archived' | 'imported'
+    /** When true, refuse importing without a validated workspace path (never fall back to dirname(file)). */
+    requireWorkingDirectory?: boolean
     /** Multi-import loop policy. */
     batch: 'continue' | 'stopOnFirstError'
     /** Flavor-only import progress metadata key (Pi). */
@@ -226,6 +231,19 @@ export const CLAUDE_LOCAL_SESSION_SOURCE: HubLocalSessionSource = {
     batch: 'continue',
     importLimit: 200,
     localIdPrefix: 'claude:',
+    requiredMachineCapability: MACHINE_CAPABILITIES.LocalSessionImport
+}
+
+export const AGY_LOCAL_SESSION_SOURCE: HubLocalSessionSource = {
+    flavor: 'agy',
+    displayName: 'Antigravity',
+    routeBase: 'agy',
+    nativeIdKeys: ['agySessionId'],
+    match: { strategy: 'anchored', reconcileLiveContinuation: true },
+    lifecycleOnCreate: 'archived',
+    requireWorkingDirectory: true,
+    batch: 'continue',
+    importLimit: 200,
     requiredMachineCapability: MACHINE_CAPABILITIES.LocalSessionImport
 }
 
