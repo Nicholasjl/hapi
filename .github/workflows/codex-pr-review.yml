@@ -43,6 +43,16 @@ jobs:
         env:
           HAPI_BOT_LOGINS: ${{ vars.HAPI_BOT_LOGINS }}
 
+      - name: Verify review credentials
+        if: steps.prepare.outputs.should_review == 'true'
+        env:
+          HAS_REVIEW_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: |
+          if [[ "$HAS_REVIEW_KEY" != true ]]; then
+            echo '::error::Configure the OPENAI_API_KEY Actions secret in this repository to run Codex PR Review.'
+            exit 1
+          fi
+
       - name: Fetch fixed review commits
         if: steps.prepare.outputs.should_review == 'true'
         env:
