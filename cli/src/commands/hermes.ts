@@ -3,7 +3,8 @@ import { authAndSetupMachineIfNeeded } from '@/ui/auth'
 import { initializeToken } from '@/ui/tokenInit'
 import { maybeAutoStartServer } from '@/utils/autoStartServer'
 import type { CommandDefinition } from './types'
-import { HERMES_PERMISSION_MODES, type HermesPermissionMode } from '@hapi/protocol/modes'
+import { Flavors } from '@hapi/protocol/modes'
+import type { PermissionModeOf } from '@hapi/protocol/types'
 
 export const hermesCommand: CommandDefinition = {
     name: 'hermes',
@@ -13,7 +14,7 @@ export const hermesCommand: CommandDefinition = {
             const options: {
                 startedBy?: 'runner' | 'terminal'
                 startingMode?: 'remote'
-                permissionMode?: HermesPermissionMode
+                permissionMode?: PermissionModeOf<typeof Flavors.hermes>
                 model?: string
                 resumeSessionId?: string
                 existingSessionId?: string
@@ -49,10 +50,10 @@ export const hermesCommand: CommandDefinition = {
                     options.existingSessionId = sessionId
                 } else if (arg === '--permission-mode') {
                     const mode = commandArgs[++i]
-                    if (!mode || !(HERMES_PERMISSION_MODES as readonly string[]).includes(mode)) {
+                    if (!mode || !Flavors.hermes.allowsPermissionMode(mode)) {
                         throw new Error(`Invalid --permission-mode value: ${mode ?? '(missing)'}`)
                     }
-                    options.permissionMode = mode as HermesPermissionMode
+                    options.permissionMode = mode
                     hasExplicitPermissionMode = true
                 } else if (arg === '--yolo' && !hasExplicitPermissionMode) {
                     options.permissionMode = 'yolo'

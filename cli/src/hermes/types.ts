@@ -1,4 +1,6 @@
-import type { HermesPermissionMode } from '@hapi/protocol/modes'
+import type { Flavors, PermissionModeOf } from '@hapi/protocol/types'
+
+export type HermesPermissionMode = PermissionModeOf<typeof Flavors.hermes>
 
 export type HermesMode = {
     permissionMode?: HermesPermissionMode

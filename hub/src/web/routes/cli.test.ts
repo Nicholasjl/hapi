@@ -1,10 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, mock } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import { Hono } from 'hono'
 import type { SyncEngine } from '../../sync/syncEngine'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { createConfiguration, resetConfigurationForTests } from '../../configuration'
 import { writeAutoBridgeTransientModelErrorsEnabled } from '../../config/autoBridgeTransientModelErrors'
 import { createCliRoutes } from './cli'
 import { SessionIdentityConflictError } from '../../store/sessions'
@@ -23,9 +24,32 @@ function authHeaders() {
     }
 }
 
-let dataDir: string
-beforeAll(async () => { dataDir = await mkdtemp(join(tmpdir(), 'hapi-cli-routes-')) }, 30_000)
-afterAll(async () => { await rm(dataDir, { recursive: true, force: true }) }, 30_000)
+let homeDir = ''
+let dataDir = ''
+let previousHapiHome: string | undefined
+
+// Actions runners under a full hub suite occasionally exceed bun's default 5s
+// hook budget during createConfiguration (seen as an unnamed
+// beforeEach/afterEach timeout). Give setup headroom — tiann/hapi#2514.
+beforeAll(async () => {
+    previousHapiHome = process.env.HAPI_HOME
+    homeDir = mkdtempSync(join(tmpdir(), 'hapi-cli-test-'))
+    process.env.HAPI_HOME = homeDir
+    resetConfigurationForTests()
+    const config = await createConfiguration()
+    dataDir = config.dataDir
+    config._setCliApiToken('test-token', 'env', false)
+    await config.setGithubPrAwareness(true)
+}, 30_000)
+
+afterAll(() => {
+    if (previousHapiHome === undefined) delete process.env.HAPI_HOME
+    else process.env.HAPI_HOME = previousHapiHome
+    if (homeDir) {
+        resetConfigurationForTests(homeDir)
+        rmSync(homeDir, { recursive: true, force: true })
+    }
+})
 
 describe('cli shutdown preparation', () => {
     function fixture(machineId = 'machine-1') {

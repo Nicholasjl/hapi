@@ -1,6 +1,6 @@
 import React from 'react'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
-import type { HermesPermissionMode } from '@hapi/protocol/modes'
+import type { HermesPermissionMode } from './types'
 import { createAcpSessionTitleSync, registerAcpSessionTitleSync } from '@/agent/acpSessionTitle'
 import { buildHapiMcpBridge } from '@/codex/utils/buildHapiMcpBridge'
 import { logger } from '@/ui/logger'

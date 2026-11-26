@@ -390,6 +390,19 @@ function requiredParkMsForToolCalls(
 }
 
 /**
+ * `agy acp` streams reactive wakeup updates live from 1.5.10 on
+ * (google-antigravity/antigravity-cli#1461); an unknown or unparseable version
+ * keeps the transcript-rendered behavior.
+ */
+export function supportsAgyLiveIdleWakeups(version: string | null | undefined): boolean {
+    const match = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.exec(version ?? '');
+    if (!match) return false;
+    const [major, minor, patch] = [Number(match[1]), Number(match[2]), Number(match[3])];
+    // 1.5.10-beta sorts below 1.5.10.
+    return major !== 1 ? major > 1 : minor !== 5 ? minor > 5 : patch > 10 || (patch === 10 && !match[4]);
+}
+
+/**
  * Classifies new transcript steps written after a user turn finished.
  * Only autonomous `SYSTEM_MESSAGE` entries start a reactive wakeup.
  */
@@ -1051,25 +1064,28 @@ export function inspectSyntheticBackgroundCommandMatch(
     );
     const actionsByStep = new Map(recentSteps.map(step => [step.step_index, step]));
     const freshActions: Array<AgyTranscriptStep | undefined> = [];
-    for (const step of recentSteps) {
-        if (step.step_index <= turnStartStepIndex) continue;
-        if (candidateStepIndexes.has(step.step_index)) continue;
-        if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') continue;
-        (step.tool_calls ?? []).forEach((call, index) => {
-            if (call.name !== 'run_command') return;
-            const args = decodeAgyTranscriptArgs(call.args);
-            const plannedCmd = typeof args.CommandLine === 'string' ? args.CommandLine : undefined;
-            if (liveCommandLine !== undefined && plannedCmd !== liveCommandLine) return;
-            if (liveArgs) {
-                for (const [key, val] of Object.entries(liveArgs)) {
-                    if (typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
-                        continue;
+    // A result-only update names no command, so any planned call would "match" it.
+    if (liveCommandLine !== undefined || liveArgs !== undefined) {
+        for (const step of recentSteps) {
+            if (step.step_index <= turnStartStepIndex) continue;
+            if (candidateStepIndexes.has(step.step_index)) continue;
+            if (step.source !== 'MODEL' || step.type !== 'PLANNER_RESPONSE') continue;
+            (step.tool_calls ?? []).forEach((call, index) => {
+                if (call.name !== 'run_command') return;
+                const args = decodeAgyTranscriptArgs(call.args);
+                const plannedCmd = typeof args.CommandLine === 'string' ? args.CommandLine : undefined;
+                if (liveCommandLine !== undefined && plannedCmd !== liveCommandLine) return;
+                if (liveArgs) {
+                    for (const [key, val] of Object.entries(liveArgs)) {
+                        if (typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
+                            continue;
+                        }
+                        if (args[key] !== undefined && args[key] !== val) return;
                     }
-                    if (args[key] !== undefined && args[key] !== val) return;
                 }
-            }
-            freshActions.push(actionsByStep.get(step.step_index + index + 1));
-        });
+                freshActions.push(actionsByStep.get(step.step_index + index + 1));
+            });
+        }
     }
 
     // A different persisted output distinguishes an older replay even when

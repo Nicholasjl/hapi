@@ -1,8 +1,7 @@
 import { ApiClient, ApiSessionClient } from '@/lib'
 import { MessageQueue2 } from '@/utils/MessageQueue2'
 import { AgentSessionBase } from '@/agent/sessionBase'
-import type { HermesPermissionMode } from '@hapi/protocol/modes'
-import type { HermesMode } from './types'
+import type { HermesMode, HermesPermissionMode } from './types'
 
 /** Remote-only HAPI session wrapper for the Hermes ACP server. */
 export class HermesSession extends AgentSessionBase<HermesMode> {

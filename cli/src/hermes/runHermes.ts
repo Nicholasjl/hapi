@@ -9,10 +9,9 @@ import { formatMessageWithAttachments } from '@/utils/attachmentFormatter'
 import { getInvokedCwd } from '@/utils/invokedCwd'
 import { logger } from '@/ui/logger'
 import type { AgentState } from '@/api/types'
-import type { HermesPermissionMode } from '@hapi/protocol/modes'
 import { HermesRemoteLauncher } from './hermesRemoteLauncher'
 import { HermesSession } from './session'
-import { hermesModeForPreference, type HermesMode } from './types'
+import { hermesModeForPreference, type HermesMode, type HermesPermissionMode } from './types'
 
 export async function runHermes(opts: {
     startedBy?: 'runner' | 'terminal'
