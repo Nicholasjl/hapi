@@ -1397,7 +1397,7 @@ if (isReconnect) {
         }, 'droppable')
     }
 
-    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean }): void {
+    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean; nativeId?: string }): void {
         if (localIds.length === 0) return
         // `clearQueuedThinkingGrace` is an opt-in signal for the hub to drop
         // the 15s queued-thinking grace immediately. Only synchronous handlers
@@ -1410,6 +1410,7 @@ if (isReconnect) {
             localIds: string[]
             clearQueuedThinkingGrace?: boolean
             steered?: boolean
+            nativeId?: string
         } = {
             sid: this.sessionId,
             localIds
@@ -1420,7 +1421,20 @@ if (isReconnect) {
         if (options?.steered) {
             payload.steered = true
         }
+        if (options?.nativeId) {
+            payload.nativeId = options.nativeId
+        }
         this.emitOrQueue(() => this.socket.emit('messages-consumed', payload))
+    }
+
+    /** Clears an uncommitted native user delivery intent (e.g. cancelled before output and restored to composer). */
+    discardPendingNativeDelivery(nativeId: string, localIds: string[]): void {
+        if (!nativeId || localIds.length === 0) return
+        this.emitOrQueue(() => this.socket.emit('session-discard-native-delivery', {
+            sid: this.sessionId,
+            nativeId,
+            localIds: [...localIds]
+        }))
     }
 
     /** Persist the durable pre-dispatch/restore state with a hub ACK. */
@@ -1766,7 +1780,7 @@ if (isReconnect) {
         }
         const MAX_NATIVE_COMMIT_BATCH = 50
         const deadlineMs = Date.now() + timeoutMs
-        let offset = expectedOffset
+        let lastConfirmedCount = expectedOffset
         let totalInserted = 0
         let totalUpdated = 0
         for (let i = 0; i < entries.length; i += MAX_NATIVE_COMMIT_BATCH) {
@@ -1779,7 +1793,7 @@ if (isReconnect) {
                 const response = await this.socket.timeout(remainingMs).emitWithAck('session-commit-native-steps', {
                     sid: this.sessionId,
                     nativeId,
-                    expectedOffset: offset,
+                    expectedOffset: expectedOffset + i,
                     entries: chunk.map((entry) => ({
                         ...entry,
                         ...(entry.kind === 'link' ? { targetLocalIds: [...entry.targetLocalIds] } : {})
@@ -1788,14 +1802,14 @@ if (isReconnect) {
                 if (!response?.ok) {
                     return response ?? { ok: false }
                 }
-                offset = response.confirmedCount
+                lastConfirmedCount = Math.max(lastConfirmedCount, response.confirmedCount)
                 totalInserted += response.inserted
                 totalUpdated += response.updated
             } catch {
                 return { ok: false }
             }
         }
-        return { ok: true, confirmedCount: offset, inserted: totalInserted, updated: totalUpdated }
+        return { ok: true, confirmedCount: lastConfirmedCount, inserted: totalInserted, updated: totalUpdated }
     }
 
     /** Reconciles disk-settled native transcript steps against Hub's confirmed step ledger on reopen. */
@@ -1806,6 +1820,15 @@ if (isReconnect) {
     ): Promise<
         | { ok: true; status: 'up_to_date'; confirmedCount: number }
         | { ok: true; status: 'needs_backfill'; fromIndex: number }
+        | {
+            ok: true
+            status: 'needs_reconcile'
+            fromIndex: number
+            pendingDeliveries: Array<
+                | { kind: 'user'; localIds: string[]; texts: string[] }
+                | { kind: 'agent'; localId: string; data: Record<string, unknown> }
+            >
+        }
         | { ok: true; status: 'diverged' }
         | { ok: false }
     > {

@@ -1300,13 +1300,48 @@ describe('generic local session routes', () => {
         expect(storedLocalIds).toContain('agy:agy-e2e:step:7:0')
         expect(storedLocalIds).toContain('agy:agy-e2e:step:8:text')
 
-        // 4. Uncommitted agy-live: message past the confirmed ledger causes re-import to fail closed with transcript_diverged.
+        // 3b. Crash-before-commit leaves durable pending user + partial agy-live: reply in SQLite;
+        //     repeat import recovers cleanly by linking user, upgrading partial reply in place, appending disk-only steps,
+        //     and clearing pending deliveries so repeat import is idempotent.
+        const crashUser = store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'crash turn' }, meta: { sentFrom: 'web' } }, 'crash-u-1', null, 60)
+        handlers.get('messages-consumed')!({ sid: hapiId, localIds: ['crash-u-1'], nativeId: 'agy-e2e' })
+        let crashLiveReplyId = ''
+        handlers.get('message')!({
+            sid: hapiId,
+            localId: 'agy-live:crash-r-1',
+            createdAt: 61,
+            message: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'crash reply' } } }
+        })
+        crashLiveReplyId = store.messages.getAllMessages(hapiId).find((m) => m.localId === 'agy-live:crash-r-1')!.id
+        expect(store.nativeSteps.getPendingDeliveries(hapiId, 'agy-e2e')).toHaveLength(2)
+
+        const s9CrashUser = nativeUser('agy-e2e', 'step:9:0', 'crash turn', 60)
+        const s10CrashFull = nativeAgent('agy-e2e', 'step:10:text', 'crash reply full text', 61)
+        const s11Offline = nativeUser('agy-e2e', 'step:11:0', 'offline follow-up after crash', 65)
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9CrashUser, s10CrashFull, s11Offline] }
+
+        const recoverRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(recoverRes.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 1 })
+        expect(store.messages.getMessageById(hapiId, crashLiveReplyId)?.content).toEqual(s10CrashFull.content)
+        expect(store.messages.getAllMessages(hapiId).filter((m) => m.id === crashUser.id)).toHaveLength(1)
+        expect(store.nativeSteps.getPendingDeliveries(hapiId, 'agy-e2e')).toEqual([])
+
+        const repeatAfterRecover = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(repeatAfterRecover.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
+
+        // 4. Verified conflict (uncommitted agy-live: agent message that does not match next native step) fails closed with transcript_diverged.
         store.messages.addMessage(hapiId, {
             role: 'agent',
-            content: { type: 'codex', data: { type: 'message', message: 'uncommitted live' } }
-        }, 'agy-live:trailing', null, 60)
-        const s9 = nativeUser('agy-e2e', 'step:9:0', 'another native prompt', 70)
-        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9] }
+            content: { type: 'codex', data: { type: 'message', message: 'uncommitted conflicting live' } }
+        }, 'agy-live:trailing', null, 70)
+        const s12 = nativeUser('agy-e2e', 'step:12:0', 'another native prompt', 75)
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9CrashUser, s10CrashFull, s11Offline, s12] }
         const divRes = await (await app.request('/api/agy/import-sessions', {
             method: 'POST',
             body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })

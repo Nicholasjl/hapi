@@ -5,8 +5,12 @@ import {
     type LocalTranscript,
     type LocalTranscriptMessage
 } from '@hapi/protocol/localTranscript'
-import type { StoredMessage } from '../../../store'
+import type { StoredMessage, StoredPendingNativeDelivery } from '../../../store'
 import { truncateOversizedMessageContent } from '../../../store/contentCodec'
+import {
+    collectEffectivePendingDeliveries,
+    matchPendingDeliveriesAgainstTranscript
+} from './reconcileNativeDeliveries'
 
 /**
  * Anchored target matching: the imported prefix P of the HAPI
@@ -23,7 +27,13 @@ import { truncateOversizedMessageContent } from '../../../store/contentCodec'
  */
 
 export type AnchoredMatchResult =
-    | { status: 'ok'; delta: LocalTranscriptMessage[] }
+    | {
+        status: 'ok'
+        delta: LocalTranscriptMessage[]
+        reconciledSteps?: Array<{ anchor: string; fingerprint: string; messageId: string }>
+        reconciledUpdates?: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }>
+        resolvedPendingMessageIds?: string[]
+    }
     | { status: 'transcript_diverged'; message: string }
     | { status: 'already_in_hapi'; message: string }
 
@@ -48,8 +58,10 @@ export function matchAnchored(options: {
     canonicalContent?: (content: unknown) => unknown
     /** Confirmed native transcript step ledger recorded for an imported session. */
     recordedNativeSteps?: ReadonlyArray<RecordedNativeStep>
+    /** Uncommitted live HAPI deliveries awaiting ledger link or upgrade on import. */
+    pendingNativeDeliveries?: ReadonlyArray<StoredPendingNativeDelivery>
 }): AnchoredMatchResult {
-    const { storedMessages, transcript, importPrefix, cursor, recordedNativeSteps } = options
+    const { storedMessages, transcript, importPrefix, cursor, recordedNativeSteps, pendingNativeDeliveries } = options
     const canonical = options.canonicalContent ?? ((content: unknown) => content)
     const sameContent = (source: unknown, stored: unknown): boolean =>
         isDeepStrictEqual(canonical(source), canonical(stored))
@@ -163,21 +175,29 @@ export function matchAnchored(options: {
                 }
             }
         }
-        const delta = sourceMessages.slice(recordedNativeSteps.length)
-        if (delta.length > 0) {
-            const hasUncommittedLiveMessages = storedMessages.some((message) =>
-                message.seq > lastRecordedSeq
-                && typeof message.localId === 'string'
-                && message.localId.startsWith('agy-live:')
-            )
-            if (hasUncommittedLiveMessages) {
+        const effectivePending = collectEffectivePendingDeliveries(
+            storedMessages,
+            recordedNativeSteps,
+            pendingNativeDeliveries ?? []
+        )
+        const tail = sourceMessages.slice(recordedNativeSteps.length)
+        if (effectivePending.length > 0) {
+            const matched = matchPendingDeliveriesAgainstTranscript(tail, effectivePending)
+            if (matched.status !== 'ok') {
                 return {
                     status: 'transcript_diverged',
-                    message: 'The HAPI session has uncommitted live turns past the confirmed native ledger'
+                    message: matched.message
                 }
             }
+            return {
+                status: 'ok',
+                delta: matched.delta,
+                reconciledSteps: matched.reconciledSteps,
+                reconciledUpdates: matched.reconciledUpdates,
+                resolvedPendingMessageIds: matched.resolvedPendingMessageIds
+            }
         }
-        return { status: 'ok', delta }
+        return { status: 'ok', delta: tail }
     }
 
     // No cursor: the imported prefix must align exactly with the head of the

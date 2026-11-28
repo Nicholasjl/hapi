@@ -397,7 +397,7 @@ describe('anchored match: Antigravity native step ledger', () => {
             recordedNativeSteps: linkedLedger
         }).status).toBe('transcript_diverged')
 
-        // Uncommitted agy-live row at seq > lastRecordedSeq diverges when delta is non-empty.
+        // Uncommitted conflicting agy-live row at seq > lastRecordedSeq diverges when it doesn't match native tail.
         expect(matchAnchored({
             storedMessages: [
                 stored0,
@@ -410,6 +410,33 @@ describe('anchored match: Antigravity native step ledger', () => {
             cursor: null,
             recordedNativeSteps: linkedLedger
         }).status).toBe('transcript_diverged')
+
+        // Uncommitted pending user + partial agy-live reply reconciles cleanly when disk extends/refines them.
+        const pendingUser = agyStoredUser(3, 'u-live', 'offline continuation', 12)
+        const pendingAgent = agyStoredAgent(4, { type: 'message', message: 'partial' }, 13, 'agy-live:r-1')
+        const s3Full = agyNativeAgent('step:3:text', { type: 'message', message: 'partial full text' })
+        const s4Tail = agyNativeUser('step:4:0', 'trailing native')
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, pendingUser, pendingAgent],
+            transcript: agyTranscript([s0, s1, s2, s3Full, s4Tail]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: pendingUser.id, localIds: ['u-live'] },
+                { deliverySeq: 2, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
+            ]
+        })).toMatchObject({
+            status: 'ok',
+            delta: [s4Tail],
+            resolvedPendingMessageIds: [pendingUser.id, pendingAgent.id],
+            reconciledUpdates: [{
+                messageId: pendingAgent.id,
+                localId: 'agy-live:r-1',
+                anchor: 'step:3:text',
+                nextContent: s3Full.content
+            }]
+        })
 
         // Non-agy-live control/restore rows alone without agy-live rows still reconcile cleanly.
         expect(matchAnchored({

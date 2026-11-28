@@ -286,7 +286,8 @@ export interface ClientToServerEvents {
         processStartMarker?: string
         time: number
     }) => void
-    'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => void
+    'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean; nativeId?: string }) => void
+    'session-discard-native-delivery': (data: { sid: string; nativeId: string; localIds: string[] }) => void
     'session-commit-native-steps': (
         data: {
             sid: string
@@ -336,6 +337,15 @@ export interface ClientToServerEvents {
             response:
                 | { ok: true; status: 'up_to_date'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }
+                | {
+                    ok: true
+                    status: 'needs_reconcile'
+                    fromIndex: number
+                    pendingDeliveries: Array<
+                        | { kind: 'user'; localIds: string[]; texts: string[] }
+                        | { kind: 'agent'; localId: string; data: Record<string, unknown> }
+                    >
+                }
                 | { ok: true; status: 'diverged' }
                 | { ok: false }
         ) => void

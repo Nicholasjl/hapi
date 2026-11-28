@@ -256,7 +256,7 @@ type ImportedReconcileState =
     | { status: 'diverged'; reason: string };
 
 type PendingNativeDelivery =
-    | { kind: 'user'; localIds: string[]; text: string }
+    | { kind: 'user'; localIds: string[]; texts: string[] }
     | { kind: 'agent'; localId: string; data: CodexMessage };
 
 type NativeCommitEntry = Parameters<NonNullable<AgySession['client']['commitNativeSteps']>>[2][number];
@@ -284,14 +284,16 @@ function isExactDeliveryMatch(diskMessage: AgyImportedMessage, delivery: Pending
             return false;
         }
         const diskText = content.content.text;
-        if (diskText === delivery.text || diskText.trim() === delivery.text.trim()) {
-            return true;
-        }
         const trimmedDisk = diskText.trim();
-        const trimmedDelivery = delivery.text.trim();
-        return Boolean(trimmedDelivery)
-            && trimmedDisk.startsWith('@')
-            && trimmedDisk.endsWith(`\n\n${trimmedDelivery}`);
+        return delivery.texts.some((text) => {
+            if (diskText === text || trimmedDisk === text.trim()) {
+                return true;
+            }
+            const trimmedDelivery = text.trim();
+            return Boolean(trimmedDelivery)
+                && trimmedDisk.startsWith('@')
+                && trimmedDisk.endsWith(`\n\n${trimmedDelivery}`);
+        });
     }
     const diskData = extractAgentPayloadData(diskMessage.content);
     if (!diskData || diskData.type !== delivery.data.type) {
@@ -312,6 +314,22 @@ function isExactDeliveryMatch(diskMessage: AgyImportedMessage, delivery: Pending
     }
 }
 
+function isPrefixOrRefinedText(liveText: unknown, diskText: unknown): boolean {
+    if (typeof liveText !== 'string' || typeof diskText !== 'string') return false;
+    const liveTrimmed = liveText.trim();
+    const diskTrimmed = diskText.trim();
+    if (!liveTrimmed || !diskTrimmed) return false;
+    if (diskText.startsWith(liveText) || diskTrimmed.startsWith(liveTrimmed)) {
+        return true;
+    }
+    const unclipped = liveTrimmed.replace(/(?:\.\.\.|…)+$/, '').trimEnd();
+    return unclipped.length > 0 && diskTrimmed.startsWith(unclipped);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function isCompatibleUpdateMatch(diskMessage: AgyImportedMessage, delivery: PendingNativeDelivery): boolean {
     if (delivery.kind !== 'agent') return false;
     const diskData = extractAgentPayloadData(diskMessage.content);
@@ -319,10 +337,33 @@ function isCompatibleUpdateMatch(diskMessage: AgyImportedMessage, delivery: Pend
     switch (delivery.data.type) {
         case 'message':
         case 'reasoning':
-        case 'tool-call-result':
-            return true;
+            return isPrefixOrRefinedText(delivery.data.message, diskData.message);
         case 'tool-call':
             return delivery.data.name === diskData.name;
+        case 'tool-call-result': {
+            if (delivery.data.output === AGY_BACKGROUND_COMMAND_RESULT) {
+                return true;
+            }
+            if (typeof delivery.data.output === 'string' && typeof diskData.output === 'string') {
+                return delivery.data.output.trim() === '' || isPrefixOrRefinedText(delivery.data.output, diskData.output);
+            }
+            if (isPlainObject(delivery.data.output) && isPlainObject(diskData.output)) {
+                const liveStdout = typeof delivery.data.output.stdout === 'string'
+                    ? delivery.data.output.stdout
+                    : typeof delivery.data.output.output === 'string'
+                        ? delivery.data.output.output
+                        : null;
+                const diskStdout = typeof diskData.output.stdout === 'string'
+                    ? diskData.output.stdout
+                    : typeof diskData.output.output === 'string'
+                        ? diskData.output.output
+                        : null;
+                if (liveStdout !== null && diskStdout !== null) {
+                    return liveStdout.trim() === '' || isPrefixOrRefinedText(liveStdout, diskStdout);
+                }
+            }
+            return false;
+        }
         default:
             return false;
     }
@@ -387,7 +428,7 @@ type AgyTurn = {
     usage: UsageMessage | null;
     // Any agent output proves agy accepted the prompt.
     sawActivity: boolean;
-    acknowledge: () => void;
+    acknowledge: (asNativeTurn?: boolean) => void;
     steers: Promise<void>[];
     // Steers agy may have taken; one put back in the queue no longer counts.
     steersTaken: number;
@@ -679,7 +720,64 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             };
             return;
         }
-        if (res.status === 'needs_backfill') {
+        if (res.status === 'needs_reconcile') {
+            if (res.fromIndex < 0 || res.fromIndex > snapshot.messages.length) {
+                this.importedReconcileState = {
+                    status: 'retryable',
+                    reason: 'Received invalid native transcript reconcile offset from HAPI.'
+                };
+                return;
+            }
+            this.confirmedNativeStepCount = res.fromIndex;
+            this.pendingNativeDeliveries.length = 0;
+            this.liveToolCallLocalIds.clear();
+            for (const item of res.pendingDeliveries) {
+                if (item.kind === 'user') {
+                    this.pendingNativeDeliveries.push({
+                        kind: 'user',
+                        localIds: [...item.localIds],
+                        texts: [...item.texts]
+                    });
+                } else {
+                    const data = item.data as CodexMessage;
+                    if (data.type === 'tool-call' && typeof data.callId === 'string') {
+                        this.liveToolCallLocalIds.set(data.callId, item.localId);
+                    }
+                    this.pendingNativeDeliveries.push({
+                        kind: 'agent',
+                        localId: item.localId,
+                        data
+                    });
+                }
+            }
+            if (this.pendingNativeDeliveries.length > 0) {
+                const committed = await this.commitSettledNativeSteps();
+                if (!committed) return;
+                if (this.pendingNativeDeliveries.length > 0) {
+                    this.pendingNativeDeliveries.length = 0;
+                    this.importedReconcileState = {
+                        status: 'diverged',
+                        reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
+                    };
+                    return;
+                }
+            }
+            if (this.confirmedNativeStepCount < snapshot.messages.length) {
+                const ok = await this.session.client.backfillNativeMessages(
+                    acpSessionId,
+                    this.confirmedNativeStepCount,
+                    snapshot.messages.slice(this.confirmedNativeStepCount)
+                );
+                if (!ok) {
+                    this.importedReconcileState = {
+                        status: 'retryable',
+                        reason: 'Failed to backfill missing Antigravity transcript history into HAPI.'
+                    };
+                    return;
+                }
+                this.confirmedNativeStepCount = snapshot.messages.length;
+            }
+        } else if (res.status === 'needs_backfill') {
             if (res.fromIndex < 0 || res.fromIndex > snapshot.messages.length) {
                 this.importedReconcileState = {
                     status: 'retryable',
@@ -1568,9 +1666,10 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         let releaseSteerWait!: () => void;
         const steerWaitReleased = new Promise<void>((resolve) => { releaseSteerWait = resolve; });
         let acknowledged = false;
+        let acknowledgedNative = false;
         let answerMain!: () => void;
         const mainAnswered = new Promise<void>((resolve) => { answerMain = resolve; });
-        let userDelivery: PendingNativeDelivery | null = null;
+        let userDelivery: Extract<PendingNativeDelivery, { kind: 'user' }> | null = null;
         const recordDispatchedUserDelivery = () => {
             if (
                 userDelivery !== null
@@ -1581,13 +1680,16 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             ) {
                 return;
             }
-            userDelivery = { kind: 'user', localIds: [...localIds], text: message };
+            userDelivery = { kind: 'user', localIds: [...localIds], texts: [message] };
             this.pendingNativeDeliveries.push(userDelivery);
         };
         const restoreIfUserTurn = () => {
             if (userDelivery !== null) {
                 const idx = this.pendingNativeDeliveries.indexOf(userDelivery);
                 if (idx >= 0) this.pendingNativeDeliveries.splice(idx, 1);
+                if (acknowledgedNative && this.acpSessionId) {
+                    session.client.discardPendingNativeDelivery?.(this.acpSessionId, userDelivery.localIds);
+                }
                 userDelivery = null;
             }
             if (!internalWakeup) this.restorePrompt(turn, message);
@@ -1618,10 +1720,16 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             // `session/prompt` is dispatched (agy 1.5.11 suppresses
             // `user_message_chunk` for the client's own prompts), or when it
             // goes back to the composer.
-            acknowledge: () => {
+            acknowledge: (asNativeTurn = false) => {
                 if (acknowledged || localIds.length === 0) return;
                 acknowledged = true;
-                session.client.emitMessagesConsumed(localIds);
+                if (asNativeTurn && this.isImportedSession() && !internalWakeup && !swarmBoardCommand && this.acpSessionId) {
+                    acknowledgedNative = true;
+                    recordDispatchedUserDelivery();
+                    session.client.emitMessagesConsumed(localIds, { nativeId: this.acpSessionId });
+                } else {
+                    session.client.emitMessagesConsumed(localIds);
+                }
             },
             steers: [],
             steersTaken: 0,
@@ -1785,8 +1893,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                             // an echo or first output leaves the message stuck
                             // in `Queued` while the model is thinking.
                             if (!turn.aborted) {
-                                recordDispatchedUserDelivery();
-                                turn.acknowledge();
+                                turn.acknowledge(true);
                             }
                         },
                         onAnswered: () => {
@@ -1800,8 +1907,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (turn.stopReason === 'cancelled' && !turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
-                    recordDispatchedUserDelivery();
-                    turn.acknowledge();
+                    turn.acknowledge(true);
                 }
             } catch (error) {
                 logger.warn('[agy-acp] prompt failed', error);
@@ -1812,8 +1918,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (!turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
-                    recordDispatchedUserDelivery();
-                    turn.acknowledge();
+                    turn.acknowledge(true);
                 }
             }
             // A steer makes agy answer the request it interrupts right away
@@ -2156,11 +2261,15 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             resolved = true;
             forgetEcho();
             if (this.isImportedSession()) {
-                this.pendingNativeDeliveries.push({ kind: 'user', localIds: [localId], text: taken.item.message });
+                this.pendingNativeDeliveries.push({ kind: 'user', localIds: [localId], texts: [taken.item.message] });
             }
             session.queue.commitReservation(taken);
             this.messageBuffer.addMessage(taken.item.message, 'user');
-            session.client.emitMessagesConsumed([localId], { steered: true });
+            if (this.isImportedSession() && this.acpSessionId) {
+                session.client.emitMessagesConsumed([localId], { steered: true, nativeId: this.acpSessionId });
+            } else {
+                session.client.emitMessagesConsumed([localId], { steered: true });
+            }
         };
         forgetEcho = () => {
             turn.unechoedSteers = turn.unechoedSteers.filter((entry) => entry.accept !== accept);
@@ -2207,7 +2316,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private handleUserEcho(text: string): void {
         const turn = this.turn;
         if (!turn) return;
-        turn.acknowledge();
+        turn.acknowledge(true);
         // Text that does not continue the prompt (a stray echo, or agy
         // skipping the prompt's echo) is checked against the steers, and the
         // prompt's own echo is still recognized when it comes.
@@ -2475,7 +2584,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     }
                 }
                 turn.sawActivity = true;
-                turn.acknowledge();
+                turn.acknowledge(true);
                 const reconciled = this.reconcileSyntheticCommandMessage(turn, message);
                 if (reconciled.skipTracking) {
                     return;
@@ -2724,7 +2833,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     }
 
     private restorePrompt(turn: AgyTurn, text: string): void {
-        turn.acknowledge();
+        turn.acknowledge(false);
         this.session.sendSessionEvent({ type: 'abort-restore', text });
     }
 

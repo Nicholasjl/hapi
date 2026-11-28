@@ -900,7 +900,7 @@ describe('session-commit-native-steps handler', () => {
         const partial = store.messages.addMessage(session.id, agentMsg('done batch'), 'agy-live:m-1', null, 14)
         const tr = store.messages.addMessage(session.id, {
             role: 'agent',
-            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'tool-call-result', callId: 'live-call-9', output: { stdout: 'old' }, is_error: false } },
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'tool-call-result', callId: 'live-call-9', output: { stdout: 'complete...' }, is_error: false } },
             meta: { sentFrom: 'cli' }
         }, 'agy-live:tr-1', null, 15)
 
@@ -1025,7 +1025,7 @@ describe('session-commit-native-steps handler', () => {
         expect(socket.roomEvents.filter((e) => e.event === 'update')).toHaveLength(3)
         expect(events.filter((e) => e.type === 'message-received')).toHaveLength(3)
 
-        // 4. Stale expectedOffset fails closed.
+        // 4. Stale/mismatched expectedOffset fails closed.
         socket.trigger('session-commit-native-steps', {
             sid: session.id,
             nativeId: 'native-1',
@@ -1040,6 +1040,155 @@ describe('session-commit-native-steps handler', () => {
             }]
         }, (resp) => acks.push(resp))
         expect(acks[3]).toEqual({ ok: false, reason: 'offset_mismatch' })
+
+        // 5. Idempotent full-overlap retry AND partial-overlap + new-tail retry succeed after lost ACK.
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            expectedOffset: 3,
+            entries: [
+                {
+                    kind: 'reconcile_update',
+                    anchor: 'step:3:text',
+                    fingerprint: computeLocalTranscriptFingerprint(diskFull),
+                    targetLocalId: 'agy-live:m-1',
+                    localId: 'agy:native-1:step:3:text',
+                    content: diskFull,
+                    createdAt: 14
+                },
+                {
+                    kind: 'reconcile_update',
+                    anchor: 'step:4:0',
+                    fingerprint: computeLocalTranscriptFingerprint(diskTr),
+                    targetLocalId: 'agy-live:tr-1',
+                    localId: 'agy:native-1:step:4:0',
+                    content: diskTr,
+                    createdAt: 15
+                }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[4]).toEqual({ ok: true, confirmedCount: 5, inserted: 0, updated: 0 })
+
+        const diskExtra = agentMsg('new step after retry')
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            expectedOffset: 4,
+            entries: [
+                {
+                    kind: 'reconcile_update',
+                    anchor: 'step:4:0',
+                    fingerprint: computeLocalTranscriptFingerprint(diskTr),
+                    targetLocalId: 'agy-live:tr-1',
+                    localId: 'agy:native-1:step:4:0',
+                    content: diskTr,
+                    createdAt: 15
+                },
+                {
+                    kind: 'backfill',
+                    anchor: 'step:5:text',
+                    fingerprint: computeLocalTranscriptFingerprint(diskExtra),
+                    localId: 'agy:native-1:step:5:text',
+                    content: diskExtra,
+                    createdAt: 16
+                }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[5]).toEqual({ ok: true, confirmedCount: 6, inserted: 1, updated: 0 })
+
+        // 6. reconcile_update rejects unrelated non-prefix text as content_mismatch instead of overwriting.
+        const conflictingLive = store.messages.addMessage(session.id, agentMsg('unrelated answer'), 'agy-live:conflict-1', null, 17)
+        expect(conflictingLive.localId).toBe('agy-live:conflict-1')
+        const diskBranch = agentMsg('completely different native branch')
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            expectedOffset: 6,
+            entries: [{
+                kind: 'reconcile_update',
+                anchor: 'step:6:text',
+                fingerprint: computeLocalTranscriptFingerprint(diskBranch),
+                targetLocalId: 'agy-live:conflict-1',
+                localId: 'agy:native-1:step:6:text',
+                content: diskBranch,
+                createdAt: 17
+            }]
+        }, (resp) => acks.push(resp))
+        expect(acks[6]).toEqual({ ok: false, reason: 'content_mismatch' })
+        store.close()
+    })
+
+    it('persists durable pending deliveries from messages-consumed and message, discards cancelled turns, and returns needs_reconcile on crash reopen', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-durable-pending',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-pend' },
+            null,
+            'default'
+        )
+        const s0 = userContent('seed prompt')
+        const m0 = store.messages.addImportedMessage(session.id, s0, 'agy:native-pend:step:0:0', 10).message
+        store.nativeSteps.recordSteps(session.id, 'native-pend', [
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0), messageId: m0.id }
+        ])
+
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid) => {
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {}
+        })
+
+        // Queue + cancel-discard lifecycle clears cancelled prompt from pending ledger.
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'aborted' } }, 'u-abort', null, 11)
+        socket.trigger('messages-consumed', { sid: session.id, localIds: ['u-abort'], nativeId: 'native-pend' })
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-pend')).toHaveLength(1)
+        socket.trigger('session-discard-native-delivery', { sid: session.id, nativeId: 'native-pend', localIds: ['u-abort'] })
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-pend')).toEqual([])
+
+        // Crash before commit leaves invoked user prompt + partial agy-live: reply in SQLite pending deliveries.
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'live turn' } }, 'u-live', null, 12)
+        socket.trigger('messages-consumed', { sid: session.id, localIds: ['u-live'], nativeId: 'native-pend' })
+        socket.trigger('message', {
+            sid: session.id,
+            localId: 'agy-live:partial-1',
+            createdAt: 13,
+            message: agentMsg('live partial')
+        })
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-pend')).toHaveLength(2)
+
+        const s1 = userContent('live turn')
+        const s2Full = agentMsg('live partial completed text')
+        const acks: unknown[] = []
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-pend',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0) },
+                { anchor: 'step:1:0', fingerprint: computeLocalTranscriptFingerprint(s1) },
+                { anchor: 'step:2:text', fingerprint: computeLocalTranscriptFingerprint(s2Full) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[0]).toEqual({
+            ok: true,
+            status: 'needs_reconcile',
+            fromIndex: 1,
+            pendingDeliveries: [
+                { kind: 'user', localIds: ['u-live'], texts: ['live turn'] },
+                { kind: 'agent', localId: 'agy-live:partial-1', data: { type: 'message', message: 'live partial' } }
+            ]
+        })
+
+        // If disk didn't advance past step:0:0 while pending deliveries exist, reconcile reports diverged.
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-pend',
+            steps: [{ anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0) }]
+        }, (resp) => acks.push(resp))
+        expect(acks[1]).toEqual({ ok: true, status: 'diverged' })
         store.close()
     })
 
@@ -1185,7 +1334,7 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         }, (resp) => acks.push(resp))
         expect(acks[3]).toEqual({ ok: true, status: 'diverged' })
 
-        // Trailing uncommitted agy-live: agent row past lastRecordedSeq returns diverged even for a different step text.
+        // Trailing uncommitted agy-live: agent row past lastRecordedSeq returns needs_reconcile with the live row for conflict verification, or diverged when disk didn't advance.
         const session2 = store.sessions.getOrCreateSession(
             'agy-reconcile-live',
             { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-rec-2' },
@@ -1205,7 +1354,14 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
                 { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(agentContent('different native')) }
             ]
         }, (resp) => acks.push(resp))
-        expect(acks[4]).toEqual({ ok: true, status: 'diverged' })
+        expect(acks[4]).toEqual({
+            ok: true,
+            status: 'needs_reconcile',
+            fromIndex: 1,
+            pendingDeliveries: [
+                { kind: 'agent', localId: 'agy-live:agent-uncommitted', data: { type: 'message', message: 'second' } }
+            ]
+        })
         store.close()
     })
 

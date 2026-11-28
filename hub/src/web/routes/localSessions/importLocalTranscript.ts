@@ -342,6 +342,9 @@ export function runLocalImportSync(options: {
 
             // --- match ----------------------------------------------------
             let delta: LocalTranscript['messages']
+            let reconciledSteps: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
+            let reconciledUpdates: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }> = []
+            let resolvedPendingMessageIds: string[] = []
             if (source.match.strategy === 'contentPrefix') {
                 const candidates = collectImportCandidates(store, namespace, () => engine)
                 const result = matchContentPrefix({
@@ -379,6 +382,9 @@ export function runLocalImportSync(options: {
                     recordedNativeSteps: target && source.match.nativeStepLedger
                         ? store.nativeSteps.getSteps(target.id, transcript.id)
                         : undefined,
+                    pendingNativeDeliveries: target && source.match.nativeStepLedger
+                        ? store.nativeSteps.getPendingDeliveries(target.id, transcript.id)
+                        : undefined,
                     cursor: target && cursorKey
                         ? (typeof storedMetadata(target)[cursorKey] === 'string' ? storedMetadata(target)[cursorKey] as string : null)
                         : null
@@ -391,10 +397,21 @@ export function runLocalImportSync(options: {
                     }, match.status === 'already_in_hapi' ? 'failed' : 'diverged')
                 }
                 delta = match.delta
+                reconciledSteps = match.reconciledSteps ?? []
+                reconciledUpdates = match.reconciledUpdates ?? []
+                resolvedPendingMessageIds = match.resolvedPendingMessageIds ?? []
             }
 
             // R6: never interleave into a live session.
-            if (target?.active && delta.length > 0) {
+            if (
+                target?.active
+                && (
+                    delta.length > 0
+                    || reconciledUpdates.length > 0
+                    || reconciledSteps.length > 0
+                    || resolvedPendingMessageIds.length > 0
+                )
+            ) {
                 return finishErrorState({
                     sessionId: transcript.id,
                     hapiSessionId: target.id,
@@ -445,6 +462,18 @@ export function runLocalImportSync(options: {
                 }
 
                 const importedAt = Date.now()
+                const updatedMessages: StoredMessage[] = []
+                const reconciledMessageIdByAnchor = new Map<string, string>(
+                    reconciledSteps.map((step) => [step.anchor, step.messageId])
+                )
+                for (const update of reconciledUpdates) {
+                    const replaced = store.messages.replaceMessageContent(stored.id, update.messageId, update.nextContent)
+                    if (!replaced) {
+                        throw new ImportedMessageConflictError('Failed to update uncommitted live Antigravity message during import')
+                    }
+                    updatedMessages.push(replaced)
+                }
+
                 const appended: StoredMessage[] = []
                 const insertedMessageIdByLocalId = new Map<string, string>()
                 for (const message of delta) {
@@ -472,7 +501,7 @@ export function runLocalImportSync(options: {
                     for (const message of transcript.messages) {
                         if (typeof message.anchor !== 'string' || message.anchor.length === 0) continue
                         if (existingSteps.has(message.anchor)) continue
-                        const messageId = messageIdByLocalId.get(message.id)
+                        const messageId = reconciledMessageIdByAnchor.get(message.anchor) ?? messageIdByLocalId.get(message.id)
                         if (!messageId) continue
                         stepsToRecord.push({
                             anchor: message.anchor,
@@ -482,6 +511,13 @@ export function runLocalImportSync(options: {
                     }
                     if (stepsToRecord.length > 0) {
                         store.nativeSteps.recordSteps(stored.id, transcript.id, stepsToRecord, importedAt)
+                    }
+                    if (resolvedPendingMessageIds.length > 0) {
+                        store.nativeSteps.removePendingDeliveriesByMessageIds(
+                            stored.id,
+                            transcript.id,
+                            resolvedPendingMessageIds
+                        )
                     }
                 }
 
@@ -523,7 +559,10 @@ export function runLocalImportSync(options: {
                 return {
                     hapiSessionId: stored.id,
                     appended,
-                    action: created ? 'created' as const : appended.length > 0 ? 'updated' as const : 'unchanged' as const
+                    updated: updatedMessages,
+                    action: created
+                        ? 'created' as const
+                        : (appended.length > 0 || updatedMessages.length > 0) ? 'updated' as const : 'unchanged' as const
                 }
             })
 
@@ -549,9 +588,11 @@ export function runLocalImportSync(options: {
                 appended: committed.appended.length
             }
 
-            const activityAt = committed.appended.at(-1)?.createdAt ?? transcript.modifiedAt
+            const activityAt = committed.appended.at(-1)?.createdAt
+                ?? committed.updated.at(-1)?.createdAt
+                ?? transcript.modifiedAt
             engine.recordSessionActivity(hapiSessionId, activityAt)
-            emitImportedMessages(engine, hapiSessionId, committed.appended)
+            emitImportedMessages(engine, hapiSessionId, [...committed.updated, ...committed.appended])
             engine.handleRealtimeEvent({ type: 'session-updated', sessionId: hapiSessionId })
             return outcome
         } catch (error) {

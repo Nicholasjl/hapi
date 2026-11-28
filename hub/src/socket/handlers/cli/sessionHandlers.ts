@@ -13,6 +13,15 @@ import { extractTeamStateFromMessageContent, applyTeamStateDelta } from '../../.
 import { extractBackgroundTasks } from '../../../sync/backgroundTasks'
 import { shouldRecordSessionActivity } from '../../../sync/sessionActivity'
 import { computeLocalTranscriptFingerprint } from '../../../web/routes/localSessions/matchAnchored'
+import {
+    collectEffectivePendingDeliveries,
+    isCompatibleNativeUpdate,
+    isPlainRecord,
+    mergeNativeReconcileContentPreservingCallId,
+    serializePendingDeliveriesForCli,
+    storedHapiMessagesMatchNativeContent,
+    unwrapAgentPayload
+} from '../../../web/routes/localSessions/reconcileNativeDeliveries'
 import type { CliSocketWithData } from '../../socketTypes'
 import type { SessionEndReason } from '@hapi/protocol'
 import type { AccessErrorReason, AccessResult } from './types'
@@ -119,129 +128,17 @@ const commitNativeStepsSchema = z.object({
     ])).max(100)
 })
 
-const AGY_BACKGROUND_COMMAND_RESULT = 'Command moved to background.'
+const discardNativeDeliverySchema = z.object({
+    sid: z.string().min(1),
+    nativeId: z.string().min(1),
+    localIds: z.array(z.string().min(1)).min(1).max(100)
+})
 
 class NativeCommitError extends Error {
     constructor(readonly reason: 'offset_mismatch' | 'missing_target' | 'content_mismatch' | 'invalid') {
         super(reason)
         this.name = 'NativeCommitError'
     }
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function userRowsMatchNativeText(rows: StoredMessage[], nativeText: string): boolean {
-    if (rows.length === 0) return false
-    const matchesFrom = (idx: number, rest: string): boolean => {
-        if (idx === rows.length) return rest.length === 0
-        const row = rows[idx]!
-        const record = unwrapRoleWrappedRecordEnvelope(row.content)
-        if (!record || record.role !== 'user' || !isPlainRecord(record.content) || record.content.type !== 'text') {
-            return false
-        }
-        const rawText = typeof record.content.text === 'string' ? record.content.text : ''
-        const attachments = Array.isArray(record.content.attachments)
-            ? record.content.attachments.filter((a): a is Record<string, unknown> => isPlainRecord(a) && typeof a.path === 'string')
-            : []
-        const allPaths = attachments.map((a) => `@${String(a.path).trim()}`).filter((p) => p.length > 1).join(' ')
-        const nonImagePaths = attachments
-            .filter((a) => typeof a.mimeType !== 'string' || !a.mimeType.startsWith('image/'))
-            .map((a) => `@${String(a.path).trim()}`)
-            .filter((p) => p.length > 1)
-            .join(' ')
-        const candidates = new Set<string>([rawText])
-        if (allPaths) candidates.add(rawText ? `${allPaths}\n\n${rawText}` : allPaths)
-        if (nonImagePaths) candidates.add(rawText ? `${nonImagePaths}\n\n${rawText}` : nonImagePaths)
-        for (const candidate of candidates) {
-            if (!rest.startsWith(candidate)) continue
-            const after = rest.slice(candidate.length)
-            if (idx === rows.length - 1) {
-                if (after.length === 0) return true
-            } else if (after.startsWith('\n')) {
-                if (matchesFrom(idx + 1, after.slice(1))) return true
-            }
-        }
-        return false
-    }
-    return matchesFrom(0, nativeText) || matchesFrom(0, nativeText.trim())
-}
-
-function unwrapAgentPayload(content: unknown): Record<string, unknown> | null {
-    const canonical = truncateOversizedMessageContent(content)
-    const record = unwrapRoleWrappedRecordEnvelope(canonical)
-    if (!record || record.role !== 'agent' || !isPlainRecord(record.content)) return null
-    if (record.content.type !== AGENT_MESSAGE_PAYLOAD_TYPE || !isPlainRecord(record.content.data)) return null
-    return record.content.data
-}
-
-function storedHapiMessagesMatchNativeContent(rows: StoredMessage[], nativeContent: unknown): boolean {
-    const canonicalNative = truncateOversizedMessageContent(nativeContent)
-    const nativeRecord = unwrapRoleWrappedRecordEnvelope(canonicalNative)
-    if (!nativeRecord) return false
-
-    if (nativeRecord.role === 'user' && isPlainRecord(nativeRecord.content) && nativeRecord.content.type === 'text') {
-        const nativeText = typeof nativeRecord.content.text === 'string' ? nativeRecord.content.text : ''
-        return userRowsMatchNativeText(rows, nativeText)
-    }
-
-    if (nativeRecord.role !== 'agent' || rows.length !== 1) {
-        return false
-    }
-    const storedRow = rows[0]!
-    if (!storedRow.localId?.startsWith('agy-live:')) {
-        return false
-    }
-    if (isDeepStrictEqual(truncateOversizedMessageContent(storedRow.content), canonicalNative)) {
-        return true
-    }
-
-    const nativeData = unwrapAgentPayload(canonicalNative)
-    const storedData = unwrapAgentPayload(storedRow.content)
-    if (!nativeData || !storedData || storedData.type !== nativeData.type) {
-        return false
-    }
-    if (nativeData.type === 'message') {
-        return storedData.message === nativeData.message
-    }
-    if (nativeData.type === 'reasoning') {
-        return storedData.message === nativeData.message
-    }
-    if (nativeData.type === 'tool-call') {
-        return storedData.name === nativeData.name
-            && isDeepStrictEqual(storedData.input ?? null, nativeData.input ?? null)
-    }
-    if (nativeData.type === 'tool-call-result') {
-        return isDeepStrictEqual(
-            { ...storedData, callId: nativeData.callId },
-            nativeData
-        )
-    }
-    return false
-}
-
-function mergeNativeReconcileContentPreservingCallId(existingContent: unknown, incomingContent: unknown): unknown {
-    const storedData = unwrapAgentPayload(existingContent)
-    const incomingData = unwrapAgentPayload(incomingContent)
-    if (
-        storedData
-        && incomingData
-        && (incomingData.type === 'tool-call' || incomingData.type === 'tool-call-result')
-        && typeof storedData.callId === 'string'
-        && storedData.callId.length > 0
-        && storedData.callId !== incomingData.callId
-    ) {
-        return {
-            role: 'agent',
-            content: {
-                type: AGENT_MESSAGE_PAYLOAD_TYPE,
-                data: { ...incomingData, callId: storedData.callId }
-            },
-            meta: { sentFrom: 'cli' }
-        }
-    }
-    return incomingContent
 }
 
 const reconcileNativeStepsSchema = z.object({
@@ -411,6 +308,22 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         // The durable row already exists; replay must not be mistaken for
         // fresh agent progress or trigger another round of UI updates.
         if (wasStored) return
+
+        if (!stored.updated && localId?.startsWith('agy-live:')) {
+            const sessionMeta = session.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+            if (
+                sessionMeta?.agyImportedAt != null
+                && typeof sessionMeta.agySessionId === 'string'
+                && sessionMeta.agySessionId.length > 0
+            ) {
+                store.nativeSteps.recordPendingDelivery(
+                    sid,
+                    sessionMeta.agySessionId,
+                    { kind: 'agent', messageId: msg.id, localIds: [localId] },
+                    msg.createdAt
+                )
+            }
+        }
 
         // A reasoning stream arrives as a series of growing snapshots under one
         // stable id, so a stream should cost one row rather than one per
@@ -668,7 +581,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         onSessionReady?.(data)
     })
 
-    socket.on('messages-consumed', (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => {
+    socket.on('messages-consumed', (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean; nativeId?: string }) => {
         if (!data || typeof data.sid !== 'string' || !Array.isArray(data.localIds)) {
             return
         }
@@ -693,6 +606,28 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         } catch (err) {
             console.error('recordMessagesConsumed failed', err)
             return
+        }
+
+        if (typeof data.nativeId === 'string' && data.nativeId.length > 0) {
+            const freshAccess = resolveSessionAccess(data.sid, { fresh: true })
+            if (freshAccess.ok) {
+                const metadata = freshAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+                if (metadata?.agyImportedAt != null && metadata.agySessionId === data.nativeId) {
+                    const idSet = new Set(localIds)
+                    const matchedRows = store.messages.getAllMessages(data.sid)
+                        .filter((m) => m.localId && idSet.has(m.localId))
+                        .sort((a, b) => a.seq - b.seq)
+                    if (matchedRows.length > 0) {
+                        const anchorRow = matchedRows[matchedRows.length - 1]!
+                        store.nativeSteps.recordPendingDelivery(
+                            data.sid,
+                            data.nativeId,
+                            { kind: 'user', messageId: anchorRow.id, localIds: matchedRows.map((row) => row.localId!) },
+                            invokedAt
+                        )
+                    }
+                }
+            }
         }
 
         try {
@@ -809,6 +744,25 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         })
     }
 
+    socket.on('session-discard-native-delivery', (data: unknown) => {
+        const parsed = discardNativeDeliverySchema.safeParse(data)
+        if (!parsed.success) return
+        const sessionAccess = resolveSessionAccess(parsed.data.sid, { fresh: true })
+        if (!sessionAccess.ok) {
+            emitAccessError('session', parsed.data.sid, sessionAccess.reason)
+            return
+        }
+        const metadata = sessionAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+        if (metadata?.agyImportedAt == null || metadata.agySessionId !== parsed.data.nativeId) {
+            return
+        }
+        store.nativeSteps.removePendingDeliveriesByLocalIds(
+            parsed.data.sid,
+            parsed.data.nativeId,
+            parsed.data.localIds
+        )
+    })
+
     socket.on('session-commit-native-steps', (
         data: unknown,
         ack?: (
@@ -840,10 +794,11 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         try {
             const { sid, nativeId, expectedOffset, entries } = parsed.data
             const result = store.runInTransaction(() => {
-                const currentCount = store.nativeSteps.getSteps(sid, nativeId).length
-                if (currentCount !== expectedOffset) {
+                const currentSteps = store.nativeSteps.getSteps(sid, nativeId)
+                if (expectedOffset > currentSteps.length) {
                     throw new NativeCommitError('offset_mismatch')
                 }
+                const overlap = Math.min(entries.length, currentSteps.length - expectedOffset)
                 const allMessages = store.messages.getAllMessages(sid)
                 const byLocalId = new Map<string, StoredMessage>()
                 for (const msg of allMessages) {
@@ -851,10 +806,75 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                         byLocalId.set(msg.localId, msg)
                     }
                 }
+                const committedMessageIds: string[] = []
+                for (let i = 0; i < overlap; i += 1) {
+                    const entry = entries[i]!
+                    const recordedStep = currentSteps[expectedOffset + i]!
+                    if (computeLocalTranscriptFingerprint(entry.content) !== entry.fingerprint) {
+                        throw new NativeCommitError('invalid')
+                    }
+                    if (recordedStep.anchor !== entry.anchor || recordedStep.fingerprint !== entry.fingerprint) {
+                        throw new NativeCommitError('offset_mismatch')
+                    }
+                    if (entry.kind === 'link') {
+                        const targetRows: StoredMessage[] = []
+                        const seenIds = new Set<string>()
+                        for (const targetLocalId of entry.targetLocalIds) {
+                            if (seenIds.has(targetLocalId)) {
+                                throw new NativeCommitError('invalid')
+                            }
+                            seenIds.add(targetLocalId)
+                            const found = byLocalId.get(targetLocalId)
+                            if (!found) {
+                                throw new NativeCommitError('offset_mismatch')
+                            }
+                            targetRows.push(found)
+                        }
+                        if (!storedHapiMessagesMatchNativeContent(targetRows, entry.content)) {
+                            throw new NativeCommitError('offset_mismatch')
+                        }
+                        const anchorRow = targetRows.reduce((latest, row) => (row.seq > latest.seq ? row : latest), targetRows[0]!)
+                        if (recordedStep.messageId !== anchorRow.id) {
+                            throw new NativeCommitError('offset_mismatch')
+                        }
+                        committedMessageIds.push(anchorRow.id)
+                        continue
+                    }
+
+                    if (entry.localId !== `agy:${nativeId}:${entry.anchor}`) {
+                        throw new NativeCommitError('invalid')
+                    }
+
+                    if (entry.kind === 'reconcile_update') {
+                        if (!entry.targetLocalId.startsWith('agy-live:') || unwrapAgentPayload(entry.content) === null) {
+                            throw new NativeCommitError('invalid')
+                        }
+                        const existing = byLocalId.get(entry.targetLocalId) ?? byLocalId.get(entry.localId)
+                        if (!existing || recordedStep.messageId !== existing.id) {
+                            throw new NativeCommitError('offset_mismatch')
+                        }
+                        const expectedContent = mergeNativeReconcileContentPreservingCallId(existing.content, entry.content)
+                        if (!isDeepStrictEqual(
+                            truncateOversizedMessageContent(existing.content),
+                            truncateOversizedMessageContent(expectedContent)
+                        )) {
+                            throw new NativeCommitError('offset_mismatch')
+                        }
+                        committedMessageIds.push(existing.id)
+                        continue
+                    }
+
+                    const existing = byLocalId.get(entry.localId)
+                    if (!existing || recordedStep.messageId !== existing.id) {
+                        throw new NativeCommitError('offset_mismatch')
+                    }
+                }
+
                 const ledgerSteps: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
                 let insertedCount = 0
                 let updatedCount = 0
-                for (const entry of entries) {
+                for (let i = overlap; i < entries.length; i += 1) {
+                    const entry = entries[i]!
                     if (computeLocalTranscriptFingerprint(entry.content) !== entry.fingerprint) {
                         throw new NativeCommitError('invalid')
                     }
@@ -876,6 +896,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                             throw new NativeCommitError('content_mismatch')
                         }
                         const anchorRow = targetRows.reduce((latest, row) => (row.seq > latest.seq ? row : latest), targetRows[0]!)
+                        committedMessageIds.push(anchorRow.id)
                         ledgerSteps.push({
                             anchor: entry.anchor,
                             fingerprint: entry.fingerprint,
@@ -894,7 +915,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                         }
                         const existing = byLocalId.get(entry.targetLocalId)
                         if (existing) {
-                            if (unwrapAgentPayload(existing.content) === null) {
+                            if (!isCompatibleNativeUpdate(existing.content, entry.content)) {
                                 throw new NativeCommitError('content_mismatch')
                             }
                             const nextContent = mergeNativeReconcileContentPreservingCallId(existing.content, entry.content)
@@ -905,6 +926,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                             byLocalId.set(entry.targetLocalId, replaced)
                             updatedMessages.push(replaced)
                             updatedCount += 1
+                            committedMessageIds.push(replaced.id)
                             ledgerSteps.push({
                                 anchor: entry.anchor,
                                 fingerprint: entry.fingerprint,
@@ -948,9 +970,14 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                         messageId: added.message.id
                     })
                 }
-                const { inserted } = store.nativeSteps.recordSteps(sid, nativeId, ledgerSteps)
-                if (inserted !== ledgerSteps.length) {
-                    throw new NativeCommitError('offset_mismatch')
+                if (ledgerSteps.length > 0) {
+                    const { inserted } = store.nativeSteps.recordSteps(sid, nativeId, ledgerSteps)
+                    if (inserted !== ledgerSteps.length) {
+                        throw new NativeCommitError('offset_mismatch')
+                    }
+                }
+                if (committedMessageIds.length > 0) {
+                    store.nativeSteps.removePendingDeliveriesByMessageIds(sid, nativeId, committedMessageIds)
                 }
                 return {
                     confirmedCount: store.nativeSteps.getSteps(sid, nativeId).length,
@@ -981,6 +1008,15 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             response:
                 | { ok: true; status: 'up_to_date'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }
+                | {
+                    ok: true
+                    status: 'needs_reconcile'
+                    fromIndex: number
+                    pendingDeliveries: Array<
+                        | { kind: 'user'; localIds: string[]; texts: string[] }
+                        | { kind: 'agent'; localId: string; data: Record<string, unknown> }
+                    >
+                }
                 | { ok: true; status: 'diverged' }
                 | { ok: false }
         ) => void
@@ -1048,11 +1084,25 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     }
                     priorIndex = sourceIndex
                 }
-                const trailingStored = storedMessages.filter((msg) => msg.seq > lastRecordedSeq)
-                if (trailingStored.some((msg) => msg.localId?.startsWith('agy-live:'))) {
-                    reply({ ok: true, status: 'diverged' })
+                const effectivePending = collectEffectivePendingDeliveries(
+                    storedMessages,
+                    recorded,
+                    store.nativeSteps.getPendingDeliveries(sid, nativeId)
+                )
+                if (effectivePending.length > 0) {
+                    if (steps.length === recorded.length) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    reply({
+                        ok: true,
+                        status: 'needs_reconcile',
+                        fromIndex: recorded.length,
+                        pendingDeliveries: serializePendingDeliveriesForCli(effectivePending)
+                    })
                     return
                 }
+                const trailingStored = storedMessages.filter((msg) => msg.seq > lastRecordedSeq)
                 if (steps.length > recorded.length) {
                     const pendingFingerprints = new Set(steps.slice(recorded.length).map((step) => step.fingerprint))
                     for (const msg of trailingStored) {

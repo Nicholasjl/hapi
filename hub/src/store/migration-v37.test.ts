@@ -13,7 +13,7 @@ it('adds session_native_steps when upgrading a v36 database', () => {
         new Store(path).close()
         expect(log).not.toHaveBeenCalled()
         const legacy = new Database(path)
-        legacy.exec('DROP TABLE session_native_steps; PRAGMA user_version = 36;')
+        legacy.exec('DROP TABLE session_native_steps; DROP TABLE session_native_deliveries; PRAGMA user_version = 36;')
         legacy.close()
         const migrated = new Store(path)
         try {
@@ -41,16 +41,43 @@ it('adds session_native_steps when upgrading a v36 database', () => {
                 { anchor: 'step:1:0', fingerprint: 'b'.repeat(64), messageId: m1.id, seq: 2 },
                 { anchor: 'step:2:0', fingerprint: 'd'.repeat(64), messageId: m2.id, seq: 3 }
             ])
+            expect(migrated.nativeSteps.recordPendingDelivery(session.id, 'agy-1', {
+                kind: 'agent',
+                messageId: m1.id,
+                localIds: ['agy-live:1']
+            }, 100)).toBe(true)
+            expect(migrated.nativeSteps.recordPendingDelivery(session.id, 'agy-1', {
+                kind: 'agent',
+                messageId: m1.id,
+                localIds: ['agy-live:1']
+            }, 101)).toBe(false)
+            expect(migrated.nativeSteps.recordPendingDelivery(session.id, 'agy-1', {
+                kind: 'user',
+                messageId: m2.id,
+                localIds: ['u-2a', 'u-2b']
+            }, 102)).toBe(true)
+            expect(migrated.nativeSteps.getPendingDeliveries(session.id, 'agy-1')).toEqual([
+                { deliverySeq: 1, kind: 'agent', messageId: m1.id, localIds: ['agy-live:1'] },
+                { deliverySeq: 2, kind: 'user', messageId: m2.id, localIds: ['u-2a', 'u-2b'] }
+            ])
 
             const target = migrated.sessions.getOrCreateSession('mig-v37-target', { path: '/tmp/p', host: 'h' }, null, 'default')
             migrated.messages.mergeSessionMessages(session.id, target.id)
             expect(migrated.nativeSteps.transferSession(session.id, target.id)).toBe(3)
             expect(migrated.nativeSteps.getSteps(session.id, 'agy-1')).toEqual([])
+            expect(migrated.nativeSteps.getPendingDeliveries(session.id, 'agy-1')).toEqual([])
             expect(migrated.nativeSteps.getSteps(target.id, 'agy-1')).toEqual([
                 { anchor: 'step:0:0', fingerprint: 'a'.repeat(64), messageId: m0.id, seq: 1 },
                 { anchor: 'step:1:0', fingerprint: 'b'.repeat(64), messageId: m1.id, seq: 2 },
                 { anchor: 'step:2:0', fingerprint: 'd'.repeat(64), messageId: m2.id, seq: 3 }
             ])
+            expect(migrated.nativeSteps.getPendingDeliveries(target.id, 'agy-1')).toEqual([
+                { deliverySeq: 1, kind: 'agent', messageId: m1.id, localIds: ['agy-live:1'] },
+                { deliverySeq: 2, kind: 'user', messageId: m2.id, localIds: ['u-2a', 'u-2b'] }
+            ])
+            expect(migrated.nativeSteps.removePendingDeliveriesByLocalIds(target.id, 'agy-1', ['u-2a'])).toBe(1)
+            expect(migrated.nativeSteps.removePendingDeliveriesByMessageIds(target.id, 'agy-1', [m1.id])).toBe(1)
+            expect(migrated.nativeSteps.getPendingDeliveries(target.id, 'agy-1')).toEqual([])
         } finally { migrated.close() }
         log.mockClear()
         new Store(path).close()
