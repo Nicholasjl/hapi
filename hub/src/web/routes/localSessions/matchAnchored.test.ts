@@ -375,4 +375,54 @@ describe('anchored match: Antigravity native step ledger', () => {
             recordedNativeSteps: ledger
         }).status).toBe('transcript_diverged')
     })
+
+    it('enforces linked messageId existence and rejects uncommitted agy-live rows past lastRecordedSeq when native tail advances', () => {
+        const s0 = agyNativeUser('step:0:0', 'start')
+        const s1 = agyNativeAgent('step:1:text', { type: 'message', message: 'reply' })
+        const s2 = agyNativeUser('step:2:0', 'offline continuation')
+
+        const stored0 = agyStoredUser(1, s0.id, 'start', 10)
+        const stored1 = agyStoredAgent(2, { type: 'message', message: 'reply' }, 11, s1.id)
+        const linkedLedger = [
+            { anchor: s0.anchor!, fingerprint: computeLocalTranscriptFingerprint(s0.content), messageId: stored0.id },
+            { anchor: s1.anchor!, fingerprint: computeLocalTranscriptFingerprint(s1.content), messageId: stored1.id }
+        ]
+
+        // Missing linked message row diverges.
+        expect(matchAnchored({
+            storedMessages: [stored0],
+            transcript: agyTranscript([s0, s1]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger
+        }).status).toBe('transcript_diverged')
+
+        // Uncommitted agy-live row at seq > lastRecordedSeq diverges when delta is non-empty.
+        expect(matchAnchored({
+            storedMessages: [
+                stored0,
+                stored1,
+                agyStoredUser(3, 'board-1', '/swarm board', 12),
+                agyStoredAgent(4, { type: 'message', message: 'uncommitted live reply' }, 13, 'agy-live:r-1')
+            ],
+            transcript: agyTranscript([s0, s1, s2]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger
+        }).status).toBe('transcript_diverged')
+
+        // Non-agy-live control/restore rows alone without agy-live rows still reconcile cleanly.
+        expect(matchAnchored({
+            storedMessages: [
+                stored0,
+                stored1,
+                agyStoredUser(3, 'board-1', '/swarm board', 12),
+                agyStoredAgent(4, { type: 'message', message: '### Swarm Board' }, 13)
+            ],
+            transcript: agyTranscript([s0, s1, s2]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger
+        })).toEqual({ status: 'ok', delta: [s2] })
+    })
 })

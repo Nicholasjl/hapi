@@ -352,6 +352,47 @@ export function collectSettledAgyNativeStepFingerprints(
 }
 
 /**
+ * Reads the contiguous settled prefix of an Antigravity native transcript before
+ * the first truncated, mid-flush, or unsettled step.
+ */
+export function collectSettledAgyNativeMessagesPrefix(
+    brainDir: string,
+    sessionId: string
+): {
+    messages: AgyImportedMessage[]
+    fingerprints: Array<{ anchor: string; fingerprint: string }>
+    maxStepIndex: number
+    hasUnsettledTail: boolean
+} {
+    const paths = agyTranscriptPaths(brainDir, sessionId)
+    if (!paths || !safeFileStat(paths.compactPath)) {
+        return { messages: [], fingerprints: [], maxStepIndex: -1, hasUnsettledTail: false }
+    }
+    const { steps: allSteps, incompleteTail } = readAgyTranscriptForImport(brainDir, sessionId)
+    const { steps: completeSteps, hadMissingFullRows } = selectStableCompleteAgySteps(allSteps)
+    const settledSteps: AgyTranscriptStep[] = []
+    let sawUnsettled = false
+    for (const step of completeSteps) {
+        if (!isAgyTranscriptStepSettled(step)) {
+            sawUnsettled = true
+            break
+        }
+        settledSteps.push(step)
+    }
+    const hasUnsettledTail = incompleteTail || hadMissingFullRows || sawUnsettled
+    if (settledSteps.length === 0) {
+        return { messages: [], fingerprints: [], maxStepIndex: -1, hasUnsettledTail }
+    }
+    const { messages } = convertAgyTranscriptStepsToMessages(sessionId, settledSteps, Date.now())
+    return {
+        messages,
+        fingerprints: computeAgyNativeStepFingerprints(messages),
+        maxStepIndex: settledSteps[settledSteps.length - 1]!.step_index,
+        hasUnsettledTail
+    }
+}
+
+/**
  * Reads the full settled native transcript snapshot for reopen reconciliation.
  * Fails closed (`ready: false`) if the transcript is mid-flush or contains any
  * unsettled/truncated step.
@@ -367,21 +408,15 @@ export function collectSettledAgyTranscriptForReconcile(
         fingerprints: Array<{ anchor: string; fingerprint: string }>
         maxStepIndex: number
     } {
-    const paths = agyTranscriptPaths(brainDir, sessionId)
-    if (!paths || !safeFileStat(paths.compactPath)) {
-        return { ready: true, messages: [], fingerprints: [], maxStepIndex: -1 }
-    }
-    const { steps: allSteps, incompleteTail } = readAgyTranscriptForImport(brainDir, sessionId)
-    const { steps, hadMissingFullRows } = selectStableCompleteAgySteps(allSteps)
-    if (incompleteTail || hadMissingFullRows || steps.some((step) => !isAgyTranscriptStepSettled(step))) {
+    const prefix = collectSettledAgyNativeMessagesPrefix(brainDir, sessionId)
+    if (prefix.hasUnsettledTail) {
         return { ready: false }
     }
-    const { messages } = convertAgyTranscriptStepsToMessages(sessionId, steps, Date.now())
     return {
         ready: true,
-        messages,
-        fingerprints: computeAgyNativeStepFingerprints(messages),
-        maxStepIndex: steps.length > 0 ? steps[steps.length - 1]!.step_index : -1
+        messages: prefix.messages,
+        fingerprints: prefix.fingerprints,
+        maxStepIndex: prefix.maxStepIndex
     }
 }
 

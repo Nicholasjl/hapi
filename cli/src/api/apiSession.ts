@@ -1210,7 +1210,7 @@ if (isReconnect) {
         void this.materialize()
     }
 
-    sendAgentMessage(body: unknown, localId?: string): void {
+    sendAgentMessage(body: unknown, localId?: string, opts?: { emitConsumed?: boolean }): void {
         const content = {
             role: 'agent',
             content: {
@@ -1227,7 +1227,9 @@ if (isReconnect) {
                 message: content,
                 localId
             })
-            if (localId) this.socket.emit('messages-consumed', { sid: this.sessionId, localIds: [localId] })
+            if (localId && opts?.emitConsumed !== false) {
+                this.socket.emit('messages-consumed', { sid: this.sessionId, localIds: [localId] })
+            }
         })
     }
 
@@ -1717,66 +1719,83 @@ if (isReconnect) {
         return await this.drainLock(this.metadataLock, timeoutMs)
     }
 
-    /** Record confirmed native transcript steps incrementally outside session metadata. */
-    recordNativeSteps(
+    /**
+     * Atomically verifies/links, updates, or backfills confirmed native transcript
+     * steps into Hub storage + `session_native_steps` outside session metadata.
+     */
+    async commitNativeSteps(
         nativeId: string,
-        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
-        onResult?: (ok: boolean) => void
-    ): void {
-        if (!nativeId || steps.length === 0) {
-            return
-        }
-        const MAX_NATIVE_STEPS_BATCH = 500
-        for (let i = 0; i < steps.length; i += MAX_NATIVE_STEPS_BATCH) {
-            const chunk = steps.slice(i, i + MAX_NATIVE_STEPS_BATCH)
-            this.emitOrQueue(() => {
-                this.socket.emit('session-native-steps', {
-                    sid: this.sessionId,
-                    nativeId,
-                    steps: chunk
-                }, (response) => {
-                    onResult?.(Boolean(response?.ok))
-                })
-            }, 'lossless')
-        }
-    }
-
-    /** Flush pending native step ledger records with bounded ack wait on shutdown/cleanup. */
-    async flushNativeSteps(
-        nativeId: string,
-        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
-        timeoutMs: number = 2_000
-    ): Promise<boolean> {
-        if (!nativeId || steps.length === 0) {
-            return true
+        expectedOffset: number,
+        entries: ReadonlyArray<
+            | {
+                kind: 'link'
+                anchor: string
+                fingerprint: string
+                targetLocalIds: string[]
+                content: unknown
+                createdAt: number
+            }
+            | {
+                kind: 'reconcile_update'
+                anchor: string
+                fingerprint: string
+                targetLocalId: string
+                localId: string
+                content: unknown
+                createdAt: number
+            }
+            | {
+                kind: 'backfill'
+                anchor: string
+                fingerprint: string
+                localId: string
+                content: unknown
+                createdAt: number
+            }
+        >,
+        timeoutMs: number = 5_000
+    ): Promise<
+        | { ok: true; confirmedCount: number; inserted: number; updated: number }
+        | { ok: false; reason?: 'offset_mismatch' | 'missing_target' | 'content_mismatch' | 'invalid' }
+    > {
+        if (!nativeId || entries.length === 0) {
+            return { ok: true, confirmedCount: expectedOffset, inserted: 0, updated: 0 }
         }
         if (this.state !== 'active' || !this.socket.connected) {
-            this.recordNativeSteps(nativeId, steps)
-            return false
+            return { ok: false }
         }
-        const MAX_NATIVE_STEPS_BATCH = 500
+        const MAX_NATIVE_COMMIT_BATCH = 50
         const deadlineMs = Date.now() + timeoutMs
-        for (let i = 0; i < steps.length; i += MAX_NATIVE_STEPS_BATCH) {
-            const chunk = steps.slice(i, i + MAX_NATIVE_STEPS_BATCH)
+        let offset = expectedOffset
+        let totalInserted = 0
+        let totalUpdated = 0
+        for (let i = 0; i < entries.length; i += MAX_NATIVE_COMMIT_BATCH) {
+            const chunk = entries.slice(i, i + MAX_NATIVE_COMMIT_BATCH)
             const remainingMs = Math.max(0, deadlineMs - Date.now())
             if (remainingMs === 0) {
-                this.recordNativeSteps(nativeId, steps.slice(i))
-                return false
+                return { ok: false }
             }
             try {
-                const response = await this.socket.timeout(remainingMs).emitWithAck('session-native-steps', {
+                const response = await this.socket.timeout(remainingMs).emitWithAck('session-commit-native-steps', {
                     sid: this.sessionId,
                     nativeId,
-                    steps: chunk
+                    expectedOffset: offset,
+                    entries: chunk.map((entry) => ({
+                        ...entry,
+                        ...(entry.kind === 'link' ? { targetLocalIds: [...entry.targetLocalIds] } : {})
+                    }))
                 })
                 if (!response?.ok) {
-                    return false
+                    return response ?? { ok: false }
                 }
+                offset = response.confirmedCount
+                totalInserted += response.inserted
+                totalUpdated += response.updated
             } catch {
-                return false
+                return { ok: false }
             }
         }
-        return true
+        return { ok: true, confirmedCount: offset, inserted: totalInserted, updated: totalUpdated }
     }
 
     /** Reconciles disk-settled native transcript steps against Hub's confirmed step ledger on reopen. */

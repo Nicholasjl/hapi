@@ -3,6 +3,7 @@ import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
 import { Store, type StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
 import type { CliSocketWithData } from '../../socketTypes'
+import { computeLocalTranscriptFingerprint } from '../../../web/routes/localSessions/matchAnchored'
 import { registerSessionHandlers } from './sessionHandlers'
 
 class FakeSocket {
@@ -856,10 +857,20 @@ it.each([
     })
 })
 
-describe('session-native-steps handler', () => {
-    const hash = (tag: string) => tag.repeat(64).slice(0, 64)
+describe('session-commit-native-steps handler', () => {
+    const userContent = (text: string) => ({ role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } })
+    const agentMsg = (message: string) => ({
+        role: 'agent',
+        content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'message', message } },
+        meta: { sentFrom: 'cli' }
+    })
+    const reasoningMsg = (id: string, message: string) => ({
+        role: 'agent',
+        content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'reasoning', id, message } },
+        meta: { sentFrom: 'cli' }
+    })
 
-    it('records incremental native steps for imported sessions with matching nativeId and ignores duplicates', () => {
+    it('links live user/reasoning/message rows, replaces partial live replies with reconcile_update, and backfills omitted steps atomically', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession(
             'agy-imported',
@@ -868,6 +879,7 @@ describe('session-native-steps handler', () => {
             'default'
         )
         const socket = new FakeSocket()
+        const events: SyncEvent[] = []
         registerSessionHandlers(socket as unknown as CliSocketWithData, {
             store,
             resolveSessionAccess: (sid, opts) => {
@@ -875,40 +887,163 @@ describe('session-native-steps handler', () => {
                 const found = store.sessions.getSession(sid)
                 return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
             },
-            emitAccessError() {}
+            emitAccessError() {},
+            onWebappEvent: (event) => events.push(event)
         })
 
+        // Seed live user batch, live reasoning with different UUID id, partial live message, and tool result.
+        const u1 = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'first' } }, 'u-1', null, 10)
+        const u2 = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'second' } }, 'u-2', null, 11)
+        store.messages.markMessagesInvoked(session.id, ['u-1', 'u-2'], 12)
+        const r1 = store.messages.addMessage(session.id, reasoningMsg('live-uuid-r1', 'Thinking step'), 'agy-live:r-1', null, 13)
+        expect(r1.invokedAt).not.toBeNull()
+        const partial = store.messages.addMessage(session.id, agentMsg('done batch'), 'agy-live:m-1', null, 14)
+        const tr = store.messages.addMessage(session.id, {
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'tool-call-result', callId: 'live-call-9', output: { stdout: 'old' }, is_error: false } },
+            meta: { sentFrom: 'cli' }
+        }, 'agy-live:tr-1', null, 15)
+
+        const diskU = userContent('first\nsecond')
+        const diskR = reasoningMsg('agy:native-1:step:1:reasoning', 'Thinking step')
+        const diskFull = agentMsg('done batch full text')
+        const diskOmitted = agentMsg('omitted intermediate note')
+        const diskTr = {
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'tool-call-result', callId: 'agy-wakeup-native-1-2-0', output: { stdout: 'complete full output', exit_code: 0 }, is_error: false } },
+            meta: { sentFrom: 'cli' }
+        }
+
         const acks: Array<unknown> = []
-        socket.trigger('session-native-steps', {
+
+        // 1. Linking partial 'done batch' against 'done batch full text' rejects fail-closed with content_mismatch.
+        socket.trigger('session-commit-native-steps', {
             sid: session.id,
             nativeId: 'native-1',
-            steps: [
-                { anchor: 'step:0:0', fingerprint: hash('a') },
-                { anchor: 'step:1:text', fingerprint: hash('b') }
-            ]
+            expectedOffset: 0,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:2:text',
+                fingerprint: computeLocalTranscriptFingerprint(diskFull),
+                targetLocalIds: ['agy-live:m-1'],
+                content: diskFull,
+                createdAt: 14
+            }]
         }, (resp) => acks.push(resp))
-        expect(acks[0]).toEqual({ ok: true, inserted: 2 })
+        expect(acks[0]).toEqual({ ok: false, reason: 'content_mismatch' })
+        expect(store.nativeSteps.getSteps(session.id, 'native-1')).toEqual([])
 
-        // Re-sending an existing anchor with a mismatched fingerprint must be ignored without mutating seq or fingerprint.
-        socket.trigger('session-native-steps', {
+        // 2. Missing target returns missing_target without inserting.
+        socket.trigger('session-commit-native-steps', {
             sid: session.id,
             nativeId: 'native-1',
-            steps: [
-                { anchor: 'step:1:text', fingerprint: hash('f') },
-                { anchor: 'step:2:0', fingerprint: hash('c') }
+            expectedOffset: 0,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:0:0',
+                fingerprint: computeLocalTranscriptFingerprint(diskU),
+                targetLocalIds: ['does-not-exist'],
+                content: diskU,
+                createdAt: 12
+            }]
+        }, (resp) => acks.push(resp))
+        expect(acks[1]).toEqual({ ok: false, reason: 'missing_target' })
+
+        // 3. Atomic commit with link + link(reasoning) + backfill + reconcile_update + reconcile_update(tool-result preserving callId).
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            expectedOffset: 0,
+            entries: [
+                {
+                    kind: 'link',
+                    anchor: 'step:0:0',
+                    fingerprint: computeLocalTranscriptFingerprint(diskU),
+                    targetLocalIds: ['u-1', 'u-2'],
+                    content: diskU,
+                    createdAt: 12
+                },
+                {
+                    kind: 'link',
+                    anchor: 'step:1:reasoning',
+                    fingerprint: computeLocalTranscriptFingerprint(diskR),
+                    targetLocalIds: ['agy-live:r-1'],
+                    content: diskR,
+                    createdAt: 13
+                },
+                {
+                    kind: 'backfill',
+                    anchor: 'step:2:text',
+                    fingerprint: computeLocalTranscriptFingerprint(diskOmitted),
+                    localId: 'agy:native-1:step:2:text',
+                    content: diskOmitted,
+                    createdAt: 14
+                },
+                {
+                    kind: 'reconcile_update',
+                    anchor: 'step:3:text',
+                    fingerprint: computeLocalTranscriptFingerprint(diskFull),
+                    targetLocalId: 'agy-live:m-1',
+                    localId: 'agy:native-1:step:3:text',
+                    content: diskFull,
+                    createdAt: 14
+                },
+                {
+                    kind: 'reconcile_update',
+                    anchor: 'step:4:0',
+                    fingerprint: computeLocalTranscriptFingerprint(diskTr),
+                    targetLocalId: 'agy-live:tr-1',
+                    localId: 'agy:native-1:step:4:0',
+                    content: diskTr,
+                    createdAt: 15
+                }
             ]
         }, (resp) => acks.push(resp))
-        expect(acks[1]).toEqual({ ok: true, inserted: 1 })
+        expect(acks[2]).toEqual({ ok: true, confirmedCount: 5, inserted: 1, updated: 2 })
 
+        const updatedPartial = store.messages.getMessageById(session.id, partial.id)
+        expect(updatedPartial?.content).toEqual(diskFull)
+        const updatedTr = store.messages.getMessageById(session.id, tr.id)
+        expect(updatedTr?.content).toMatchObject({
+            role: 'agent',
+            content: {
+                data: {
+                    type: 'tool-call-result',
+                    callId: 'live-call-9',
+                    output: { stdout: 'complete full output', exit_code: 0 }
+                }
+            }
+        })
         expect(store.nativeSteps.getSteps(session.id, 'native-1')).toEqual([
-            { anchor: 'step:0:0', fingerprint: hash('a'), seq: 1 },
-            { anchor: 'step:1:text', fingerprint: hash('b'), seq: 2 },
-            { anchor: 'step:2:0', fingerprint: hash('c'), seq: 3 }
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(diskU), messageId: u2.id, seq: 1 },
+            { anchor: 'step:1:reasoning', fingerprint: computeLocalTranscriptFingerprint(diskR), messageId: r1.id, seq: 2 },
+            { anchor: 'step:2:text', fingerprint: computeLocalTranscriptFingerprint(diskOmitted), messageId: expect.any(String), seq: 3 },
+            { anchor: 'step:3:text', fingerprint: computeLocalTranscriptFingerprint(diskFull), messageId: partial.id, seq: 4 },
+            { anchor: 'step:4:0', fingerprint: computeLocalTranscriptFingerprint(diskTr), messageId: tr.id, seq: 5 }
         ])
+        expect(u1.id).not.toBe(u2.id)
+        expect(socket.roomEvents.filter((e) => e.event === 'update')).toHaveLength(3)
+        expect(events.filter((e) => e.type === 'message-received')).toHaveLength(3)
+
+        // 4. Stale expectedOffset fails closed.
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            expectedOffset: 4,
+            entries: [{
+                kind: 'backfill',
+                anchor: 'step:5:text',
+                fingerprint: computeLocalTranscriptFingerprint(agentMsg('extra')),
+                localId: 'agy:native-1:step:5:text',
+                content: agentMsg('extra'),
+                createdAt: 16
+            }]
+        }, (resp) => acks.push(resp))
+        expect(acks[3]).toEqual({ ok: false, reason: 'offset_mismatch' })
         store.close()
     })
 
-    it('rejects session-native-steps when agyImportedAt is missing or nativeId does not match metadata', () => {
+    it('rejects session-commit-native-steps when agyImportedAt is missing or nativeId does not match metadata', () => {
         const store = new Store(':memory:')
         const unimported = store.sessions.getOrCreateSession(
             'agy-plain',
@@ -932,16 +1067,26 @@ describe('session-native-steps handler', () => {
             emitAccessError() {}
         })
 
+        const entry = {
+            kind: 'backfill' as const,
+            anchor: 'step:0:0',
+            fingerprint: computeLocalTranscriptFingerprint(userContent('hi')),
+            localId: 'agy:native-1:step:0:0',
+            content: userContent('hi'),
+            createdAt: 10
+        }
         const acks: Array<unknown> = []
-        socket.trigger('session-native-steps', {
+        socket.trigger('session-commit-native-steps', {
             sid: unimported.id,
             nativeId: 'native-1',
-            steps: [{ anchor: 'step:0:0', fingerprint: hash('a') }]
+            expectedOffset: 0,
+            entries: [entry]
         }, (resp) => acks.push(resp))
-        socket.trigger('session-native-steps', {
+        socket.trigger('session-commit-native-steps', {
             sid: imported.id,
             nativeId: 'native-wrong',
-            steps: [{ anchor: 'step:0:0', fingerprint: hash('a') }]
+            expectedOffset: 0,
+            entries: [{ ...entry, localId: 'agy:native-wrong:step:0:0' }]
         }, (resp) => acks.push(resp))
 
         expect(acks).toEqual([{ ok: false }, { ok: false }])
@@ -960,7 +1105,7 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         meta: { sentFrom: 'cli' }
     })
 
-    it('returns up_to_date, needs_backfill, or diverged against durable ledger and imported messages', () => {
+    it('returns up_to_date, needs_backfill, or diverged against durable ledger, message_id links, and uncommitted live turns', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession(
             'agy-reconcile',
@@ -970,8 +1115,8 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         )
         const c0 = userContent('first')
         const c1 = agentContent('second')
-        store.messages.addImportedMessage(session.id, c0, 'agy:native-rec:step:0:0', 10)
-        store.messages.addImportedMessage(session.id, c1, 'agy:native-rec:step:1:text', 11)
+        const m0 = store.messages.addImportedMessage(session.id, c0, 'agy:native-rec:step:0:0', 10).message
+        const m1 = store.messages.addImportedMessage(session.id, c1, 'agy:native-rec:step:1:text', 11).message
 
         const socket = new FakeSocket()
         registerSessionHandlers(socket as unknown as CliSocketWithData, {
@@ -984,7 +1129,7 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
             emitAccessError() {}
         })
 
-        // Legacy imported session (empty ledger) verifies imported prefix, backfills ledger rows, and reports up_to_date / needs_backfill.
+        // Legacy mismatch diverges cleanly.
         const acks: unknown[] = []
         socket.trigger('session-reconcile-native-steps', {
             sid: session.id,
@@ -996,8 +1141,8 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         expect(acks[0]).toEqual({ ok: true, status: 'diverged' })
 
         store.nativeSteps.recordSteps(session.id, 'native-rec', [
-            { anchor: 'step:0:0', fingerprint: hash('a') },
-            { anchor: 'step:1:text', fingerprint: hash('b') }
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0), messageId: m0.id },
+            { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(c1), messageId: m1.id }
         ])
 
         // Mismatching step:0:0 vs stored ledger returns diverged.
@@ -1006,12 +1151,61 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
             nativeId: 'native-rec',
             steps: [
                 { anchor: 'step:0:0', fingerprint: hash('e') },
-                { anchor: 'step:1:text', fingerprint: hash('b') }
+                { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(c1) }
             ]
         }, (resp) => acks.push(resp))
         expect(acks[1]).toEqual({ ok: true, status: 'diverged' })
 
-        // Test with real SHA-256 fingerprints via backfill flow below; reset session cleanly for exact match checks.
+        // /swarm board control row after lastRecordedSeq does not falsely diverge.
+        const boardPrompt = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: '/swarm board' }, meta: { sentFrom: 'web' } }, 'board-1', null, 15)
+        store.messages.markMessagesInvoked(session.id, [boardPrompt.localId!], 15)
+        const c2 = userContent('offline next turn')
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-rec',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0) },
+                { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(c1) },
+                { anchor: 'step:2:0', fingerprint: computeLocalTranscriptFingerprint(c2) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[2]).toEqual({ ok: true, status: 'needs_backfill', fromIndex: 2 })
+
+        // Trailing uncommitted invoked user prompt matching pending step:2:0 returns diverged instead of duplicating.
+        const uLive = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'offline next turn' }, meta: { sentFrom: 'web' } }, 'live-u-1', null, 16)
+        store.messages.markMessagesInvoked(session.id, [uLive.localId!], 16)
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-rec',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0) },
+                { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(c1) },
+                { anchor: 'step:2:0', fingerprint: computeLocalTranscriptFingerprint(c2) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[3]).toEqual({ ok: true, status: 'diverged' })
+
+        // Trailing uncommitted agy-live: agent row past lastRecordedSeq returns diverged even for a different step text.
+        const session2 = store.sessions.getOrCreateSession(
+            'agy-reconcile-live',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-rec-2' },
+            null,
+            'default'
+        )
+        const r0 = store.messages.addImportedMessage(session2.id, c0, 'agy:native-rec-2:step:0:0', 10).message
+        store.nativeSteps.recordSteps(session2.id, 'native-rec-2', [
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0), messageId: r0.id }
+        ])
+        store.messages.addMessage(session2.id, c1, 'agy-live:agent-uncommitted', null, 12)
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session2.id,
+            nativeId: 'native-rec-2',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0) },
+                { anchor: 'step:1:text', fingerprint: computeLocalTranscriptFingerprint(agentContent('different native')) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[4]).toEqual({ ok: true, status: 'diverged' })
         store.close()
     })
 

@@ -15,6 +15,7 @@ import * as agyNativeTitle from './agyNativeTitle';
 import type { AgyMode } from './types';
 import {
     AgyAcpRemoteLauncher,
+    AgyNativeReconcileError,
     addAgyUsage,
     agyAcpModeForPermission,
     agyRoundSummary,
@@ -273,16 +274,17 @@ function makeClient() {
         emitMessagesConsumed: vi.fn(),
         emitSteerIndeterminate: vi.fn(),
         setSteerDeliveryState: vi.fn(async () => true),
-        recordNativeSteps: vi.fn((
+        commitNativeSteps: vi.fn(async (
             _nativeId: string,
-            _steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
-            _onResult?: (ok: boolean) => void
-        ) => {}),
-        flushNativeSteps: vi.fn(async (
-            _nativeId: string,
-            _steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+            expectedOffset: number,
+            entries: ReadonlyArray<{ kind: string; anchor: string; fingerprint: string; createdAt: number; content: unknown; targetLocalIds?: string[]; targetLocalId?: string; localId?: string }>,
             _timeoutMs?: number
-        ) => true),
+        ): ReturnType<ApiSessionClient['commitNativeSteps']> => ({
+            ok: true as const,
+            confirmedCount: expectedOffset + entries.length,
+            inserted: entries.filter((entry) => entry.kind === 'backfill').length,
+            updated: entries.filter((entry) => entry.kind === 'reconcile_update').length
+        })),
         reconcileNativeSteps: vi.fn(async (
             _nativeId: string,
             steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
@@ -3061,21 +3063,19 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
 
             expect(client.reconcileNativeSteps).not.toHaveBeenCalled();
             expect(client.backfillNativeMessages).not.toHaveBeenCalled();
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
-            expect(client.flushNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
             expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
 
             queue.close();
             await run;
             expect(client.reconcileNativeSteps).not.toHaveBeenCalled();
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
-            expect(client.flushNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
         } finally {
             rmSync(brainDir, { recursive: true, force: true });
         }
     });
 
-    it('reconciles and backfills unseen disk steps on reopen, flushes truncated rendered steps, and never suppresses late disk-only replies on cleanup', async () => {
+    it('links live deliveries, reconciles truncated replies via reconcile_update, and never commits late disk-only replies on cleanup', async () => {
         const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-ledger-'));
         try {
             const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
@@ -3175,16 +3175,15 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
             expect(eventOrder).toEqual(['reconcile', 'backfill:2:step:2:0,step:3:text', 'ready']);
             expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
 
-            // 1. /swarm board sends normal agent reply and records no native steps.
+            // 1. /swarm board sends normal agent reply without agy-live: localId and commits nothing.
             queue.pushIsolated('/swarm board', REVIEW, 'board-1');
             await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['board-1']));
             expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
-            expect(client.sendAgentMessage.mock.calls.every(([msg]) => !('hapiOnly' in (msg as Record<string, unknown>)))).toBe(true);
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
 
-            // 2. Pre-dispatch abort restores to composer without emitting native steps or provenance metadata.
+            // 2. Pre-dispatch abort restores to composer without committing native steps.
             queue.push('restored turn', REVIEW, 'restored-1');
             await vi.waitFor(() => expect(backend.setModeCalls).toHaveLength(1));
             await client.rpcHandlerManager.handlers.get(RPC_METHODS.Abort)!();
@@ -3193,9 +3192,9 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 text: 'restored turn'
             }));
             await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(2));
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
 
-            // 3. Cancelled turn before output restores to composer without recording native steps.
+            // 3. Cancelled turn before output restores to composer without committing native steps.
             backend.preSendDelayMs = 0;
             queue.push('cancelled turn', REVIEW, 'cancelled-1');
             await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
@@ -3203,20 +3202,34 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 text: 'cancelled turn'
             }));
             await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(3));
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
 
-            // 4. Real batched turn emits settled rendered step:5:0, holding truncated step:6:text until transcript_full flushes.
+            // 4. Real batched turn links settled user batch (real-1, real-2) and tags live reply with agy-live: localId.
             queue.push('first batch line', REVIEW, 'real-1');
             queue.push('second batch line', REVIEW, 'real-2');
-            await vi.waitFor(() => expect(client.recordNativeSteps).toHaveBeenCalledTimes(1));
-            const [firstNativeId, firstSteps] = client.recordNativeSteps.mock.calls[0]!;
+            await vi.waitFor(() => expect(client.commitNativeSteps).toHaveBeenCalledTimes(1));
+            const liveReplyCall = client.sendAgentMessage.mock.calls.find(
+                ([msg]) => (msg as { type?: string; message?: string }).message === 'done batch'
+            );
+            expect(liveReplyCall).toBeDefined();
+            const liveReplyLocalId = liveReplyCall![1] as string;
+            expect(liveReplyLocalId).toMatch(/^agy-live:/);
+            expect(liveReplyCall![2]).toEqual({ emitConsumed: false });
+
+            const [firstNativeId, firstOffset, firstEntries] = client.commitNativeSteps.mock.calls[0]!;
             expect(firstNativeId).toBe('agy-conv-new');
-            expect(firstSteps.map((s: { anchor: string }) => s.anchor)).toEqual(['step:5:0']);
-            expect(firstSteps[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+            expect(firstOffset).toBe(4);
+            expect(firstEntries).toHaveLength(1);
+            expect(firstEntries[0]).toMatchObject({
+                kind: 'link',
+                anchor: 'step:5:0',
+                targetLocalIds: ['real-1', 'real-2']
+            });
+            expect(firstEntries[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
 
             // 5. During backend disconnect:
-            //    - transcript_full.jsonl upgrades rendered step 6 -> cleanup() MUST flush step:6:text
-            //    - a late disk-only reply (step 7, NEVER sent over ACP) is written -> cleanup() MUST NOT flush step:7:text!
+            //    - transcript_full.jsonl upgrades rendered step 6 -> cleanup() MUST commit reconcile_update targeting liveReplyLocalId
+            //    - a late disk-only reply (step 7, NEVER sent over ACP) is written -> cleanup() MUST NOT commit step:7:text!
             const origDisconnect = backend.disconnect.bind(backend);
             backend.disconnect = async () => {
                 await origDisconnect();
@@ -3258,18 +3271,32 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             await run;
 
             expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
-            expect(client.flushNativeSteps).toHaveBeenCalledTimes(1);
-            const [flushedNativeId, flushedSteps] = client.flushNativeSteps.mock.calls[0]!;
+            expect(client.commitNativeSteps).toHaveBeenCalledTimes(2);
+            const [flushedNativeId, flushedOffset, flushedEntries] = client.commitNativeSteps.mock.calls[1]!;
             expect(flushedNativeId).toBe('agy-conv-new');
-            expect(flushedSteps.map((s: { anchor: string }) => s.anchor)).toEqual(['step:6:text']);
-            expect(flushedSteps[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+            expect(flushedOffset).toBe(5);
+            expect(flushedEntries).toHaveLength(1);
+            expect(flushedEntries[0]).toMatchObject({
+                kind: 'reconcile_update',
+                anchor: 'step:6:text',
+                targetLocalId: liveReplyLocalId,
+                localId: 'agy:agy-conv-new:step:6:text',
+                content: {
+                    role: 'agent',
+                    content: {
+                        type: 'codex',
+                        data: { type: 'message', message: 'done batch full text' }
+                    }
+                }
+            });
+            expect(flushedEntries[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
         } finally {
             rmSync(brainDir, { recursive: true, force: true });
         }
     });
 
-    it('disables native step ledger writes fail-closed when reopen reconciliation reports diverged', async () => {
-        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-diverged-'));
+    it('blocks startup without emitting ready when reopen reconciliation reports diverged or retryable failure', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-startup-gate-'));
         try {
             const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
             mkdirSync(logsDir, { recursive: true });
@@ -3279,58 +3306,208 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 type: 'USER_INPUT',
                 source: 'USER_EXPLICIT',
                 status: 'DONE',
-                content: '<USER_REQUEST>\nmodified history\n</USER_REQUEST>'
+                content: '<USER_REQUEST>\nhistory\n</USER_REQUEST>'
             }) + '\n');
 
+            // 1. Diverged startup fails with AgyNativeReconcileError('diverged') and never emits ready.
+            const diverged = makeSession();
+            diverged.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            diverged.client.reconcileNativeSteps.mockResolvedValue({ ok: true, status: 'diverged' });
+            diverged.queue.close();
+            await expect(launch(diverged.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toMatchObject({ name: 'AgyNativeReconcileError', kind: 'diverged' });
+            expect(diverged.client.emitSessionReady).not.toHaveBeenCalled();
+            expect(sessionEvents(diverged.client)).toContainEqual({
+                type: 'error',
+                message: expect.stringContaining('diverged')
+            });
+
+            // 2. Retryable startup failure (reconcile RPC unavailable) fails without ready.
+            const retryable = makeSession();
+            retryable.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            retryable.client.reconcileNativeSteps.mockResolvedValue({ ok: false });
+            retryable.queue.close();
+            await expect(launch(retryable.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toBeInstanceOf(AgyNativeReconcileError);
+            expect(retryable.client.emitSessionReady).not.toHaveBeenCalled();
+
+            // 3. Failed backfill or unsettled disk tail also blocks startup.
+            const failedBackfill = makeSession();
+            failedBackfill.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            failedBackfill.client.reconcileNativeSteps.mockResolvedValue({ ok: true, status: 'needs_backfill', fromIndex: 0 });
+            failedBackfill.client.backfillNativeMessages.mockResolvedValue(false);
+            failedBackfill.queue.close();
+            await expect(launch(failedBackfill.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toMatchObject({ name: 'AgyNativeReconcileError', kind: 'retryable' });
+            expect(failedBackfill.client.emitSessionReady).not.toHaveBeenCalled();
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('blocks prompt dispatch and restores prompt on mid-session retryable failure, then recovers once Hub reconciles', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-mid-retry-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            const initialStep = JSON.stringify({
+                step_index: 0,
+                type: 'USER_INPUT',
+                source: 'USER_EXPLICIT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\ninit\n</USER_REQUEST>'
+            });
+            writeFileSync(stepsPath, initialStep + '\n');
+
             const { session, queue, client } = makeSession();
-            client.getMetadata.mockImplementation(() => ({
-                path: '/tmp/agy-project',
-                host: 'test',
-                agyImportedAt: 100
-            }) as never);
-            client.reconcileNativeSteps.mockResolvedValue({ ok: true, status: 'diverged' });
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            client.reconcileNativeSteps
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 1 })
+                .mockResolvedValueOnce({ ok: false })
+                .mockResolvedValueOnce({ ok: true, status: 'needs_backfill', fromIndex: 1 });
 
             const backend = new FakeAgyBackend();
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+            // External native step arrives on disk, forcing mid-session reconciliation before prompt dispatch.
+            writeFileSync(stepsPath, [
+                initialStep,
+                JSON.stringify({
+                    step_index: 1,
+                    type: 'USER_INPUT',
+                    source: 'USER_EXPLICIT',
+                    status: 'DONE',
+                    content: '<USER_REQUEST>\nexternal edit\n</USER_REQUEST>'
+                })
+            ].join('\n') + '\n');
+
+            queue.push('blocked turn', REVIEW, 'mid-1');
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'abort-restore',
+                text: 'blocked turn'
+            }));
+            expect(backend.prompts).toHaveLength(0);
+            expect(sessionEvents(client)).toContainEqual({
+                type: 'error',
+                message: expect.stringContaining('reconcile')
+            });
+
+            // Once Hub recovers, the next prompt reconciles external step 1 via backfill and dispatches cleanly.
+            queue.push('recovered turn', REVIEW, 'mid-2');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(1));
+            expect(backend.prompts[0]).toEqual([{ type: 'text', text: 'recovered turn' }]);
+            expect(client.backfillNativeMessages).toHaveBeenCalledTimes(1);
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('blocks prompt dispatch, restores prompt, and refuses commits when mid-session reconciliation reports diverged', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-mid-div-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            writeFileSync(stepsPath, '');
+
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            client.reconcileNativeSteps
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 0 })
+                .mockResolvedValueOnce({ ok: true, status: 'diverged' });
+
+            const backend = new FakeAgyBackend();
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+            // External disk change triggers mid-session reconcile -> diverged.
+            writeFileSync(stepsPath, JSON.stringify({
+                step_index: 0,
+                type: 'USER_INPUT',
+                source: 'USER_EXPLICIT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\ndiverged native step\n</USER_REQUEST>'
+            }) + '\n');
+
+            queue.push('follow up', REVIEW, 'div-1');
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'abort-restore',
+                text: 'follow up'
+            }));
+
+            expect(backend.prompts).toHaveLength(0);
+            expect(sessionEvents(client)).toContainEqual({
+                type: 'error',
+                message: expect.stringContaining('diverged')
+            });
+
+            queue.close();
+            await run;
+            expect(client.commitNativeSteps).not.toHaveBeenCalled();
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('retries failed post-turn commitNativeSteps during pre-turn reconciliation before dispatching the next prompt', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-retry-commit-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            writeFileSync(stepsPath, '');
+
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            client.reconcileNativeSteps
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 0 })
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 2 });
+            client.commitNativeSteps
+                .mockResolvedValueOnce({ ok: false })
+                .mockResolvedValueOnce({ ok: true, confirmedCount: 2, inserted: 0, updated: 0 })
+                .mockResolvedValueOnce({ ok: true, confirmedCount: 4, inserted: 0, updated: 0 });
+
+            const backend = new FakeAgyBackend();
+            const turnOneSteps = [
+                JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\nturn one\n</USER_REQUEST>' }),
+                JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'reply one' })
+            ];
+            backend.promptScripts.push(async (onUpdate) => {
+                writeFileSync(stepsPath, turnOneSteps.join('\n') + '\n');
+                onUpdate({ type: 'text', text: 'reply one' });
+                onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
+            });
             backend.promptScripts.push(async (onUpdate) => {
                 writeFileSync(stepsPath, [
-                    JSON.stringify({
-                        step_index: 0,
-                        type: 'USER_INPUT',
-                        source: 'USER_EXPLICIT',
-                        status: 'DONE',
-                        content: '<USER_REQUEST>\nmodified history\n</USER_REQUEST>'
-                    }),
-                    JSON.stringify({
-                        step_index: 1,
-                        type: 'USER_INPUT',
-                        source: 'USER_EXPLICIT',
-                        status: 'DONE',
-                        content: '<USER_REQUEST>\nfollow up\n</USER_REQUEST>'
-                    }),
-                    JSON.stringify({
-                        step_index: 2,
-                        type: 'PLANNER_RESPONSE',
-                        source: 'MODEL',
-                        status: 'DONE',
-                        content: 'done'
-                    })
+                    ...turnOneSteps,
+                    JSON.stringify({ step_index: 2, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\nturn two\n</USER_REQUEST>' }),
+                    JSON.stringify({ step_index: 3, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'reply two' })
                 ].join('\n') + '\n');
-                onUpdate({ type: 'text', text: 'done' });
+                onUpdate({ type: 'text', text: 'reply two' });
                 onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
             });
 
             const { run } = launch(session, [backend], { brainDir });
             await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
 
-            queue.push('follow up', REVIEW, 'div-1');
-            await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(1));
+            queue.push('turn one', REVIEW, 't-1');
+            await vi.waitFor(() => expect(client.commitNativeSteps).toHaveBeenCalledTimes(1));
+
+            // Turn 2 must flush pending turn-1 deliveries via commitNativeSteps + reconcile before dispatching.
+            queue.push('turn two', REVIEW, 't-2');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(2));
+            await vi.waitFor(() => expect(client.commitNativeSteps).toHaveBeenCalledTimes(3));
+            expect(client.reconcileNativeSteps).toHaveBeenCalledTimes(2);
+            expect(client.commitNativeSteps.mock.calls[1]![1]).toBe(0);
+            expect(client.commitNativeSteps.mock.calls[2]![1]).toBe(2);
 
             queue.close();
             await run;
-
-            expect(client.backfillNativeMessages).not.toHaveBeenCalled();
-            expect(client.recordNativeSteps).not.toHaveBeenCalled();
-            expect(client.flushNativeSteps).not.toHaveBeenCalled();
         } finally {
             rmSync(brainDir, { recursive: true, force: true });
         }

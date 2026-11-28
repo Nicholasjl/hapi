@@ -446,6 +446,7 @@ export function runLocalImportSync(options: {
 
                 const importedAt = Date.now()
                 const appended: StoredMessage[] = []
+                const insertedMessageIdByLocalId = new Map<string, string>()
                 for (const message of delta) {
                     const result = store.messages.addImportedMessage(
                         stored.id,
@@ -453,18 +454,32 @@ export function runLocalImportSync(options: {
                         message.id,
                         message.createdAt ?? importedAt
                     )
+                    insertedMessageIdByLocalId.set(message.id, result.message.id)
                     if (result.inserted) appended.push(result.message)
                 }
 
                 if (source.match.strategy === 'anchored' && source.match.nativeStepLedger) {
-                    const stepsToRecord = transcript.messages
-                        .filter((message): message is typeof message & { anchor: string } =>
-                            typeof message.anchor === 'string' && message.anchor.length > 0
-                        )
-                        .map((message) => ({
+                    const existingSteps = new Set(
+                        store.nativeSteps.getSteps(stored.id, transcript.id).map((step) => step.anchor)
+                    )
+                    const messageIdByLocalId = new Map<string, string>(insertedMessageIdByLocalId)
+                    for (const storedMessage of store.messages.getAllMessages(stored.id)) {
+                        if (storedMessage.localId && !messageIdByLocalId.has(storedMessage.localId)) {
+                            messageIdByLocalId.set(storedMessage.localId, storedMessage.id)
+                        }
+                    }
+                    const stepsToRecord: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
+                    for (const message of transcript.messages) {
+                        if (typeof message.anchor !== 'string' || message.anchor.length === 0) continue
+                        if (existingSteps.has(message.anchor)) continue
+                        const messageId = messageIdByLocalId.get(message.id)
+                        if (!messageId) continue
+                        stepsToRecord.push({
                             anchor: message.anchor,
-                            fingerprint: computeLocalTranscriptFingerprint(message.content)
-                        }))
+                            fingerprint: computeLocalTranscriptFingerprint(message.content),
+                            messageId
+                        })
+                    }
                     if (stepsToRecord.length > 0) {
                         store.nativeSteps.recordSteps(stored.id, transcript.id, stepsToRecord, importedAt)
                     }

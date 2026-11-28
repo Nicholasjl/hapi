@@ -77,8 +77,14 @@ export class AgySession extends AgentSessionBase<AgyMode> {
         this.localLaunchFailure = { message, exitReason };
     };
 
-    sendAgentMessage = (message: unknown): void => {
-        this.client.sendAgentMessage(message);
+    sendAgentMessage = (message: unknown, localId?: string, opts?: { emitConsumed?: boolean }): void => {
+        if (opts !== undefined) {
+            this.client.sendAgentMessage(message, localId, opts);
+        } else if (localId !== undefined) {
+            this.client.sendAgentMessage(message, localId);
+        } else {
+            this.client.sendAgentMessage(message);
+        }
     };
 
     sendUserMessage = (text: string): void => {

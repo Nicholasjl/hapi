@@ -586,16 +586,16 @@ describe('generic local session routes', () => {
         const hapiId = batchRes.results[1]!.hapiSessionId!
 
         const prompt = { type: 'text', text: 'live follow-up' } as const
-        store.messages.addMessage(hapiId, { role: 'user', content: prompt, meta: { sentFrom: 'web' } }, 'live')
+        const cU = store.messages.addMessage(hapiId, { role: 'user', content: prompt, meta: { sentFrom: 'web' } }, 'live')
         store.messages.markMessagesInvoked(hapiId, ['live'], 20)
-        store.messages.addMessage(hapiId, {
+        const cR = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: {
                 type: 'codex',
                 data: { type: 'reasoning', message: 'Checking workspace files', id: 'acp-generated-reasoning-uuid' }
             }
         })
-        store.messages.addMessage(hapiId, {
+        const cTc = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: {
                 type: 'codex',
@@ -610,7 +610,7 @@ describe('generic local session routes', () => {
                 }
             }
         })
-        store.messages.addMessage(hapiId, {
+        const cTr = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: {
                 type: 'codex',
@@ -621,7 +621,7 @@ describe('generic local session routes', () => {
                 }
             }
         })
-        store.messages.addMessage(hapiId, {
+        const cMsg = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: {
                 type: 'codex',
@@ -638,6 +638,7 @@ describe('generic local session routes', () => {
                 }
             }
         })
+        const continuedLiveMsgs = [cU, cR, cTc, cTr, cMsg]
         const native = (id: string, text: string) => ({
             id: `agy:agy-continued:${id}`, createdAt: 20, anchor: id,
             content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } } as const
@@ -674,9 +675,10 @@ describe('generic local session routes', () => {
         store.nativeSteps.recordSteps(
             hapiId,
             'agy-continued',
-            nativeTurn(prompt.text).map((message) => ({
+            nativeTurn(prompt.text).map((message, index) => ({
                 anchor: message.anchor,
-                fingerprint: computeLocalTranscriptFingerprint(message.content)
+                fingerprint: computeLocalTranscriptFingerprint(message.content),
+                messageId: continuedLiveMsgs[index]!.id
             }))
         )
         const initial = agyContinued.messages
@@ -821,19 +823,19 @@ describe('generic local session routes', () => {
         const hapiId = initRes.results[0]!.hapiSessionId!
 
         // HAPI stores interleaved queued/batched live messages plus oversized >64KB output.
-        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'first live turn' }, meta: { sentFrom: 'web' } }, 'u1', null, 20)
+        const bU1 = store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'first live turn' }, meta: { sentFrom: 'web' } }, 'u1', null, 20)
         store.messages.markMessagesInvoked(hapiId, ['u1'], 20)
-        store.messages.addMessage(hapiId, {
+        const bR1 = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'reasoning', message: 'Thinking', id: 'acp-r1' } }
         }, undefined, null, 21)
-        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'queued during reply' }, meta: { sentFrom: 'web' } }, 'u2', null, 22)
-        store.messages.addMessage(hapiId, {
+        const bU2 = store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'queued during reply' }, meta: { sentFrom: 'web' } }, 'u2', null, 22)
+        const bM1 = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'first reply' } }
         }, undefined, null, 25)
         store.messages.markMessagesInvoked(hapiId, ['u2'], 30)
-        store.messages.addMessage(hapiId, {
+        const bM2 = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'second reply' } }
         }, undefined, null, 35)
@@ -849,13 +851,13 @@ describe('generic local session routes', () => {
             },
             meta: { sentFrom: 'web' }
         }, 'u3-a', null, 36)
-        store.messages.addMessage(hapiId, {
+        const bU3b = store.messages.addMessage(hapiId, {
             role: 'user',
             content: { type: 'text', text: 'And check tests' },
             meta: { sentFrom: 'web' }
         }, 'u3-b', null, 37)
         store.messages.markMessagesInvoked(hapiId, ['u3-a', 'u3-b'], 40)
-        store.messages.addMessage(hapiId, {
+        const bM3 = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'batch reply' } }
         }, undefined, null, 45)
@@ -872,13 +874,15 @@ describe('generic local session routes', () => {
             nativeAgent('step:6:0', { type: 'tool-call-result', callId: 'c1', output: bigToolOutput, is_error: false }, 42),
             nativeAgent('step:6:text', { type: 'message', message: 'batch reply' }, 45)
         ]
+        const batchLinkedIds = [bU1.id, bR1.id, bM1.id, bU2.id, bM2.id, bU3b.id, bM3.id, bM3.id]
         // Runner incrementally persisted confirmed live native steps into the SQLite ledger.
         store.nativeSteps.recordSteps(
             hapiId,
             'agy-batch',
-            livePrefixInNative.map((message) => ({
+            livePrefixInNative.map((message, index) => ({
                 anchor: message.anchor,
-                fingerprint: computeLocalTranscriptFingerprint(message.content)
+                fingerprint: computeLocalTranscriptFingerprint(message.content),
+                messageId: batchLinkedIds[index]!
             }))
         )
 
@@ -989,17 +993,17 @@ describe('generic local session routes', () => {
         }, undefined, null, 21)
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'failed pre-dispatch' }, meta: { sentFrom: 'web' } }, 'restore-1', null, 22)
         store.messages.markMessagesInvoked(hapiId, ['restore-1'], 22)
-        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'real dispatched turn' }, meta: { sentFrom: 'web' } }, 'real-1', null, 30)
+        const pReal = store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'real dispatched turn' }, meta: { sentFrom: 'web' } }, 'real-1', null, 30)
         store.messages.markMessagesInvoked(hapiId, ['real-1'], 30)
-        store.messages.addMessage(hapiId, {
+        const pTc = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'tool-call', name: 'Bash', callId: 'live-cmd-1', input: { command: 'sleep 2' } } }
         }, undefined, null, 31)
-        store.messages.addMessage(hapiId, {
+        const pTr = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'tool-call-result', callId: 'live-cmd-1', output: { stdout: 'finished on steer', exit_code: 0 }, is_error: false } }
         }, undefined, null, 32)
-        store.messages.addMessage(hapiId, {
+        const pMsg = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'real reply' } }
         }, undefined, null, 35)
@@ -1011,12 +1015,14 @@ describe('generic local session routes', () => {
             nativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-agy-prov-3-0', output: 'Command moved to background.', is_error: false }, 32),
             nativeAgent('step:5:text', { type: 'message', message: 'real reply' }, 35)
         ]
+        const provLinkedIds = [pReal.id, pTc.id, pTr.id, pMsg.id]
         store.nativeSteps.recordSteps(
             hapiId,
             'agy-prov',
-            nativeLivePrefix.map((message) => ({
+            nativeLivePrefix.map((message, index) => ({
                 anchor: message.anchor,
-                fingerprint: computeLocalTranscriptFingerprint(message.content)
+                fingerprint: computeLocalTranscriptFingerprint(message.content),
+                messageId: provLinkedIds[index]!
             }))
         )
 
@@ -1232,25 +1238,46 @@ describe('generic local session routes', () => {
         )
         expect(backfillAck).toEqual({ ok: true, inserted: 2, confirmedCount: 4 })
 
-        // 2. Live HAPI turn runs next and incrementally records steps 4 & 5; step 6 finishes disk-only unrecorded.
+        // 2. Live HAPI turn runs next: user turn links via 'link', partial ACP reply 'live reply' upgrades in place
+        //    to 'live reply full text' via 'reconcile_update', and step 6 finishes disk-only unrecorded.
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'live turn in hapi' }, meta: { sentFrom: 'web' } }, 'live-1', null, 30)
         store.messages.markMessagesInvoked(hapiId, ['live-1'], 30)
-        store.messages.addMessage(hapiId, {
+        const livePartialMsg = store.messages.addMessage(hapiId, {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'live reply' } }
-        }, undefined, null, 35)
+        }, 'agy-live:r-1', null, 35)
         const s4 = nativeUser('agy-e2e', 'step:4:0', 'live turn in hapi', 30)
-        const s5 = nativeAgent('agy-e2e', 'step:5:text', 'live reply', 35)
-        let recordAck: unknown
-        handlers.get('session-native-steps')!(
+        const s5Full = nativeAgent('agy-e2e', 'step:5:text', 'live reply full text', 35)
+        let commitAck: unknown
+        handlers.get('session-commit-native-steps')!(
             {
                 sid: hapiId,
                 nativeId: 'agy-e2e',
-                steps: [s4, s5].map((m) => ({ anchor: m.anchor, fingerprint: computeLocalTranscriptFingerprint(m.content) }))
+                expectedOffset: 4,
+                entries: [
+                    {
+                        kind: 'link',
+                        anchor: s4.anchor,
+                        fingerprint: computeLocalTranscriptFingerprint(s4.content),
+                        targetLocalIds: ['live-1'],
+                        content: s4.content,
+                        createdAt: s4.createdAt
+                    },
+                    {
+                        kind: 'reconcile_update',
+                        anchor: s5Full.anchor,
+                        fingerprint: computeLocalTranscriptFingerprint(s5Full.content),
+                        targetLocalId: 'agy-live:r-1',
+                        localId: s5Full.id,
+                        content: s5Full.content,
+                        createdAt: s5Full.createdAt
+                    }
+                ]
             },
-            (resp) => { recordAck = resp }
+            (resp) => { commitAck = resp }
         )
-        expect(recordAck).toEqual({ ok: true, inserted: 2 })
+        expect(commitAck).toEqual({ ok: true, confirmedCount: 6, inserted: 0, updated: 1 })
+        expect(store.messages.getMessageById(hapiId, livePartialMsg.id)?.content).toEqual(s5Full.content)
 
         // 3. A late disk-only reply (step:6:text) wasn't rendered in HAPI or recorded in ledger, plus step:7..8 follow natively.
         const lateDiskReply = nativeAgent('agy-e2e', 'step:6:text', 'late disk-only reply', 40)
@@ -1258,12 +1285,12 @@ describe('generic local session routes', () => {
             nativeUser('agy-e2e', 'step:7:0', 'later native prompt', 50),
             nativeAgent('agy-e2e', 'step:8:text', 'later native answer', 55)
         ]
-        agySession = { ...agySession, messages: [...allSteps, s4, s5, lateDiskReply, ...nativeTail] }
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail] }
 
         const syncRes = await (await app.request('/api/agy/import-sessions', {
             method: 'POST',
             body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
-        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number; error?: { code: string } }> }
 
         expect(syncRes.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 3 })
         const storedLocalIds = store.messages.getAllMessages(hapiId).map((m) => m.localId)
@@ -1272,6 +1299,19 @@ describe('generic local session routes', () => {
         expect(storedLocalIds).toContain('agy:agy-e2e:step:6:text')
         expect(storedLocalIds).toContain('agy:agy-e2e:step:7:0')
         expect(storedLocalIds).toContain('agy:agy-e2e:step:8:text')
+
+        // 4. Uncommitted agy-live: message past the confirmed ledger causes re-import to fail closed with transcript_diverged.
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: 'uncommitted live' } }
+        }, 'agy-live:trailing', null, 60)
+        const s9 = nativeUser('agy-e2e', 'step:9:0', 'another native prompt', 70)
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9] }
+        const divRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; error?: { code: string } }> }
+        expect(divRes.results[0]?.error?.code).toBe('transcript_diverged')
     })
 
 })

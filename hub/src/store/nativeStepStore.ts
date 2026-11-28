@@ -6,10 +6,12 @@ export const NATIVE_STEPS_TABLE_SQL = `
         native_id TEXT NOT NULL,
         anchor TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
+        message_id TEXT NOT NULL,
         seq INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
         PRIMARY KEY (session_id, native_id, anchor),
-        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_session_native_steps_session_native_seq
         ON session_native_steps(session_id, native_id, seq);
@@ -18,13 +20,15 @@ export const NATIVE_STEPS_TABLE_SQL = `
 export type StoredNativeStep = {
     anchor: string
     fingerprint: string
+    messageId: string
     seq: number
 }
 
 /**
- * Durable append-only ledger of confirmed native transcript step anchors and
- * content hashes for imported sessions. Kept out of session metadata so growth
- * never swells keepalive/metadata snapshots or hits socket payload caps.
+ * Durable append-only ledger of confirmed native transcript step anchors,
+ * content hashes, and owning durable HAPI message IDs for imported sessions.
+ * Kept out of session metadata so growth never swells keepalive/metadata
+ * snapshots or hits socket payload caps.
  */
 export class NativeStepStore {
     private readonly db: Database
@@ -36,7 +40,7 @@ export class NativeStepStore {
     recordSteps(
         sessionId: string,
         nativeId: string,
-        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+        steps: ReadonlyArray<{ anchor: string; fingerprint: string; messageId: string }>,
         now: number = Date.now()
     ): { inserted: number } {
         if (steps.length === 0) return { inserted: 0 }
@@ -47,12 +51,20 @@ export class NativeStepStore {
             let nextSeq = (maxRow?.max_seq ?? 0) + 1
             const insertStmt = this.db.prepare(`
                 INSERT OR IGNORE INTO session_native_steps
-                    (session_id, native_id, anchor, fingerprint, seq, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (session_id, native_id, anchor, fingerprint, message_id, seq, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             `)
             let inserted = 0
             for (const step of steps) {
-                const res = insertStmt.run(sessionId, nativeId, step.anchor, step.fingerprint, nextSeq, now)
+                const res = insertStmt.run(
+                    sessionId,
+                    nativeId,
+                    step.anchor,
+                    step.fingerprint,
+                    step.messageId,
+                    nextSeq,
+                    now
+                )
                 if (res.changes > 0) {
                     nextSeq += 1
                     inserted += 1
@@ -64,7 +76,7 @@ export class NativeStepStore {
 
     getSteps(sessionId: string, nativeId: string): StoredNativeStep[] {
         return this.db.prepare(`
-            SELECT anchor, fingerprint, seq
+            SELECT anchor, fingerprint, message_id AS messageId, seq
             FROM session_native_steps
             WHERE session_id = ? AND native_id = ?
             ORDER BY seq ASC
@@ -75,7 +87,7 @@ export class NativeStepStore {
         if (fromSessionId === toSessionId) return 0
         return this.db.transaction(() => {
             const sourceRows = this.db.prepare(`
-                SELECT native_id, anchor, fingerprint, created_at
+                SELECT native_id, anchor, fingerprint, message_id, created_at
                 FROM session_native_steps
                 WHERE session_id = ?
                 ORDER BY native_id ASC, seq ASC
@@ -83,6 +95,7 @@ export class NativeStepStore {
                 native_id: string
                 anchor: string
                 fingerprint: string
+                message_id: string
                 created_at: number
             }>
             if (sourceRows.length === 0) return 0
@@ -92,8 +105,8 @@ export class NativeStepStore {
             )
             const insertStmt = this.db.prepare(`
                 INSERT OR IGNORE INTO session_native_steps
-                    (session_id, native_id, anchor, fingerprint, seq, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (session_id, native_id, anchor, fingerprint, message_id, seq, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             `)
             const nextSeqByNative = new Map<string, number>()
             let moved = 0
@@ -108,6 +121,7 @@ export class NativeStepStore {
                     row.native_id,
                     row.anchor,
                     row.fingerprint,
+                    row.message_id,
                     nextSeq,
                     row.created_at
                 )

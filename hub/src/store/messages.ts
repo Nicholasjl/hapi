@@ -173,13 +173,10 @@ export function addMessage(
     const canonicalContent = truncateOversizedMessageContent(content)
     const encoded = encodeMessageContent(canonicalContent)
 
-    // Messages without a localId have no ack path (markMessagesInvoked matches by localId).
-    // Treat them as already-invoked at insert time so they land in the thread normally instead
-    // of being stuck in the queued floating bar forever. Stamped with `stampedAt` (the
-    // client-provided createdAt when present) rather than server-now so getMessagesByPosition's
-    // COALESCE(invoked_at, created_at) sort reflects the transcript's own jsonl order instead of
-    // hub arrival order.
-    const invokedAt = localId ? null : stampedAt
+    // Messages without a localId (or CLI live ACP deliveries tagged with `agy-live:`
+    // solely for native-step linking) have no queued-prompt ack path, so stamp
+    // invoked_at immediately to land them in the thread and search index.
+    const invokedAt = localId && !localId.startsWith('agy-live:') ? null : stampedAt
 
     return db.transaction(() => {
         const previousHead = getNewestMessagePosition(db, sessionId)
@@ -691,6 +688,45 @@ export function upsertToolCallMessage(
         if (!row) throw new Error('Failed to update tool-call message')
         return { message: toStoredMessage(row), updated: true }
     })()
+}
+
+/** Replaces a message row's canonical content in place (e.g. upgrading partial live ACP text from full disk transcript) and updates search index. */
+export function replaceMessageContent(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+    content: unknown
+): StoredMessage | null {
+    return runInTransaction(db, () => {
+        const existing = prepareCached(db,
+            'SELECT * FROM messages WHERE session_id = ? AND id = ? LIMIT 1'
+        ).get(sessionId, messageId) as DbMessageRow | undefined
+        if (!existing) return null
+        const canonicalContent = truncateOversizedMessageContent(content)
+        if (isDeepStrictEqual(decodeMessageContent(existing.content), canonicalContent)) {
+            return toStoredMessage(existing)
+        }
+        const encoded = encodeMessageContent(canonicalContent)
+        prepareCached(db, 'UPDATE messages SET content = ? WHERE id = ? AND session_id = ?').run(
+            encoded,
+            messageId,
+            sessionId
+        )
+        const updated = prepareCached(db,
+            'SELECT * FROM messages WHERE id = ? AND session_id = ? LIMIT 1'
+        ).get(messageId, sessionId) as DbMessageRow | undefined
+        if (!updated) throw new Error('Failed to update message content')
+        indexMessageContent(db, {
+            id: updated.id,
+            sessionId: updated.session_id,
+            content: canonicalContent,
+            seq: updated.seq,
+            createdAt: updated.created_at,
+            invokedAt: updated.invoked_at
+        })
+        invalidateLiveTail(db, sessionId)
+        return toStoredMessage(updated)
+    })
 }
 
 /** Shared engines own pending native text. Never overwrite an invoked row. */

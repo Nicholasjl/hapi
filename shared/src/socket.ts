@@ -287,13 +287,44 @@ export interface ClientToServerEvents {
         time: number
     }) => void
     'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => void
-    'session-native-steps': (
+    'session-commit-native-steps': (
         data: {
             sid: string
             nativeId: string
-            steps: Array<{ anchor: string; fingerprint: string }>
+            expectedOffset: number
+            entries: Array<
+                | {
+                    kind: 'link'
+                    anchor: string
+                    fingerprint: string
+                    targetLocalIds: string[]
+                    content: unknown
+                    createdAt: number
+                }
+                | {
+                    kind: 'reconcile_update'
+                    anchor: string
+                    fingerprint: string
+                    targetLocalId: string
+                    localId: string
+                    content: unknown
+                    createdAt: number
+                }
+                | {
+                    kind: 'backfill'
+                    anchor: string
+                    fingerprint: string
+                    localId: string
+                    content: unknown
+                    createdAt: number
+                }
+            >
         },
-        callback?: (response: { ok: boolean; inserted?: number }) => void
+        callback?: (
+            response:
+                | { ok: true; confirmedCount: number; inserted: number; updated: number }
+                | { ok: false; reason?: 'offset_mismatch' | 'missing_target' | 'content_mismatch' | 'invalid' }
+        ) => void
     ) => void
     'session-reconcile-native-steps': (
         data: {

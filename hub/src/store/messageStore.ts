@@ -44,6 +44,7 @@ import {
     copyMessagesToSession as copyStoredMessagesToSession,
     addMessageSweepingLiveSnapshots,
     deleteLiveTextSnapshots,
+    replaceMessageContent,
     getAllMessages,
     getMessagesAfterSeq,
     getMaxSeq,
@@ -97,6 +98,10 @@ export class MessageStore {
 
     upsertToolCallMessage(sessionId: string, content: unknown, callId: string, localId?: string, createdAt?: number): UpsertToolCallResult {
         return upsertToolCallMessage(this.db, sessionId, content, callId, localId, createdAt)
+    }
+
+    replaceMessageContent(sessionId: string, messageId: string, content: unknown): StoredMessage | null {
+        return replaceMessageContent(this.db, sessionId, messageId, content)
     }
 
     /** Whether the session tail still holds unsettled tool work (see

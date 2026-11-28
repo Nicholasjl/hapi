@@ -1279,3 +1279,71 @@ describe('text snapshot sweep', () => {
         expect((rows[0]!.content as { content: { data: { message: string } } }).content.data.message).toBe('thinking')
     })
 })
+
+describe('agy-live localId and replaceMessageContent', () => {
+    it('stamps invokedAt immediately for agy-live: localIds so live rows land invoked and searchable without ack', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'agy-live-invoked')
+        const liveContent = {
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'message', message: 'initial searchable token' } },
+            meta: { sentFrom: 'cli' }
+        }
+        const stored = store.messages.addMessage(session.id, liveContent, 'agy-live:msg-1', null, 1234)
+        expect(stored.localId).toBe('agy-live:msg-1')
+        expect(stored.invokedAt).toBe(1234)
+        expect(store.messages.getUninvokedLocalMessages(session.id)).toHaveLength(0)
+        expect(store.messages.searchContentInSession('initial searchable token', 'default', session.id).total).toBe(1)
+        store.close()
+    })
+
+    it('replaces message content in place, updates FTS index, and invalidates live tail cache', () => {
+        const store = makeStore()
+        const session = makeSession(store, 'replace-content')
+        const initialTool = {
+            role: 'agent',
+            content: {
+                type: AGENT_MESSAGE_PAYLOAD_TYPE,
+                data: { type: 'tool-call', callId: 'call-replace', name: 'Read', status: 'in_progress', input: { path: 'a.ts' } }
+            },
+            meta: { sentFrom: 'cli' }
+        }
+        store.messages.upsertToolCallMessage(session.id, initialTool, 'call-replace', 'agy-live:tc-1', 100)
+        expect(store.messages.getLiveToolWork(session.id)).toBe(true)
+
+        const partialMsg = store.messages.addMessage(session.id, {
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'message', message: 'alpha stale phrase' } },
+            meta: { sentFrom: 'cli' }
+        }, 'agy-live:text-1', null, 101)
+        expect(store.messages.searchContentInSession('alpha stale phrase', 'default', session.id).total).toBe(1)
+
+        const replacedMsg = store.messages.replaceMessageContent(session.id, partialMsg.id, {
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'message', message: 'omega upgraded phrase' } },
+            meta: { sentFrom: 'cli' }
+        })
+        expect(replacedMsg?.id).toBe(partialMsg.id)
+        expect(replacedMsg?.content).toEqual({
+            role: 'agent',
+            content: { type: AGENT_MESSAGE_PAYLOAD_TYPE, data: { type: 'message', message: 'omega upgraded phrase' } },
+            meta: { sentFrom: 'cli' }
+        })
+        expect(store.messages.searchContentInSession('alpha stale phrase', 'default', session.id).total).toBe(0)
+        expect(store.messages.searchContentInSession('omega upgraded phrase', 'default', session.id).total).toBe(1)
+
+        // Updating an open tool-call row invalidates the live tail cache when settled.
+        const openRow = store.messages.getAllMessages(session.id).find((m) => m.localId === 'agy-live:tc-1')!
+        store.messages.replaceMessageContent(session.id, openRow.id, {
+            role: 'agent',
+            content: {
+                type: AGENT_MESSAGE_PAYLOAD_TYPE,
+                data: { type: 'tool-call', callId: 'call-replace', name: 'Read', status: 'completed', input: { path: 'a.ts' } }
+            },
+            meta: { sentFrom: 'cli' }
+        })
+        expect(store.messages.getLiveToolWork(session.id)).toBe(false)
+        expect(store.messages.replaceMessageContent(session.id, 'non-existent-id', {})).toBeNull()
+        store.close()
+    })
+})

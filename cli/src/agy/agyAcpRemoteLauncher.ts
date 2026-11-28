@@ -1,10 +1,12 @@
 import React from 'react';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { RawJSONLines } from '@/claude/types';
 import { statSync, watch, type BigIntStats, type FSWatcher } from 'node:fs';
 import { RPC_METHODS, splitAgyModelSelection } from '@hapi/protocol';
+import type { AgyImportedMessage } from '@hapi/protocol/apiTypes';
 import {
-    collectSettledAgyNativeStepFingerprints,
+    collectSettledAgyNativeMessagesPrefix,
     collectSettledAgyTranscriptForReconcile
 } from '@/modules/common/agySessions';
 import type { PermissionMode as ProtocolPermissionMode } from '@hapi/protocol/types';
@@ -12,7 +14,7 @@ import { getBuiltinSlashCommands, mergeSlashCommands } from '@hapi/protocol/slas
 import { logger } from '@/ui/logger';
 import { hashObject } from '@/utils/deterministicJson';
 import { RemoteModeDisplay } from '@/ui/ink/RemoteModeDisplay';
-import { convertAgentMessage } from '@/agent/messageConverter';
+import { convertAgentMessage, type CodexMessage } from '@/agent/messageConverter';
 import { GenerationClock } from '@/agent/generationClock';
 import { createAcpSessionTitleSync, registerAcpSessionTitleSync, type AcpSessionTitleController } from '@/agent/acpSessionTitle';
 import type { AgentMessage, FormElicitationRequest, FormElicitationResponse, McpServerStdio, PermissionRequest, PromptContent } from '@/agent/types';
@@ -236,6 +238,96 @@ export function resolveAgyHapiMcpAutoApproval(
 /** agy acp did not come up; the caller may fall back to another transport. */
 export class AgyAcpStartError extends Error {}
 
+/** Native transcript reconciliation blocked imported startup or prompt dispatch. */
+export class AgyNativeReconcileError extends Error {
+    constructor(
+        readonly kind: 'retryable' | 'diverged',
+        message: string
+    ) {
+        super(message);
+        this.name = 'AgyNativeReconcileError';
+    }
+}
+
+type ImportedReconcileState =
+    | { status: 'unreconciled' }
+    | { status: 'ready' }
+    | { status: 'retryable'; reason: string }
+    | { status: 'diverged'; reason: string };
+
+type PendingNativeDelivery =
+    | { kind: 'user'; localIds: string[]; text: string }
+    | { kind: 'agent'; localId: string; data: CodexMessage };
+
+type NativeCommitEntry = Parameters<NonNullable<AgySession['client']['commitNativeSteps']>>[2][number];
+
+function parseNativeStepIndex(anchor: string): number {
+    const match = /^step:(-?\d+):/.exec(anchor);
+    return match ? Number(match[1]) : -1;
+}
+
+function extractAgentPayloadData(content: unknown): Record<string, unknown> | null {
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return null;
+    const record = content as Record<string, unknown>;
+    if (record.role !== 'agent') return null;
+    const inner = record.content;
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return null;
+    const innerRecord = inner as Record<string, unknown>;
+    if (!innerRecord.data || typeof innerRecord.data !== 'object' || Array.isArray(innerRecord.data)) return null;
+    return innerRecord.data as Record<string, unknown>;
+}
+
+function isExactDeliveryMatch(diskMessage: AgyImportedMessage, delivery: PendingNativeDelivery): boolean {
+    const content = diskMessage.content as { role?: unknown; content?: { type?: unknown; text?: unknown } };
+    if (delivery.kind === 'user') {
+        if (content?.role !== 'user' || content.content?.type !== 'text' || typeof content.content.text !== 'string') {
+            return false;
+        }
+        const diskText = content.content.text;
+        if (diskText === delivery.text || diskText.trim() === delivery.text.trim()) {
+            return true;
+        }
+        const trimmedDisk = diskText.trim();
+        const trimmedDelivery = delivery.text.trim();
+        return Boolean(trimmedDelivery)
+            && trimmedDisk.startsWith('@')
+            && trimmedDisk.endsWith(`\n\n${trimmedDelivery}`);
+    }
+    const diskData = extractAgentPayloadData(diskMessage.content);
+    if (!diskData || diskData.type !== delivery.data.type) {
+        return false;
+    }
+    switch (delivery.data.type) {
+        case 'message':
+            return delivery.data.message === diskData.message;
+        case 'reasoning':
+            return delivery.data.message === diskData.message;
+        case 'tool-call':
+            return delivery.data.name === diskData.name
+                && isDeepStrictEqual(delivery.data.input ?? null, diskData.input ?? null);
+        case 'tool-call-result':
+            return isDeepStrictEqual({ ...delivery.data, callId: diskData.callId }, diskData);
+        default:
+            return false;
+    }
+}
+
+function isCompatibleUpdateMatch(diskMessage: AgyImportedMessage, delivery: PendingNativeDelivery): boolean {
+    if (delivery.kind !== 'agent') return false;
+    const diskData = extractAgentPayloadData(diskMessage.content);
+    if (!diskData || diskData.type !== delivery.data.type) return false;
+    switch (delivery.data.type) {
+        case 'message':
+        case 'reasoning':
+        case 'tool-call-result':
+            return true;
+        case 'tool-call':
+            return delivery.data.name === diskData.name;
+        default:
+            return false;
+    }
+}
+
 /** Hashes turn settings used for steer compatibility, ignoring per-message attachments. */
 function agyTurnConfigKey(mode: AgyMode): string {
     return hashObject({
@@ -357,9 +449,11 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private lastBgSnapshotIds: string[] = [];
     private acpSessionId: string | null = null;
     private nativeStepTrackingSessionId: string | null = null;
-    private nativeStepTrackingReady = false;
-    private maxRenderedNativeStepIndex = -1;
-    private readonly recordedNativeStepAnchors = new Set<string>();
+    private importedReconcileState: ImportedReconcileState = { status: 'unreconciled' };
+    private confirmedNativeStepCount: number | null = null;
+    private confirmedNativeMaxStepIndex = -1;
+    private readonly pendingNativeDeliveries: PendingNativeDelivery[] = [];
+    private readonly liveToolCallLocalIds = new Map<string, string>();
     private lastTranscriptStepIndex = -1;
     // Latest step_index seen when an unfinished wakeup hit `maxIdleMs`, so
     // tracking resumes as soon as late output appends a newer step.
@@ -477,6 +571,10 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         } catch (error) {
             // A kill during start-up is not a start failure.
             if (this.shouldExit) return;
+            if (error instanceof AgyNativeReconcileError) {
+                this.reportTurnError(error.message);
+                throw error;
+            }
             // Otherwise the session only ends as crashed, without the reason
             // (agy not signed in, an agy release without `acp`, ...).
             const message = describeAgyStartFailure(error);
@@ -518,44 +616,75 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         return this.session.client.getMetadata?.()?.agyImportedAt != null;
     }
 
+    private resetNativeLedgerTracking(sessionId: string | null): void {
+        this.nativeStepTrackingSessionId = sessionId;
+        this.importedReconcileState = { status: 'unreconciled' };
+        this.confirmedNativeStepCount = null;
+        this.confirmedNativeMaxStepIndex = -1;
+        this.pendingNativeDeliveries.length = 0;
+        this.liveToolCallLocalIds.clear();
+    }
+
     private async reconcileImportedNativeSteps(): Promise<void> {
         const acpSessionId = this.acpSessionId;
         if (!this.isImportedSession() || !acpSessionId) return;
         if (this.nativeStepTrackingSessionId !== acpSessionId) {
-            this.nativeStepTrackingSessionId = acpSessionId;
-            this.nativeStepTrackingReady = false;
-            this.maxRenderedNativeStepIndex = -1;
-            this.recordedNativeStepAnchors.clear();
+            this.resetNativeLedgerTracking(acpSessionId);
+        }
+        if (this.importedReconcileState.status === 'diverged') {
+            return;
+        }
+        if (
+            typeof this.session.client.reconcileNativeSteps !== 'function'
+            || typeof this.session.client.backfillNativeMessages !== 'function'
+            || typeof this.session.client.commitNativeSteps !== 'function'
+        ) {
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Antigravity native transcript sync is unavailable on this connection.'
+            };
+            return;
+        }
+        if (this.pendingNativeDeliveries.length > 0 && this.confirmedNativeStepCount !== null) {
+            const committed = await this.commitSettledNativeSteps();
+            if (!committed) return;
+            if (this.pendingNativeDeliveries.length > 0) {
+                this.importedReconcileState = {
+                    status: 'retryable',
+                    reason: 'Waiting for Antigravity native transcript to finish flushing before sending the next prompt.'
+                };
+                return;
+            }
         }
         const snapshot = collectSettledAgyTranscriptForReconcile(this.brainDir, acpSessionId);
         if (!snapshot.ready) {
-            this.nativeStepTrackingReady = false;
-            return;
-        }
-        if (typeof this.session.client.reconcileNativeSteps !== 'function') {
-            this.maxRenderedNativeStepIndex = Math.max(this.maxRenderedNativeStepIndex, this.lastTranscriptStepIndex);
-            for (const entry of snapshot.fingerprints) {
-                const match = /^step:(-?\d+):/.exec(entry.anchor);
-                const stepIndex = match ? Number(match[1]) : -1;
-                if (stepIndex <= this.maxRenderedNativeStepIndex) {
-                    this.recordedNativeStepAnchors.add(entry.anchor);
-                }
-            }
-            this.nativeStepTrackingReady = true;
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Antigravity transcript is still flushing to disk; retry shortly.'
+            };
             return;
         }
         const res = await this.session.client.reconcileNativeSteps(acpSessionId, snapshot.fingerprints);
-        if (!res?.ok || res.status === 'diverged') {
-            this.nativeStepTrackingReady = false;
+        if (!res?.ok) {
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Failed to reconcile Antigravity native history with HAPI; retrying on next turn.'
+            };
+            return;
+        }
+        if (res.status === 'diverged') {
+            this.importedReconcileState = {
+                status: 'diverged',
+                reason: 'Antigravity native history diverged from HAPI; cannot safely continue this imported session.'
+            };
             return;
         }
         if (res.status === 'needs_backfill') {
-            if (
-                res.fromIndex < 0
-                || res.fromIndex > snapshot.messages.length
-                || typeof this.session.client.backfillNativeMessages !== 'function'
-            ) {
-                this.nativeStepTrackingReady = false;
+            if (res.fromIndex < 0 || res.fromIndex > snapshot.messages.length) {
+                this.importedReconcileState = {
+                    status: 'retryable',
+                    reason: 'Received invalid native transcript backfill offset from HAPI.'
+                };
                 return;
             }
             const ok = await this.session.client.backfillNativeMessages(
@@ -564,67 +693,172 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 snapshot.messages.slice(res.fromIndex)
             );
             if (!ok) {
-                this.nativeStepTrackingReady = false;
+                this.importedReconcileState = {
+                    status: 'retryable',
+                    reason: 'Failed to backfill missing Antigravity transcript history into HAPI.'
+                };
                 return;
             }
+            this.confirmedNativeStepCount = snapshot.messages.length;
+        } else {
+            this.confirmedNativeStepCount = res.confirmedCount;
         }
-        for (const entry of snapshot.fingerprints) {
-            this.recordedNativeStepAnchors.add(entry.anchor);
-        }
-        this.maxRenderedNativeStepIndex = Math.max(this.maxRenderedNativeStepIndex, snapshot.maxStepIndex);
+        this.confirmedNativeMaxStepIndex = Math.max(this.confirmedNativeMaxStepIndex, snapshot.maxStepIndex);
         this.lastTranscriptStepIndex = Math.max(this.lastTranscriptStepIndex, snapshot.maxStepIndex);
-        this.nativeStepTrackingReady = true;
+        this.importedReconcileState = { status: 'ready' };
     }
 
-    private collectUnseenNativeSteps(acpSessionId: string): Array<{ anchor: string; fingerprint: string }> {
-        if (!this.nativeStepTrackingReady) return [];
-        const steps = readAgyTranscriptStepsAfter(this.brainDir, acpSessionId, -1);
-        const fingerprints = collectSettledAgyNativeStepFingerprints(acpSessionId, steps, {
-            maxStepIndex: this.maxRenderedNativeStepIndex
-        });
-        return fingerprints.filter((entry) => !this.recordedNativeStepAnchors.has(entry.anchor));
-    }
-
-    private syncConfirmedNativeSteps(): void {
-        if (!this.isImportedSession() || !this.acpSessionId || !this.nativeStepTrackingReady) return;
-        const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
-        if (unseen.length === 0) return;
-        for (const entry of unseen) {
-            this.recordedNativeStepAnchors.add(entry.anchor);
+    private async commitSettledNativeSteps(): Promise<boolean> {
+        const acpSessionId = this.acpSessionId;
+        if (
+            !this.isImportedSession()
+            || !acpSessionId
+            || this.confirmedNativeStepCount === null
+            || this.importedReconcileState.status === 'diverged'
+        ) {
+            return false;
         }
-        this.session.client.recordNativeSteps?.(this.acpSessionId, unseen, (ok) => {
-            if (!ok) {
-                for (const entry of unseen) {
-                    this.recordedNativeStepAnchors.delete(entry.anchor);
+        if (this.pendingNativeDeliveries.length === 0) {
+            return this.importedReconcileState.status === 'ready';
+        }
+        if (typeof this.session.client.commitNativeSteps !== 'function') {
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Antigravity native transcript sync is unavailable on this connection.'
+            };
+            return false;
+        }
+
+        const prefix = collectSettledAgyNativeMessagesPrefix(this.brainDir, acpSessionId);
+        if (prefix.messages.length < this.confirmedNativeStepCount) {
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Antigravity native transcript shrank below the confirmed ledger; re-reconciling before next turn.'
+            };
+            return false;
+        }
+
+        const candidateMessages = prefix.messages.slice(this.confirmedNativeStepCount);
+        const candidateFingerprints = prefix.fingerprints.slice(this.confirmedNativeStepCount);
+        if (candidateMessages.length === 0) {
+            return true;
+        }
+
+        const entries: NativeCommitEntry[] = [];
+        let dIdx = 0;
+        let pIdx = 0;
+        while (dIdx < candidateMessages.length && pIdx < this.pendingNativeDeliveries.length) {
+            const diskMsg = candidateMessages[dIdx]!;
+            const fpEntry = candidateFingerprints[dIdx]!;
+            const delivery = this.pendingNativeDeliveries[pIdx]!;
+
+            if (isExactDeliveryMatch(diskMsg, delivery)) {
+                entries.push({
+                    kind: 'link',
+                    anchor: fpEntry.anchor,
+                    fingerprint: fpEntry.fingerprint,
+                    targetLocalIds: delivery.kind === 'user' ? [...delivery.localIds] : [delivery.localId],
+                    content: diskMsg.content,
+                    createdAt: diskMsg.createdAt
+                });
+                dIdx += 1;
+                pIdx += 1;
+                continue;
+            }
+
+            let matchedAheadExact = false;
+            for (let look = dIdx + 1; look < candidateMessages.length; look += 1) {
+                if (isExactDeliveryMatch(candidateMessages[look]!, delivery)) {
+                    matchedAheadExact = true;
+                    break;
                 }
             }
-        });
-    }
+            if (matchedAheadExact) {
+                entries.push({
+                    kind: 'backfill',
+                    anchor: fpEntry.anchor,
+                    fingerprint: fpEntry.fingerprint,
+                    localId: diskMsg.localId,
+                    content: diskMsg.content,
+                    createdAt: diskMsg.createdAt
+                });
+                dIdx += 1;
+                continue;
+            }
 
-    private async flushConfirmedNativeSteps(): Promise<void> {
-        if (!this.isImportedSession() || !this.acpSessionId || !this.nativeStepTrackingReady) return;
-        const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
-        if (unseen.length === 0) return;
-        for (const entry of unseen) {
-            this.recordedNativeStepAnchors.add(entry.anchor);
-        }
-        try {
-            if (typeof this.session.client.flushNativeSteps === 'function') {
-                const ok = await this.session.client.flushNativeSteps(this.acpSessionId, unseen);
-                if (!ok) {
-                    for (const entry of unseen) {
-                        this.recordedNativeStepAnchors.delete(entry.anchor);
-                    }
+            if (delivery.kind === 'agent' && isCompatibleUpdateMatch(diskMsg, delivery)) {
+                entries.push({
+                    kind: 'reconcile_update',
+                    anchor: fpEntry.anchor,
+                    fingerprint: fpEntry.fingerprint,
+                    targetLocalId: delivery.localId,
+                    localId: diskMsg.localId,
+                    content: diskMsg.content,
+                    createdAt: diskMsg.createdAt
+                });
+                dIdx += 1;
+                pIdx += 1;
+                continue;
+            }
+
+            let matchedAheadCompatible = false;
+            for (let look = dIdx + 1; look < candidateMessages.length; look += 1) {
+                if (isCompatibleUpdateMatch(candidateMessages[look]!, delivery)) {
+                    matchedAheadCompatible = true;
+                    break;
                 }
+            }
+            if (matchedAheadCompatible) {
+                entries.push({
+                    kind: 'backfill',
+                    anchor: fpEntry.anchor,
+                    fingerprint: fpEntry.fingerprint,
+                    localId: diskMsg.localId,
+                    content: diskMsg.content,
+                    createdAt: diskMsg.createdAt
+                });
+                dIdx += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        if (entries.length === 0) {
+            return true;
+        }
+
+        const res = await this.session.client.commitNativeSteps(
+            acpSessionId,
+            this.confirmedNativeStepCount,
+            entries
+        );
+        if (!res?.ok) {
+            if (res?.reason === 'content_mismatch' || res?.reason === 'invalid') {
+                this.importedReconcileState = {
+                    status: 'diverged',
+                    reason: 'Antigravity native history diverged from HAPI; cannot safely continue this imported session.'
+                };
             } else {
-                this.session.client.recordNativeSteps?.(this.acpSessionId, unseen);
+                this.importedReconcileState = {
+                    status: 'retryable',
+                    reason: 'Failed to sync Antigravity transcript ledger with HAPI; retrying before next turn.'
+                };
             }
-        } catch (error) {
-            for (const entry of unseen) {
-                this.recordedNativeStepAnchors.delete(entry.anchor);
-            }
-            logger.debug('[agy-acp] flushConfirmedNativeSteps failed', error);
+            return false;
         }
+
+        this.pendingNativeDeliveries.splice(0, pIdx);
+        this.confirmedNativeStepCount = res.confirmedCount;
+        let maxCommitted = this.confirmedNativeMaxStepIndex;
+        for (const entry of entries) {
+            const idx = parseNativeStepIndex(entry.anchor);
+            if (idx > maxCommitted) {
+                maxCommitted = idx;
+            }
+        }
+        this.confirmedNativeMaxStepIndex = maxCommitted;
+        return true;
     }
 
     private syncTranscriptCursor(): void {
@@ -694,6 +928,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private hasPendingReactiveWakeup(): boolean {
         const acpSessionId = this.acpSessionId;
         if (!acpSessionId || this.backendLost || !this.backend?.isTransportAlive()) return false;
+        if (this.isImportedSession() && this.importedReconcileState.status !== 'ready') return false;
         if (this.retainedAmbiguousCompletions.length > 0) {
             this.reconcileRetainedAmbiguousCompletions(null);
         }
@@ -1014,10 +1249,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                         );
                     }
                     session.onThinkingChange(false);
-                    if (inspection.latestStepIndex > this.maxRenderedNativeStepIndex) {
-                        this.maxRenderedNativeStepIndex = inspection.latestStepIndex;
+                    if (this.pendingNativeDeliveries.length > 0) {
+                        await this.commitSettledNativeSteps();
                     }
-                    this.syncConfirmedNativeSteps();
                     if (session.queue.size() === 0 && !this.shouldExit) {
                         session.sendSessionEvent({ type: 'ready' });
                     }
@@ -1054,7 +1288,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 await this.waitWakeupTick(acpSessionId, pollIntervalMs, abortController.signal);
             }
         } finally {
-            this.syncConfirmedNativeSteps();
+            if (this.pendingNativeDeliveries.length > 0) {
+                await this.commitSettledNativeSteps();
+            }
             if (this.reactiveWakeupAbort === abortController) {
                 this.reactiveWakeupAbort = null;
             }
@@ -1187,6 +1423,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 this.lastTranscriptStepIndex = -1;
                 this.pausedWakeupStepIndex = null;
                 this.lastTurnTranscriptState = null;
+                this.resetNativeLedgerTracking(acpSessionId);
             }
             this.acpSessionId = acpSessionId;
             const reportedCommands = backend.getAvailableCommands?.(acpSessionId) ?? [];
@@ -1195,7 +1432,19 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
             this.syncTranscriptCursor();
             session.onSessionFound(acpSessionId);
-            await this.reconcileImportedNativeSteps();
+            if (this.isImportedSession()) {
+                await this.reconcileImportedNativeSteps();
+                if (this.importedReconcileState.status !== 'ready') {
+                    const state = this.importedReconcileState;
+                    const reason = state.status === 'retryable' || state.status === 'diverged'
+                        ? state.reason
+                        : 'Failed to reconcile Antigravity native transcript history.';
+                    throw new AgyNativeReconcileError(
+                        state.status === 'diverged' ? 'diverged' : 'retryable',
+                        reason
+                    );
+                }
+            }
             session.client.emitSessionReady();
             if (resumeSessionId === acpSessionId) {
                 const existingTitle = await readAgyConversationTitle(acpSessionId);
@@ -1321,7 +1570,26 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         let acknowledged = false;
         let answerMain!: () => void;
         const mainAnswered = new Promise<void>((resolve) => { answerMain = resolve; });
+        let userDelivery: PendingNativeDelivery | null = null;
+        const recordDispatchedUserDelivery = () => {
+            if (
+                userDelivery !== null
+                || !this.isImportedSession()
+                || internalWakeup
+                || swarmBoardCommand
+                || localIds.length === 0
+            ) {
+                return;
+            }
+            userDelivery = { kind: 'user', localIds: [...localIds], text: message };
+            this.pendingNativeDeliveries.push(userDelivery);
+        };
         const restoreIfUserTurn = () => {
+            if (userDelivery !== null) {
+                const idx = this.pendingNativeDeliveries.indexOf(userDelivery);
+                if (idx >= 0) this.pendingNativeDeliveries.splice(idx, 1);
+                userDelivery = null;
+            }
             if (!internalWakeup) this.restorePrompt(turn, message);
         };
         const turn: AgyTurn = {
@@ -1368,6 +1636,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             steerWaitReleased
         };
         let turnStartStepIndex = this.lastTranscriptStepIndex;
+        let promptDispatched = false;
         // Registered before any await so Stop can reach the turn while agy
         // restarts or switches settings.
         this.turn = turn;
@@ -1404,7 +1673,11 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     await this.relaunchBackend();
                     relaunched = true;
                 } catch (error) {
-                    this.reportTurnError(`Failed to restart Antigravity: ${errorMessage(error)}`);
+                    if (error instanceof AgyNativeReconcileError) {
+                        this.reportTurnError(error.message);
+                    } else {
+                        this.reportTurnError(`Failed to restart Antigravity: ${errorMessage(error)}`);
+                    }
                     restoreIfUserTurn();
                     return;
                 }
@@ -1415,14 +1688,25 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 restoreIfUserTurn();
                 return;
             }
-            if (
-                this.isImportedSession()
-                && !internalWakeup
-                && Math.max(this.lastTranscriptStepIndex, readLatestAgyTranscriptStepIndex(this.brainDir, acpSessionId))
-                    > this.maxRenderedNativeStepIndex
-            ) {
-                await this.reconcileImportedNativeSteps();
-                if (turn.aborted) {
+            if (this.isImportedSession() && !internalWakeup) {
+                const latestStepIndex = readLatestAgyTranscriptStepIndex(this.brainDir, acpSessionId);
+                if (
+                    this.importedReconcileState.status !== 'ready'
+                    || this.pendingNativeDeliveries.length > 0
+                    || Math.max(this.lastTranscriptStepIndex, latestStepIndex) > this.confirmedNativeMaxStepIndex
+                ) {
+                    await this.reconcileImportedNativeSteps();
+                    if (turn.aborted) {
+                        restoreIfUserTurn();
+                        return;
+                    }
+                }
+                if (this.importedReconcileState.status !== 'ready') {
+                    const state = this.importedReconcileState;
+                    const reason = state.status === 'retryable' || state.status === 'diverged'
+                        ? state.reason
+                        : 'Antigravity native history reconciliation failed.';
+                    this.reportTurnError(reason);
                     restoreIfUserTurn();
                     return;
                 }
@@ -1490,6 +1774,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
             session.client.updateAgentState((state) => ({ ...state, steeringActive: true }));
             try {
+                promptDispatched = true;
                 await backend.prompt(acpSessionId, prompt, (update) => this.handleTurnUpdate(turn, update), {
                     ...(live ? { beforeHandlerSwap: beginWindow } : {}),
                     timing: {
@@ -1500,6 +1785,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                             // an echo or first output leaves the message stuck
                             // in `Queued` while the model is thinking.
                             if (!turn.aborted) {
+                                recordDispatchedUserDelivery();
                                 turn.acknowledge();
                             }
                         },
@@ -1514,6 +1800,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (turn.stopReason === 'cancelled' && !turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
+                    recordDispatchedUserDelivery();
                     turn.acknowledge();
                 }
             } catch (error) {
@@ -1525,6 +1812,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (!turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
+                    recordDispatchedUserDelivery();
                     turn.acknowledge();
                 }
             }
@@ -1535,11 +1823,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             await this.waitForSteers(turn);
             this.flushDeferredLiveCommandCalls(turn);
             if (!turn.aborted && !this.backendLost) {
-                const nextCursor = this.syncTurnTranscriptCursor(turn, turnStartStepIndex, internalWakeup ? commandWindowAfterStepIndex : undefined);
-                if (nextCursor !== null && nextCursor > this.maxRenderedNativeStepIndex) {
-                    this.maxRenderedNativeStepIndex = nextCursor;
-                }
-                this.syncConfirmedNativeSteps();
+                this.syncTurnTranscriptCursor(turn, turnStartStepIndex, internalWakeup ? commandWindowAfterStepIndex : undefined);
             }
             this.closeBackgroundCommands(turn, commandWindowAfterStepIndex, false, internalWakeup);
         } finally {
@@ -1547,9 +1831,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 // The stopped activity ends here: discard its late starts before ready.
                 await this.discardStoppedWakeup(turn);
                 this.syncTranscriptCursor();
-            }
-            if (!this.backendLost) {
-                this.syncConfirmedNativeSteps();
             }
             this.questionLabels.clear();
             // After a Stop or a lost agy process, agy may have dropped a steer
@@ -1577,6 +1858,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
             session.onThinkingChange(false);
             await this.permissionHandler?.cancelAll('Prompt finished');
+            if (promptDispatched && !this.backendLost && this.pendingNativeDeliveries.length > 0) {
+                await this.commitSettledNativeSteps();
+            }
             if (session.queue.size() === 0 && !this.shouldExit) {
                 session.sendSessionEvent({ type: 'ready' });
             }
@@ -1627,7 +1911,15 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 { type: 'tool_result', id, output: AGY_BACKGROUND_COMMAND_RESULT, status: 'completed' },
                 this.currentModelId
             );
-            if (placeholder) this.session.sendAgentMessage(placeholder);
+            if (placeholder) {
+                if (this.isImportedSession()) {
+                    const localId = `agy-live:${randomUUID()}`;
+                    this.pendingNativeDeliveries.push({ kind: 'agent', localId, data: placeholder });
+                    this.session.sendAgentMessage(placeholder, localId, { emitConsumed: false });
+                } else {
+                    this.session.sendAgentMessage(placeholder);
+                }
+            }
         }
         // The background-task indicator mirrors these cards: register every
         // command agy left open at end_turn so the hub shows it running until
@@ -1863,6 +2155,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             if (resolved) return;
             resolved = true;
             forgetEcho();
+            if (this.isImportedSession()) {
+                this.pendingNativeDeliveries.push({ kind: 'user', localIds: [localId], text: taken.item.message });
+            }
             session.queue.commitReservation(taken);
             this.messageBuffer.addMessage(taken.item.message, 'user');
             session.client.emitMessagesConsumed([localId], { steered: true });
@@ -2346,7 +2641,38 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
 
     private forwardAgentMessage(message: AgentMessage): void {
         const converted = convertAgentMessage(this.toCanonicalToolMessage(message), this.currentModelId);
-        if (converted) this.session.sendAgentMessage(converted);
+        if (converted) {
+            const isTrackableImported = this.isImportedSession() && (
+                (message.type === 'text' && !message.live && message.text.trim().length > 0)
+                || (message.type === 'reasoning' && !message.live && message.text.trim().length > 0)
+                || message.type === 'tool_call'
+                || message.type === 'tool_result'
+            );
+            if (isTrackableImported && converted.type === 'tool-call') {
+                const existingLocalId = this.liveToolCallLocalIds.get(converted.callId);
+                if (existingLocalId) {
+                    const existingDelivery = this.pendingNativeDeliveries.find(
+                        (entry): entry is Extract<PendingNativeDelivery, { kind: 'agent' }> =>
+                            entry.kind === 'agent' && entry.localId === existingLocalId
+                    );
+                    if (existingDelivery) {
+                        existingDelivery.data = converted;
+                    }
+                    this.session.sendAgentMessage(converted);
+                } else {
+                    const localId = `agy-live:${randomUUID()}`;
+                    this.liveToolCallLocalIds.set(converted.callId, localId);
+                    this.pendingNativeDeliveries.push({ kind: 'agent', localId, data: converted });
+                    this.session.sendAgentMessage(converted, localId, { emitConsumed: false });
+                }
+            } else if (isTrackableImported) {
+                const localId = `agy-live:${randomUUID()}`;
+                this.pendingNativeDeliveries.push({ kind: 'agent', localId, data: converted });
+                this.session.sendAgentMessage(converted, localId, { emitConsumed: false });
+            } else {
+                this.session.sendAgentMessage(converted);
+            }
+        }
 
         switch (message.type) {
             case 'text':
@@ -2534,7 +2860,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         const backend = this.backend;
         this.backend = null;
         await backend?.disconnect();
-        await this.flushConfirmedNativeSteps();
+        if (this.pendingNativeDeliveries.length > 0) {
+            await this.commitSettledNativeSteps();
+        }
         const happyServer = this.happyServer;
         this.happyServer = null;
         happyServer?.stop();

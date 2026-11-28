@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { TRUNCATE_STRING_LIMIT } from '@hapi/protocol/localTranscript'
 import {
+    collectSettledAgyNativeMessagesPrefix,
     collectSettledAgyNativeStepFingerprints,
     collectSettledAgyTranscriptForReconcile,
     isAgyTranscriptStepSettled
@@ -772,6 +773,49 @@ describe('agy native step ledger settlement and fingerprinting', () => {
                 expect(settled.fingerprints).toHaveLength(2)
                 expect(settled.fingerprints[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/)
             }
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true })
+        }
+    })
+
+    it('returns contiguous settled prefix and stops before truncated or unsettled trailing steps in collectSettledAgyNativeMessagesPrefix', () => {
+        const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = require('node:fs') as typeof import('node:fs')
+        const { tmpdir } = require('node:os') as typeof import('node:os')
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-prefix-helper-'))
+        try {
+            const logsDir = join(brainDir, 'conv-pref', '.system_generated', 'logs')
+            mkdirSync(logsDir, { recursive: true })
+            const stepsPath = join(logsDir, 'transcript.jsonl')
+            const fullPath = join(logsDir, 'transcript_full.jsonl')
+
+            writeFileSync(stepsPath, [
+                JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }),
+                JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'clipped', truncated_fields: ['content'] }),
+                JSON.stringify({ step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'later step' })
+            ].join('\n') + '\n')
+
+            const partial = collectSettledAgyNativeMessagesPrefix(brainDir, 'conv-pref')
+            expect(partial.hasUnsettledTail).toBe(true)
+            expect(partial.maxStepIndex).toBe(0)
+            expect(partial.messages.map((m) => m.anchor)).toEqual(['step:0:0'])
+            expect(partial.fingerprints).toHaveLength(1)
+
+            // Flushing step 1 in transcript_full.jsonl unlocks steps 1 and 2 while staying deterministic.
+            writeFileSync(fullPath, JSON.stringify({
+                step_index: 1,
+                source: 'MODEL',
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'full step 1 reply'
+            }) + '\n')
+            const settled = collectSettledAgyNativeMessagesPrefix(brainDir, 'conv-pref')
+            expect(settled.hasUnsettledTail).toBe(false)
+            expect(settled.maxStepIndex).toBe(2)
+            expect(settled.messages.map((m) => m.anchor)).toEqual(['step:0:0', 'step:1:text', 'step:2:text'])
+            expect(settled.messages[1]?.content).toMatchObject({
+                role: 'agent',
+                content: { data: { type: 'message', message: 'full step 1 reply' } }
+            })
         } finally {
             rmSync(brainDir, { recursive: true, force: true })
         }

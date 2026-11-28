@@ -30,6 +30,7 @@ export type AnchoredMatchResult =
 export type RecordedNativeStep = {
     anchor: string
     fingerprint: string
+    messageId?: string
 }
 
 export function computeLocalTranscriptFingerprint(content: unknown): string {
@@ -107,6 +108,22 @@ export function matchAnchored(options: {
     }
 
     if (recordedNativeSteps && recordedNativeSteps.length > 0) {
+        const storedById = new Map(storedMessages.map((message) => [message.id, message]))
+        let lastRecordedSeq = -1
+        for (const step of recordedNativeSteps) {
+            if (step.messageId !== undefined) {
+                const linked = storedById.get(step.messageId)
+                if (!linked) {
+                    return {
+                        status: 'transcript_diverged',
+                        message: 'A confirmed native transcript message is no longer present in HAPI storage'
+                    }
+                }
+                if (linked.seq > lastRecordedSeq) {
+                    lastRecordedSeq = linked.seq
+                }
+            }
+        }
         let priorSourceIndex = -1
         for (const message of imported) {
             const sourceIndex = sourceIndexById.get(message.localId!)
@@ -146,7 +163,21 @@ export function matchAnchored(options: {
                 }
             }
         }
-        return { status: 'ok', delta: sourceMessages.slice(recordedNativeSteps.length) }
+        const delta = sourceMessages.slice(recordedNativeSteps.length)
+        if (delta.length > 0) {
+            const hasUncommittedLiveMessages = storedMessages.some((message) =>
+                message.seq > lastRecordedSeq
+                && typeof message.localId === 'string'
+                && message.localId.startsWith('agy-live:')
+            )
+            if (hasUncommittedLiveMessages) {
+                return {
+                    status: 'transcript_diverged',
+                    message: 'The HAPI session has uncommitted live turns past the confirmed native ledger'
+                }
+            }
+        }
+        return { status: 'ok', delta }
     }
 
     // No cursor: the imported prefix must align exactly with the head of the
