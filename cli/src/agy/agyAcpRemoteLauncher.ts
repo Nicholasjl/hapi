@@ -2,8 +2,8 @@ import React from 'react';
 import { randomUUID } from 'node:crypto';
 import type { RawJSONLines } from '@/claude/types';
 import { statSync, watch, type BigIntStats, type FSWatcher } from 'node:fs';
-import { RPC_METHODS, splitAgyModelSelection, type AgyNativeTurnProvenance } from '@hapi/protocol';
-import { extractAgyUserInputText } from '@/modules/common/agySessions';
+import { RPC_METHODS, splitAgyModelSelection } from '@hapi/protocol';
+import { collectSettledAgyNativeStepFingerprints } from '@/modules/common/agySessions';
 import type { PermissionMode as ProtocolPermissionMode } from '@hapi/protocol/types';
 import { getBuiltinSlashCommands, mergeSlashCommands } from '@hapi/protocol/slashCommands';
 import { logger } from '@/ui/logger';
@@ -251,13 +251,6 @@ function promptTextForEcho(prompt: PromptContent[]): string {
         .join(' ');
 }
 
-function sentPromptText(prompt: PromptContent[]): string {
-    return prompt
-        .filter((block): block is Extract<PromptContent, { type: 'text' }> => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n');
-}
-
 type AgyTurn = {
     modeHash: string;
     steerConfigKey: string;
@@ -301,7 +294,6 @@ type AgyTurn = {
     sawActivity: boolean;
     acknowledge: () => void;
     steers: Promise<void>[];
-    recordedSteers: AgyNativeTurnProvenance[];
     // Steers agy may have taken; one put back in the queue no longer counts.
     steersTaken: number;
     // agy's answers to the turn's requests, before HAPI drains late output.
@@ -361,8 +353,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private readonly activeBgTasks = new Map<string, string>();
     private lastBgSnapshotIds: string[] = [];
     private acpSessionId: string | null = null;
-    private nativeTurns: AgyNativeTurnProvenance[] = [];
-    private nativeTurnsInitialized = false;
+    private liveNativeTrackingSessionId: string | null = null;
+    private liveNativeTrackingStartStepIndex: number | null = null;
+    private readonly recordedNativeStepAnchors = new Set<string>();
     private lastTranscriptStepIndex = -1;
     // Latest step_index seen when an unfinished wakeup hit `maxIdleMs`, so
     // tracking resumes as soon as late output appends a newer step.
@@ -517,61 +510,66 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         }
     }
 
-    private hydrateNativeTurns(): void {
-        if (this.nativeTurnsInitialized) return;
-        this.nativeTurnsInitialized = true;
-        const stored = this.session.client.getMetadata?.()?.agyNativeTurns;
-        if (Array.isArray(stored)) {
-            this.nativeTurns = stored.map((entry) => ({
-                ...entry,
-                localIds: [...entry.localIds]
-            }));
+    private isImportedSession(): boolean {
+        return this.session.client.getMetadata?.()?.agyImportedAt != null;
+    }
+
+    private initializeNativeStepTracking(): void {
+        if (!this.isImportedSession() || !this.acpSessionId) return;
+        if (this.liveNativeTrackingSessionId !== this.acpSessionId) {
+            this.liveNativeTrackingSessionId = this.acpSessionId;
+            this.liveNativeTrackingStartStepIndex = this.lastTranscriptStepIndex;
+            this.recordedNativeStepAnchors.clear();
         }
     }
 
-    private persistNativeTurns(): void {
-        if (typeof this.session.client.updateMetadata !== 'function') return;
-        const snapshot = this.nativeTurns.map((entry) => ({
-            ...entry,
-            localIds: [...entry.localIds]
-        }));
-        this.session.client.updateMetadata((metadata) => ({
-            ...metadata,
-            agyNativeTurns: snapshot
-        }));
+    private collectUnseenNativeSteps(acpSessionId: string): Array<{ anchor: string; fingerprint: string }> {
+        const steps = readAgyTranscriptStepsAfter(this.brainDir, acpSessionId, -1);
+        const fingerprints = collectSettledAgyNativeStepFingerprints(acpSessionId, steps, {
+            afterStepIndex: this.liveNativeTrackingStartStepIndex ?? -1
+        });
+        return fingerprints.filter((entry) => !this.recordedNativeStepAnchors.has(entry.anchor));
     }
 
-    private confirmTurnProvenanceSteps(
-        acpSessionId: string,
-        afterStepIndex: number,
-        records: AgyNativeTurnProvenance[]
-    ): void {
-        const pending = records.filter((entry) => entry.userStepIndex == null);
-        if (pending.length === 0) return;
-        const steps = readAgyTranscriptStepsAfter(this.brainDir, acpSessionId, afterStepIndex);
-        let minStepIndex = afterStepIndex;
-        for (const existing of this.nativeTurns) {
-            if (existing.acpSessionId === acpSessionId && existing.userStepIndex != null && existing.userStepIndex > minStepIndex) {
-                minStepIndex = existing.userStepIndex;
+    private syncConfirmedNativeSteps(): void {
+        if (!this.isImportedSession() || !this.acpSessionId) return;
+        const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
+        if (unseen.length === 0) return;
+        for (const entry of unseen) {
+            this.recordedNativeStepAnchors.add(entry.anchor);
+        }
+        this.session.client.recordNativeSteps?.(this.acpSessionId, unseen, (ok) => {
+            if (!ok) {
+                for (const entry of unseen) {
+                    this.recordedNativeStepAnchors.delete(entry.anchor);
+                }
             }
+        });
+    }
+
+    private async flushConfirmedNativeSteps(): Promise<void> {
+        if (!this.isImportedSession() || !this.acpSessionId) return;
+        const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
+        if (unseen.length === 0) return;
+        for (const entry of unseen) {
+            this.recordedNativeStepAnchors.add(entry.anchor);
         }
-        let updated = false;
-        for (const record of pending) {
-            const target = record.promptText.replace(/\r\n/g, '\n').trim();
-            const match = steps.find((step) =>
-                step.step_index > minStepIndex
-                && step.type === 'USER_INPUT'
-                && step.source !== 'SYSTEM'
-                && extractAgyUserInputText(step.content).replace(/\r\n/g, '\n').trim() === target
-            );
-            if (!match) continue;
-            record.userStepIndex = match.step_index;
-            record.endStepIndex = Math.max(match.step_index, this.lastTranscriptStepIndex);
-            minStepIndex = match.step_index;
-            updated = true;
-        }
-        if (updated) {
-            this.persistNativeTurns();
+        try {
+            if (typeof this.session.client.flushNativeSteps === 'function') {
+                const ok = await this.session.client.flushNativeSteps(this.acpSessionId, unseen);
+                if (!ok) {
+                    for (const entry of unseen) {
+                        this.recordedNativeStepAnchors.delete(entry.anchor);
+                    }
+                }
+            } else {
+                this.session.client.recordNativeSteps?.(this.acpSessionId, unseen);
+            }
+        } catch (error) {
+            for (const entry of unseen) {
+                this.recordedNativeStepAnchors.delete(entry.anchor);
+            }
+            logger.debug('[agy-acp] flushConfirmedNativeSteps failed', error);
         }
     }
 
@@ -997,6 +995,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 await this.waitWakeupTick(acpSessionId, pollIntervalMs, abortController.signal);
             }
         } finally {
+            this.syncConfirmedNativeSteps();
             if (this.reactiveWakeupAbort === abortController) {
                 this.reactiveWakeupAbort = null;
             }
@@ -1137,10 +1136,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
             this.syncTranscriptCursor();
             session.onSessionFound(acpSessionId);
-            this.hydrateNativeTurns();
-            if (!Array.isArray(session.client.getMetadata?.()?.agyNativeTurns)) {
-                this.persistNativeTurns();
-            }
+            this.initializeNativeStepTracking();
             session.client.emitSessionReady();
             if (resumeSessionId === acpSessionId) {
                 const existingTitle = await readAgyConversationTitle(acpSessionId);
@@ -1266,18 +1262,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         let acknowledged = false;
         let answerMain!: () => void;
         const mainAnswered = new Promise<void>((resolve) => { answerMain = resolve; });
-        let nativeTurnRecord: AgyNativeTurnProvenance | null = null;
-        let restoredToComposer = false;
         const restoreIfUserTurn = () => {
-            restoredToComposer = true;
-            if (nativeTurnRecord !== null) {
-                const idx = this.nativeTurns.indexOf(nativeTurnRecord);
-                if (idx >= 0) {
-                    this.nativeTurns.splice(idx, 1);
-                    this.persistNativeTurns();
-                }
-                nativeTurnRecord = null;
-            }
             if (!internalWakeup) this.restorePrompt(turn, message);
         };
         const turn: AgyTurn = {
@@ -1312,7 +1297,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 session.client.emitMessagesConsumed(localIds);
             },
             steers: [],
-            recordedSteers: [],
             steersTaken: 0,
             mainAnswered,
             answerMain,
@@ -1350,7 +1334,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 );
                 const boardConverted = convertAgentMessage({ type: 'text', text: boardMarkdown }, this.currentModelId);
                 if (boardConverted && boardConverted.type === 'message') {
-                    session.sendAgentMessage({ ...boardConverted, hapiOnly: true });
+                    session.sendAgentMessage(boardConverted);
                 }
                 this.messageBuffer.addMessage(boardMarkdown, 'assistant');
                 return;
@@ -1433,20 +1417,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             if (!internalWakeup) {
                 this.messageBuffer.addMessage(message, 'user');
             }
-            const recordDispatchedPrompt = () => {
-                if (internalWakeup || turn.aborted || restoredToComposer || nativeTurnRecord !== null) return;
-                this.hydrateNativeTurns();
-                nativeTurnRecord = {
-                    acpSessionId,
-                    localIds: [...localIds],
-                    promptText: sentPromptText(prompt),
-                    userStepIndex: null,
-                    endStepIndex: null,
-                    kind: 'prompt'
-                };
-                this.nativeTurns.push(nativeTurnRecord);
-                this.persistNativeTurns();
-            };
             session.client.updateAgentState((state) => ({ ...state, steeringActive: true }));
             try {
                 await backend.prompt(acpSessionId, prompt, (update) => this.handleTurnUpdate(turn, update), {
@@ -1459,7 +1429,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                             // an echo or first output leaves the message stuck
                             // in `Queued` while the model is thinking.
                             if (!turn.aborted) {
-                                recordDispatchedPrompt();
                                 turn.acknowledge();
                             }
                         },
@@ -1474,7 +1443,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (turn.stopReason === 'cancelled' && !turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
-                    recordDispatchedPrompt();
                     turn.acknowledge();
                 }
             } catch (error) {
@@ -1486,7 +1454,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (!turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
-                    recordDispatchedPrompt();
                     turn.acknowledge();
                 }
             }
@@ -1498,11 +1465,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             this.flushDeferredLiveCommandCalls(turn);
             if (!turn.aborted && !this.backendLost) {
                 this.syncTurnTranscriptCursor(turn, turnStartStepIndex, internalWakeup ? commandWindowAfterStepIndex : undefined);
-                this.confirmTurnProvenanceSteps(
-                    acpSessionId,
-                    turnStartStepIndex,
-                    [nativeTurnRecord, ...turn.recordedSteers].filter((r): r is AgyNativeTurnProvenance => r !== null)
-                );
+                this.syncConfirmedNativeSteps();
             }
             this.closeBackgroundCommands(turn, commandWindowAfterStepIndex, false, internalWakeup);
         } finally {
@@ -1511,6 +1474,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 await this.discardStoppedWakeup(turn);
                 this.syncTranscriptCursor();
             }
+            if (!this.backendLost) {
+                this.syncConfirmedNativeSteps();
+            }
             this.questionLabels.clear();
             // After a Stop or a lost agy process, agy may have dropped a steer
             // it had not echoed yet.
@@ -1518,13 +1484,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             for (const steer of turn.answeredSteers) {
                 if (endedCleanly) steer.accept();
                 else steer.hold();
-            }
-            if (!this.backendLost && this.acpSessionId && !restoredToComposer) {
-                this.confirmTurnProvenanceSteps(
-                    this.acpSessionId,
-                    turnStartStepIndex,
-                    [nativeTurnRecord, ...turn.recordedSteers].filter((r): r is AgyNativeTurnProvenance => r !== null)
-                );
             }
             turn.answerMain();
             if (this.turn === turn) this.turn = null;
@@ -1832,18 +1791,6 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             forgetEcho();
             session.queue.commitReservation(taken);
             this.messageBuffer.addMessage(taken.item.message, 'user');
-            this.hydrateNativeTurns();
-            const steerRecord: AgyNativeTurnProvenance = {
-                acpSessionId,
-                localIds: [localId],
-                promptText: sentPromptText(steerPrompt),
-                userStepIndex: null,
-                endStepIndex: null,
-                kind: 'steer'
-            };
-            turn.recordedSteers.push(steerRecord);
-            this.nativeTurns.push(steerRecord);
-            this.persistNativeTurns();
             session.client.emitMessagesConsumed([localId], { steered: true });
         };
         forgetEcho = () => {
@@ -2513,6 +2460,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         const backend = this.backend;
         this.backend = null;
         await backend?.disconnect();
+        await this.flushConfirmedNativeSteps();
         const happyServer = this.happyServer;
         this.happyServer = null;
         happyServer?.stop();

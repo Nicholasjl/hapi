@@ -1,10 +1,12 @@
 import { asQuestionCard } from '@/agy/agyQuestion'
+import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+import { canonicalizeLocalTranscriptContent, truncateOversizedMessageContent } from '@hapi/protocol/localTranscript'
 import type {
     AgyImportedMessage,
     AgyImportedMessageContent,
@@ -280,6 +282,68 @@ function buildActionStepToolResult(
         output: raw,
         status: step.status === 'ERROR' ? 'failed' : 'completed'
     }
+}
+
+export function isAgyTranscriptStepSettled(step: AgyTranscriptStep): boolean {
+    if (Array.isArray(step.truncated_fields) && step.truncated_fields.length > 0) {
+        return false
+    }
+    if (step.status === 'PENDING' || step.status === 'WAITING') {
+        return false
+    }
+    if (step.status === 'RUNNING') {
+        // Non-background RUNNING steps (or foreground run_command steps that have not
+        // yet moved into a tracked background task) still mutate in place as AGY finishes
+        // them. Once a model action step carries a background task id, both RUNNING and
+        // its settled background DONE representation map to AGY_BACKGROUND_COMMAND_RESULT.
+        return (
+            step.source === 'MODEL'
+            && step.type !== 'PLANNER_RESPONSE'
+            && Boolean(extractAgyBackgroundTaskId(stripAgyStepTimestamps(step.content ?? '')))
+        )
+    }
+    return true
+}
+
+function parseStepIndexFromAnchor(anchor: string): number | null {
+    const match = /^step:(-?\d+):/.exec(anchor)
+    return match ? Number(match[1]) : null
+}
+
+/**
+ * Computes incremental `(anchor, sha256)` ledger entries for the contiguous prefix
+ * of settled steps in an Antigravity transcript while skipping steps at or before
+ * `options.afterStepIndex`. Stops at the first unsettled step so ledger sequence
+ * positions stay aligned with `convertAgyTranscriptStepsToMessages`.
+ */
+export function collectSettledAgyNativeStepFingerprints(
+    sessionId: string,
+    steps: AgyTranscriptStep[],
+    options?: { afterStepIndex?: number }
+): Array<{ anchor: string; fingerprint: string }> {
+    const settledSteps: AgyTranscriptStep[] = []
+    for (const step of steps) {
+        if (!isAgyTranscriptStepSettled(step)) {
+            break
+        }
+        settledSteps.push(step)
+    }
+    if (settledSteps.length === 0) {
+        return []
+    }
+    const afterStepIndex = options?.afterStepIndex ?? -1
+    const { messages } = convertAgyTranscriptStepsToMessages(sessionId, settledSteps, 0)
+    const fingerprints: Array<{ anchor: string; fingerprint: string }> = []
+    for (const message of messages) {
+        const stepIndex = parseStepIndexFromAnchor(message.anchor)
+        if (stepIndex === null || stepIndex <= afterStepIndex) {
+            continue
+        }
+        const canonical = canonicalizeLocalTranscriptContent(truncateOversizedMessageContent(message.content))
+        const fingerprint = createHash('sha256').update(canonical).digest('hex')
+        fingerprints.push({ anchor: message.anchor, fingerprint })
+    }
+    return fingerprints
 }
 
 export function convertAgyTranscriptStepsToMessages(

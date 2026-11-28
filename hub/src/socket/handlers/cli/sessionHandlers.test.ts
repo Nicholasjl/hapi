@@ -855,3 +855,98 @@ it.each([
         store.close()
     })
 })
+
+describe('session-native-steps handler', () => {
+    const hash = (tag: string) => tag.repeat(64).slice(0, 64)
+
+    it('records incremental native steps for imported sessions with matching nativeId and ignores duplicates', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-imported',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-1' },
+            null,
+            'default'
+        )
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid, opts) => {
+                expect(opts?.fresh).toBe(true)
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {}
+        })
+
+        const acks: Array<unknown> = []
+        socket.trigger('session-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: hash('a') },
+                { anchor: 'step:1:text', fingerprint: hash('b') }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[0]).toEqual({ ok: true, inserted: 2 })
+
+        // Re-sending an existing anchor with a mismatched fingerprint must be ignored without mutating seq or fingerprint.
+        socket.trigger('session-native-steps', {
+            sid: session.id,
+            nativeId: 'native-1',
+            steps: [
+                { anchor: 'step:1:text', fingerprint: hash('f') },
+                { anchor: 'step:2:0', fingerprint: hash('c') }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[1]).toEqual({ ok: true, inserted: 1 })
+
+        expect(store.nativeSteps.getSteps(session.id, 'native-1')).toEqual([
+            { anchor: 'step:0:0', fingerprint: hash('a'), seq: 1 },
+            { anchor: 'step:1:text', fingerprint: hash('b'), seq: 2 },
+            { anchor: 'step:2:0', fingerprint: hash('c'), seq: 3 }
+        ])
+        store.close()
+    })
+
+    it('rejects session-native-steps when agyImportedAt is missing or nativeId does not match metadata', () => {
+        const store = new Store(':memory:')
+        const unimported = store.sessions.getOrCreateSession(
+            'agy-plain',
+            { path: '/work', host: 'h1', agySessionId: 'native-1' },
+            null,
+            'default'
+        )
+        const imported = store.sessions.getOrCreateSession(
+            'agy-mismatch',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-actual' },
+            null,
+            'default'
+        )
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid) => {
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {}
+        })
+
+        const acks: Array<unknown> = []
+        socket.trigger('session-native-steps', {
+            sid: unimported.id,
+            nativeId: 'native-1',
+            steps: [{ anchor: 'step:0:0', fingerprint: hash('a') }]
+        }, (resp) => acks.push(resp))
+        socket.trigger('session-native-steps', {
+            sid: imported.id,
+            nativeId: 'native-wrong',
+            steps: [{ anchor: 'step:0:0', fingerprint: hash('a') }]
+        }, (resp) => acks.push(resp))
+
+        expect(acks).toEqual([{ ok: false }, { ok: false }])
+        expect(store.nativeSteps.getSteps(unimported.id, 'native-1')).toEqual([])
+        expect(store.nativeSteps.getSteps(imported.id, 'native-wrong')).toEqual([])
+        store.close()
+    })
+})

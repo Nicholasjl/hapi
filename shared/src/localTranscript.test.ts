@@ -10,10 +10,12 @@ import {
     ListLocalSessionsRpcResponseSchema,
     LocalTranscriptSchema,
     agyToTranscript,
+    canonicalizeLocalTranscriptContent,
     claudeToTranscript,
     codexToTranscript,
     opencodeToTranscript,
-    piToTranscript
+    piToTranscript,
+    truncateOversizedMessageContent
 } from './localTranscript'
 
 const piSession: PiLocalSessionWithMessages = {
@@ -252,5 +254,37 @@ describe('local transcript mappers', () => {
             sessions: [piToTranscript(piSession), opencodeToTranscript(opencodeSession)]
         }).success).toBe(true)
         expect(ListLocalSessionsRpcResponseSchema.parse({ success: false, error: 'nope' }).success).toBe(false)
+    })
+
+    it('canonicalizes transcript content deterministically across key orders and undefined properties', () => {
+        const a = {
+            role: 'agent',
+            meta: { z: 2, a: 1, dropped: undefined },
+            items: ['x', undefined, { b: true, a: false }]
+        }
+        const b = {
+            items: ['x', undefined, { a: false, b: true }],
+            meta: { a: 1, z: 2 },
+            extra: undefined,
+            role: 'agent'
+        }
+        expect(canonicalizeLocalTranscriptContent(a)).toBe(canonicalizeLocalTranscriptContent(b))
+        expect(JSON.parse(canonicalizeLocalTranscriptContent(a))).toEqual({
+            items: ['x', null, { a: false, b: true }],
+            meta: { a: 1, z: 2 },
+            role: 'agent'
+        })
+    })
+
+    it('truncates oversized agent strings idempotently while keeping user messages verbatim', () => {
+        const oversized = `${'A'.repeat(70_000)}TAIL`
+        const agent = { role: 'agent', content: { type: 'codex', data: { output: oversized } } }
+        const once = truncateOversizedMessageContent(agent) as typeof agent
+        expect(once.content.data.output.length).toBeLessThan(oversized.length)
+        expect(once.content.data.output).toContain('[hapi: truncated ')
+        expect(truncateOversizedMessageContent(once)).toBe(once)
+
+        const user = { role: 'user', content: { type: 'text', text: oversized } }
+        expect(truncateOversizedMessageContent(user)).toBe(user)
     })
 })

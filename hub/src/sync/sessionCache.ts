@@ -2173,6 +2173,7 @@ export class SessionCache {
         // the operator's per-session notes, contradicting the v2.0
         // promise that scratchlist survives reloads.
         const movedScratchlist = this.store.scratchlist.transfer(oldSessionId, newSessionId)
+        this.store.nativeSteps.transferSession(oldSessionId, newSessionId)
         // Snapshot before transfer: if newSessionId previously redirected its
         // jobs to oldSessionId (A→B history, then B→A reclaim), clear that
         // stale outgoing pointer so the reclaimed owner resolves to itself.

@@ -273,6 +273,16 @@ function makeClient() {
         emitMessagesConsumed: vi.fn(),
         emitSteerIndeterminate: vi.fn(),
         setSteerDeliveryState: vi.fn(async () => true),
+        recordNativeSteps: vi.fn((
+            _nativeId: string,
+            _steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+            _onResult?: (ok: boolean) => void
+        ) => {}),
+        flushNativeSteps: vi.fn(async (
+            _nativeId: string,
+            _steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+            _timeoutMs?: number
+        ) => true),
         getMetadata: vi.fn((): ReturnType<ApiSessionClient['getMetadata']> => null),
         keepAlive: vi.fn(),
         emitSessionReady: vi.fn()
@@ -2987,8 +2997,8 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
         }
     });
 
-    it('tags /swarm board replies hapiOnly without recording them or pre-dispatch restores in agyNativeTurns, while recording real dispatched turns with step provenance', async () => {
-        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-provenance-'));
+    it('does not record native steps or write provenance metadata on non-imported AGY sessions', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-non-imported-'));
         try {
             const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
             mkdirSync(logsDir, { recursive: true });
@@ -2998,14 +3008,88 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             const { session, queue, client } = makeSession();
             let currentMetadata: Record<string, unknown> = {
                 path: '/tmp/agy-project',
-                host: 'test',
-                agyImportedAt: 100
+                host: 'test'
             };
-            const agyNativeTurnHistory: unknown[] = [];
             client.getMetadata.mockImplementation(() => currentMetadata as never);
             client.updateMetadata.mockImplementation((updater: (m: Record<string, unknown>) => Record<string, unknown>) => {
                 currentMetadata = updater(currentMetadata);
-                agyNativeTurnHistory.push(structuredClone(currentMetadata.agyNativeTurns));
+            });
+
+            const backend = new FakeAgyBackend();
+            backend.promptScripts.push(async (onUpdate) => {
+                writeFileSync(stepsPath, [
+                    JSON.stringify({
+                        step_index: 0,
+                        type: 'USER_INPUT',
+                        source: 'USER_EXPLICIT',
+                        status: 'DONE',
+                        content: '<USER_REQUEST>\nplain prompt\n</USER_REQUEST>'
+                    }),
+                    JSON.stringify({
+                        step_index: 1,
+                        type: 'PLANNER_RESPONSE',
+                        source: 'MODEL',
+                        status: 'DONE',
+                        content: 'plain reply'
+                    })
+                ].join('\n') + '\n');
+                onUpdate({ type: 'text', text: 'plain reply' });
+                onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
+            });
+
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+            queue.push('plain prompt', REVIEW, 'plain-1');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(1));
+            await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(1));
+
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.flushNativeSteps).not.toHaveBeenCalled();
+            expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
+
+            queue.close();
+            await run;
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
+            expect(client.flushNativeSteps).not.toHaveBeenCalled();
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('tracks settled native steps incrementally outside metadata for imported sessions and flushes late settled steps on cleanup', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-ledger-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            const startupSteps = [
+                JSON.stringify({
+                    step_index: 0,
+                    type: 'USER_INPUT',
+                    source: 'USER_EXPLICIT',
+                    status: 'DONE',
+                    content: '<USER_REQUEST>\nalready imported\n</USER_REQUEST>'
+                }),
+                JSON.stringify({
+                    step_index: 1,
+                    type: 'PLANNER_RESPONSE',
+                    source: 'MODEL',
+                    status: 'DONE',
+                    content: 'already imported answer'
+                })
+            ];
+            writeFileSync(stepsPath, startupSteps.join('\n') + '\n');
+
+            const { session, queue, client } = makeSession();
+            let currentMetadata: Record<string, unknown> = {
+                path: '/tmp/agy-project',
+                host: 'test',
+                agyImportedAt: 100
+            };
+            client.getMetadata.mockImplementation(() => currentMetadata as never);
+            client.updateMetadata.mockImplementation((updater: (m: Record<string, unknown>) => Record<string, unknown>) => {
+                currentMetadata = updater(currentMetadata);
             });
 
             const backend = new FakeAgyBackend();
@@ -3017,18 +3101,29 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 onUpdate({ type: 'turn_complete', stopReason: 'cancelled' });
             });
             backend.promptScripts.push(async (onUpdate) => {
+                // Step 5 & 6 are settled; step 7 is still non-background RUNNING and must NOT be emitted yet.
                 writeFileSync(stepsPath, [
+                    ...startupSteps,
                     JSON.stringify({
                         step_index: 5,
                         type: 'USER_INPUT',
                         source: 'USER_EXPLICIT',
+                        status: 'DONE',
                         content: '<USER_REQUEST>\nfirst batch line\nsecond batch line\n</USER_REQUEST>'
                     }),
                     JSON.stringify({
                         step_index: 6,
                         type: 'PLANNER_RESPONSE',
                         source: 'MODEL',
+                        status: 'DONE',
                         content: 'done batch'
+                    }),
+                    JSON.stringify({
+                        step_index: 7,
+                        type: 'PLANNER_RESPONSE',
+                        source: 'MODEL',
+                        status: 'RUNNING',
+                        content: 'streaming late step'
                     })
                 ].join('\n') + '\n');
                 onUpdate({ type: 'text', text: 'done batch' });
@@ -3037,19 +3132,17 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
 
             const { run } = launch(session, [backend], { brainDir });
             await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
-            expect(currentMetadata.agyNativeTurns).toEqual([]);
+            expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
 
-            // 1. /swarm board must emit hapiOnly agent reply and leave agyNativeTurns empty.
+            // 1. /swarm board sends normal agent reply and records no native steps.
             queue.pushIsolated('/swarm board', REVIEW, 'board-1');
             await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['board-1']));
-            expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({
-                type: 'message',
-                hapiOnly: true
-            }));
-            expect(currentMetadata.agyNativeTurns).toEqual([]);
+            expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+            expect(client.sendAgentMessage.mock.calls.every(([msg]) => !('hapiOnly' in (msg as Record<string, unknown>)))).toBe(true);
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
 
-            // 2. Pre-dispatch abort restores to composer without recording provenance.
-            const metadataUpdatesBeforeAbort = client.updateMetadata.mock.calls.length;
+            // 2. Pre-dispatch abort restores to composer without emitting native steps or provenance metadata.
             queue.push('restored turn', REVIEW, 'restored-1');
             await vi.waitFor(() => expect(backend.setModeCalls).toHaveLength(1));
             await client.rpcHandlerManager.handlers.get(RPC_METHODS.Abort)!();
@@ -3058,10 +3151,9 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 text: 'restored turn'
             }));
             await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(2));
-            expect(agyNativeTurnHistory.slice(metadataUpdatesBeforeAbort).every((turns) => Array.isArray(turns) && turns.length === 0)).toBe(true);
-            expect(currentMetadata.agyNativeTurns).toEqual([]);
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
 
-            // 3. Cancelled turn before output restores to composer and reverts any pending provenance.
+            // 3. Cancelled turn before output restores to composer without recording native steps.
             backend.preSendDelayMs = 0;
             queue.push('cancelled turn', REVIEW, 'cancelled-1');
             await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
@@ -3069,23 +3161,56 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
                 text: 'cancelled turn'
             }));
             await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(3));
-            expect(currentMetadata.agyNativeTurns).toEqual([]);
+            expect(client.recordNativeSteps).not.toHaveBeenCalled();
 
-            // 4. Real batched prompt records ordered localIds, promptText, and confirmed transcript step indices.
+            // 4. Real batched turn emits settled post-startup steps (5 & 6) via recordNativeSteps, skips RUNNING step 7.
             queue.push('first batch line', REVIEW, 'real-1');
             queue.push('second batch line', REVIEW, 'real-2');
-            await vi.waitFor(() => expect(backend.prompts).toHaveLength(3));
-            await vi.waitFor(() => expect(currentMetadata.agyNativeTurns).toEqual([{
-                acpSessionId: 'agy-conv-new',
-                localIds: ['real-1', 'real-2'],
-                promptText: 'first batch line\nsecond batch line',
-                userStepIndex: 5,
-                endStepIndex: 6,
-                kind: 'prompt'
-            }]));
+            await vi.waitFor(() => expect(client.recordNativeSteps).toHaveBeenCalledTimes(1));
+            const [firstNativeId, firstSteps] = client.recordNativeSteps.mock.calls[0]!;
+            expect(firstNativeId).toBe('agy-conv-new');
+            expect(firstSteps.map((s: { anchor: string }) => s.anchor)).toEqual(['step:5:0', 'step:6:text']);
+            expect(firstSteps.every((s: { fingerprint: string }) => /^[0-9a-f]{64}$/.test(s.fingerprint))).toBe(true);
+
+            // 5. Step 7 finishes during backend disconnect; cleanup() flushes it via flushNativeSteps without re-sending 5 or 6.
+            const origDisconnect = backend.disconnect.bind(backend);
+            backend.disconnect = async () => {
+                await origDisconnect();
+                writeFileSync(stepsPath, [
+                    ...startupSteps,
+                    JSON.stringify({
+                        step_index: 5,
+                        type: 'USER_INPUT',
+                        source: 'USER_EXPLICIT',
+                        status: 'DONE',
+                        content: '<USER_REQUEST>\nfirst batch line\nsecond batch line\n</USER_REQUEST>'
+                    }),
+                    JSON.stringify({
+                        step_index: 6,
+                        type: 'PLANNER_RESPONSE',
+                        source: 'MODEL',
+                        status: 'DONE',
+                        content: 'done batch'
+                    }),
+                    JSON.stringify({
+                        step_index: 7,
+                        type: 'PLANNER_RESPONSE',
+                        source: 'MODEL',
+                        status: 'DONE',
+                        content: 'final settled reply'
+                    })
+                ].join('\n') + '\n');
+            };
 
             queue.close();
             await run;
+
+            expect(currentMetadata).not.toHaveProperty('agyNativeTurns');
+            expect(client.flushNativeSteps).toHaveBeenCalledTimes(1);
+            const [flushedNativeId, flushedSteps] = client.flushNativeSteps.mock.calls[0]!;
+            expect(flushedNativeId).toBe('agy-conv-new');
+            expect(flushedSteps.map((s: { anchor: string }) => s.anchor)).toEqual(['step:7:text']);
+            expect(flushedSteps[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/);
         } finally {
             rmSync(brainDir, { recursive: true, force: true });
         }

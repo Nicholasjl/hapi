@@ -282,6 +282,73 @@ export function agyToTranscriptSummary(session: AgyLocalSessionSummary): LocalTr
     })
 }
 
+export function canonicalizeLocalTranscriptContent(value: unknown): string {
+    if (value === null || value === undefined) {
+        return String(value)
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+        return JSON.stringify(value)
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map((item) => (item === undefined ? 'null' : canonicalizeLocalTranscriptContent(item))).join(',')}]`
+    }
+    if (typeof value === 'object') {
+        const record = value as Record<string, unknown>
+        const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort()
+        return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalizeLocalTranscriptContent(record[key])}`).join(',')}}`
+    }
+    return JSON.stringify(value)
+}
+
+/** Per-string cap inside agent message content. Tool results above this are
+ *  head+tail truncated at ingest and must match across hub and CLI hashing. */
+export const TRUNCATE_STRING_LIMIT = 64 * 1024
+const TRUNCATE_HEAD = 48 * 1024
+const TRUNCATE_TAIL = 12 * 1024
+
+function truncateOversizedString(value: string): string {
+    const removed = value.length - TRUNCATE_HEAD - TRUNCATE_TAIL
+    return `${value.slice(0, TRUNCATE_HEAD)}\n…[hapi: truncated ${removed} chars]…\n${value.slice(value.length - TRUNCATE_TAIL)}`
+}
+
+function truncateOversizedDeep(value: unknown): unknown {
+    if (typeof value === 'string') {
+        return value.length > TRUNCATE_STRING_LIMIT ? truncateOversizedString(value) : value
+    }
+    if (Array.isArray(value)) {
+        let copy: unknown[] | null = null
+        for (let i = 0; i < value.length; i++) {
+            const item = truncateOversizedDeep(value[i])
+            if (item !== value[i]) {
+                copy ??= value.slice()
+                copy[i] = item
+            }
+        }
+        return copy ?? value
+    }
+    if (value !== null && typeof value === 'object') {
+        const record = value as Record<string, unknown>
+        let copy: Record<string, unknown> | null = null
+        for (const key of Object.keys(record)) {
+            const item = truncateOversizedDeep(record[key])
+            if (item !== record[key]) {
+                copy ??= { ...record }
+                copy[key] = item
+            }
+        }
+        return copy ?? value
+    }
+    return value
+}
+
+/** Truncates oversized strings inside `role === 'agent'` message envelopes
+ *  idempotently so hub storage, transcript matching, and CLI fingerprinting agree. */
+export function truncateOversizedMessageContent(content: unknown): unknown {
+    if (content === null || typeof content !== 'object') return content
+    if ((content as Record<string, unknown>).role !== 'agent') return content
+    return truncateOversizedDeep(content)
+}
+
 export function agyToTranscript(session: AgyLocalSessionWithMessages): LocalTranscript {
     return {
         ...agyToTranscriptSummary(session),

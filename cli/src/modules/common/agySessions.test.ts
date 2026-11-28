@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { TRUNCATE_STRING_LIMIT } from '@hapi/protocol/localTranscript'
+import {
+    collectSettledAgyNativeStepFingerprints,
+    isAgyTranscriptStepSettled
+} from './agySessions'
 
 // Mirror opencodeSessions.test.ts: production lazy-imports bun:sqlite under
 // Bun, so these tests execute agySessions inside a real `bun` subprocess
@@ -576,5 +581,145 @@ describe('agySessions', () => {
         expect(headError).toContain('full transcript is still flushing')
         expect(emptyError).toContain('full transcript is still flushing')
         expect(output.truncated.batchIds).toEqual(expect.arrayContaining(['conv-trunc-head', 'conv-empty-file', 'conv-trunc-prefix']))
+    })
+})
+
+describe('agy native step ledger settlement and fingerprinting', () => {
+    it('distinguishes settled steps from truncated, PENDING/WAITING, and non-background RUNNING steps', () => {
+        expect(isAgyTranscriptStepSettled({
+            step_index: 0,
+            source: 'USER_EXPLICIT',
+            type: 'USER_INPUT',
+            status: 'DONE',
+            content: '<USER_REQUEST>\nhi\n</USER_REQUEST>'
+        })).toBe(true)
+
+        expect(isAgyTranscriptStepSettled({
+            step_index: 1,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'RUNNING',
+            content: 'partial reply'
+        })).toBe(false)
+
+        expect(isAgyTranscriptStepSettled({
+            step_index: 2,
+            source: 'MODEL',
+            type: 'RUN_COMMAND',
+            status: 'RUNNING',
+            content: 'still running foreground...'
+        })).toBe(false)
+
+        expect(isAgyTranscriptStepSettled({
+            step_index: 3,
+            source: 'MODEL',
+            type: 'RUN_COMMAND',
+            status: 'PENDING',
+            content: ''
+        })).toBe(false)
+
+        expect(isAgyTranscriptStepSettled({
+            step_index: 4,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'truncated',
+            truncated_fields: ['content']
+        })).toBe(false)
+
+        expect(isAgyTranscriptStepSettled({
+            step_index: 5,
+            source: 'MODEL',
+            type: 'RUN_COMMAND',
+            status: 'RUNNING',
+            content: 'Created At: 2026-11-28T00:00:00Z\nTool is running as a background task with task id: conv-bg/task-1'
+        })).toBe(true)
+    })
+
+    it('stops at first unsettled step, preserves background placeholder fingerprint across DONE, and matches hub >64KB truncation', () => {
+        const bgRunning = {
+            step_index: 2,
+            source: 'MODEL',
+            type: 'RUN_COMMAND',
+            status: 'RUNNING',
+            content: 'Created At: 2026-11-28T00:00:00Z\nCommand running in background.\nTool is running as a background task with task id: conv-bg/task-1'
+        }
+        const bgDoneSamePlaceholder = {
+            ...bgRunning,
+            status: 'DONE'
+        }
+        const trailingUnsettled = {
+            step_index: 3,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'RUNNING',
+            content: 'thinking...'
+        }
+        const blockedSettled = {
+            step_index: 4,
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: 'should not be skipped past step 3'
+        }
+        const hugeOutput = `Command exited with code 0.\n\nCommand output:\n${'X'.repeat(TRUNCATE_STRING_LIMIT + 4_000)}END`
+
+        const commonPrefix = [
+            {
+                step_index: 0,
+                source: 'USER_EXPLICIT',
+                type: 'USER_INPUT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\nstart\n</USER_REQUEST>'
+            },
+            {
+                step_index: 1,
+                source: 'MODEL',
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                content: 'starting command',
+                tool_calls: [{ name: 'run_command', args: { CommandLine: JSON.stringify('sleep 5') } }]
+            }
+        ]
+
+        const whileRunning = collectSettledAgyNativeStepFingerprints('conv-bg', [
+            ...commonPrefix,
+            bgRunning,
+            trailingUnsettled,
+            blockedSettled
+        ])
+        expect(whileRunning.map((entry) => entry.anchor)).toEqual([
+            'step:0:0',
+            'step:1:text',
+            'step:1:call:0',
+            'step:2:0'
+        ])
+
+        const afterBgDone = collectSettledAgyNativeStepFingerprints('conv-bg', [
+            ...commonPrefix,
+            bgDoneSamePlaceholder
+        ])
+        expect(afterBgDone).toEqual(whileRunning)
+
+        // Filtering after step 1 keeps planner step 1 tool_call pairing intact for step 2 result.
+        const incremental = collectSettledAgyNativeStepFingerprints('conv-bg', [
+            ...commonPrefix,
+            bgRunning
+        ], { afterStepIndex: 1 })
+        expect(incremental).toEqual([whileRunning[3]!])
+
+        // Oversized action step output is truncated identically before hashing.
+        const largeStep = collectSettledAgyNativeStepFingerprints('conv-bg', [
+            ...commonPrefix,
+            {
+                step_index: 2,
+                source: 'MODEL',
+                type: 'RUN_COMMAND',
+                status: 'DONE',
+                content: hugeOutput
+            }
+        ])
+        expect(largeStep.map((e) => e.anchor)).toEqual(['step:0:0', 'step:1:text', 'step:1:call:0', 'step:2:0'])
+        expect(largeStep[3]!.fingerprint).toMatch(/^[0-9a-f]{64}$/)
     })
 })

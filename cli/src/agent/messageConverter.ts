@@ -4,7 +4,7 @@ import type { AgentMessage, PlanItem } from './types';
 import type { InlineMediaSource } from '@/modules/common/inlineMediaSource';
 
 export type CodexMessage =
-    | { type: 'message'; message: string; id?: string; live?: boolean; streamSnapshot?: boolean; hapiOnly?: boolean }
+    | { type: 'message'; message: string; id?: string; live?: boolean; streamSnapshot?: boolean }
     | { type: 'reasoning'; message: string; id: string; live?: boolean }
     | {
         type: 'token_count';

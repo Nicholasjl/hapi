@@ -168,7 +168,6 @@ function pickExistingSessionMetadata(metadata: Metadata | null | undefined): Par
     if (metadata.opencodeSessionId !== undefined) preserved.opencodeSessionId = metadata.opencodeSessionId
     if (metadata.grokSessionId !== undefined) preserved.grokSessionId = metadata.grokSessionId
     if (metadata.agyImportedAt !== undefined) preserved.agyImportedAt = metadata.agyImportedAt
-    if (metadata.agyNativeTurns !== undefined) preserved.agyNativeTurns = metadata.agyNativeTurns
     if (metadata.agySessionId !== undefined) preserved.agySessionId = metadata.agySessionId
     if (metadata.cursorSessionId !== undefined) preserved.cursorSessionId = metadata.cursorSessionId
     if (metadata.cursorSessionProtocol !== undefined) preserved.cursorSessionProtocol = metadata.cursorSessionProtocol

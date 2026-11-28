@@ -1,5 +1,10 @@
+import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
-import type { LocalTranscript, LocalTranscriptMessage } from '@hapi/protocol/localTranscript'
+import {
+    canonicalizeLocalTranscriptContent,
+    type LocalTranscript,
+    type LocalTranscriptMessage
+} from '@hapi/protocol/localTranscript'
 import type { StoredMessage } from '../../../store'
 import { truncateOversizedMessageContent } from '../../../store/contentCodec'
 
@@ -22,353 +27,15 @@ export type AnchoredMatchResult =
     | { status: 'transcript_diverged'; message: string }
     | { status: 'already_in_hapi'; message: string }
 
-export type LiveNativeTurnRecord = {
-    localIds: string[]
-    promptText: string
-    userStepIndex?: number | null
-    endStepIndex?: number | null
+export type RecordedNativeStep = {
+    anchor: string
+    fingerprint: string
 }
 
-function parseStepIndexFromAnchor(anchor: string | undefined): number | null {
-    if (!anchor) return null
-    const match = /^step:(\d+):/.exec(anchor)
-    return match ? Number(match[1]) : null
-}
-
-function normalizePromptText(text: string): string {
-    return text.replace(/\r\n/g, '\n').trim()
-}
-
-function matchProvenanceSegment(options: {
-    segmentStored: StoredMessage[]
-    segmentSource: LocalTranscriptMessage[]
-    exactEnd: boolean
-    sourceContentById: Map<string, unknown>
-    liveCompareKey: (content: unknown, callIds?: Map<string, number>) => string | null
-    allNativeTurns: LiveNativeTurnRecord[]
-    claimedTurnIndices: Set<number>
-    storedCallIds: Map<string, number>
-    sourceCallIds: Map<string, number>
-}): MatchSegmentResult | null {
-    const {
-        segmentStored,
-        segmentSource,
-        exactEnd,
-        sourceContentById,
-        liveCompareKey,
-        allNativeTurns,
-        claimedTurnIndices
-    } = options
-    const storedCallIds = new Map(options.storedCallIds)
-    const sourceCallIds = new Map(options.sourceCallIds)
-
-    const segmentLocalIds = new Set<string>()
-    const storedByLocalId = new Map<string, StoredMessage>()
-    const liveAgents: StoredMessage[] = []
-    for (const stored of segmentStored) {
-        if (typeof stored.localId === 'string') {
-            segmentLocalIds.add(stored.localId)
-            storedByLocalId.set(stored.localId, stored)
-        }
-        const payload = stored.content as { role?: unknown } | null
-        if (payload?.role !== 'user' && liveCompareKey(stored.content) !== null) {
-            liveAgents.push(stored)
-        }
-    }
-
-    const segmentStepIndices = new Set<number>()
-    for (const source of segmentSource) {
-        const step = parseStepIndexFromAnchor(source.anchor)
-        if (step !== null) segmentStepIndices.add(step)
-    }
-
-    const segmentTurns: LiveNativeTurnRecord[] = []
-    for (let idx = 0; idx < allNativeTurns.length; idx += 1) {
-        if (claimedTurnIndices.has(idx)) continue
-        const turn = allNativeTurns[idx]!
-        const matchesLocal = turn.localIds.some((id) => segmentLocalIds.has(id))
-        const matchesStepFallback = turn.localIds.length === 0
-            && turn.userStepIndex != null
-            && segmentStepIndices.has(turn.userStepIndex)
-        if (matchesLocal || matchesStepFallback) {
-            claimedTurnIndices.add(idx)
-            segmentTurns.push(turn)
-        }
-    }
-
-    let srcIdx = 0
-    let turnIdx = 0
-    let agentIdx = 0
-    let lastTurnMinSeq: number | null = null
-    let lastTurnInvokedAt: number | null = null
-
-    const turnTimingBounds = (turn: LiveNativeTurnRecord): { minSeq: number | null; minPos: number | null } => {
-        const rows = turn.localIds
-            .map((id) => storedByLocalId.get(id))
-            .filter((row): row is StoredMessage => row !== undefined)
-        if (rows.length === 0) return { minSeq: null, minPos: null }
-        return {
-            minSeq: Math.min(...rows.map((r) => r.seq)),
-            minPos: Math.min(...rows.map((r) => r.invokedAt ?? r.createdAt))
-        }
-    }
-
-    while (srcIdx < segmentSource.length) {
-        if (!exactEnd && turnIdx === segmentTurns.length && agentIdx === liveAgents.length) {
-            return { matchedEnd: srcIdx, storedCallIds, sourceCallIds }
-        }
-        const source = segmentSource[srcIdx]!
-        const nativeContent = sourceContentById.get(source.id)
-        const nativeRecord = nativeContent && typeof nativeContent === 'object'
-            ? (nativeContent as { role?: unknown; content?: unknown })
-            : null
-
-        if (nativeRecord?.role === 'user') {
-            if (turnIdx >= segmentTurns.length) return null
-            const turn = segmentTurns[turnIdx]!
-            if (turn.userStepIndex != null && parseStepIndexFromAnchor(source.anchor) !== turn.userStepIndex) {
-                return null
-            }
-            const nativeBody = nativeRecord.content && typeof nativeRecord.content === 'object' && !Array.isArray(nativeRecord.content)
-                ? (nativeRecord.content as { type?: unknown; text?: unknown })
-                : null
-            if (nativeBody?.type !== 'text' || typeof nativeBody.text !== 'string') {
-                return null
-            }
-            if (normalizePromptText(nativeBody.text) !== normalizePromptText(turn.promptText)) {
-                return null
-            }
-            const bounds = turnTimingBounds(turn)
-            if (bounds.minSeq !== null) lastTurnMinSeq = bounds.minSeq
-            if (bounds.minPos !== null) lastTurnInvokedAt = bounds.minPos
-            srcIdx += 1
-            turnIdx += 1
-            continue
-        }
-
-        const sourceKey = liveCompareKey(nativeContent, sourceCallIds)
-        if (sourceKey === null) {
-            srcIdx += 1
-            continue
-        }
-        if (agentIdx >= liveAgents.length) return null
-        const liveAgent = liveAgents[agentIdx]!
-        const agentPos = liveAgent.invokedAt ?? liveAgent.createdAt
-        if (lastTurnMinSeq !== null && liveAgent.seq <= lastTurnMinSeq) {
-            return null
-        }
-        if (lastTurnInvokedAt !== null && agentPos < lastTurnInvokedAt) {
-            return null
-        }
-        const nextTurn = segmentTurns[turnIdx]
-        if (nextTurn) {
-            const nextBounds = turnTimingBounds(nextTurn)
-            if (
-                nextBounds.minSeq !== null
-                && nextBounds.minSeq < liveAgent.seq
-                && nextBounds.minPos !== null
-                && agentPos > nextBounds.minPos
-            ) {
-                return null
-            }
-        }
-        const storedKey = liveCompareKey(liveAgent.content, storedCallIds)
-        if (storedKey !== sourceKey) return null
-        srcIdx += 1
-        agentIdx += 1
-    }
-
-    if (turnIdx !== segmentTurns.length || agentIdx !== liveAgents.length) {
-        return null
-    }
-    if (exactEnd && srcIdx !== segmentSource.length) {
-        return null
-    }
-    return { matchedEnd: srcIdx, storedCallIds, sourceCallIds }
-}
-
-type MatchSegmentResult = {
-    matchedEnd: number
-    storedCallIds: Map<string, number>
-    sourceCallIds: Map<string, number>
-}
-
-function getUserBatchEnd(liveUsers: StoredMessage[], start: number): number {
-    const first = liveUsers[start]
-    if (!first || first.invokedAt === null) return start + 1
-    let end = start + 1
-    while (end < liveUsers.length && liveUsers[end]?.invokedAt === first.invokedAt) {
-        end += 1
-    }
-    return end
-}
-
-function matchLiveSegment(options: {
-    segmentStored: StoredMessage[]
-    segmentSource: LocalTranscriptMessage[]
-    exactEnd: boolean
-    sourceContentById: Map<string, unknown>
-    liveCompareKey: (content: unknown, callIds?: Map<string, number>) => string | null
-    liveUserBatchMatches?: (batch: StoredMessage[], nativeContent: unknown) => boolean
-    storedCallIds: Map<string, number>
-    sourceCallIds: Map<string, number>
-}): MatchSegmentResult | null {
-    const {
-        segmentStored,
-        segmentSource,
-        exactEnd,
-        sourceContentById,
-        liveCompareKey,
-        liveUserBatchMatches
-    } = options
-
-    const liveUsers: StoredMessage[] = []
-    const liveAgents: StoredMessage[] = []
-    for (const stored of segmentStored) {
-        const payload = stored.content as { role?: unknown } | null
-        if (payload?.role === 'user') {
-            const undelivered = stored.deliveryState === 'indeterminate'
-                || (stored.localId != null && stored.invokedAt == null)
-            if (!undelivered) {
-                liveUsers.push(stored)
-            }
-            continue
-        }
-        if (liveCompareKey(stored.content) !== null) {
-            liveAgents.push(stored)
-        }
-    }
-    liveUsers.sort((a, b) => ((a.invokedAt ?? a.createdAt) - (b.invokedAt ?? b.createdAt)) || (a.seq - b.seq))
-
-    const failedStates = new Set<string>()
-
-    function dfs(
-        srcIdx: number,
-        userIdx: number,
-        agentIdx: number,
-        lastUserFirstSeq: number | null,
-        lastUserInvokedAt: number | null,
-        curStoredCalls: Map<string, number>,
-        curSourceCalls: Map<string, number>
-    ): MatchSegmentResult | null {
-        if (userIdx === liveUsers.length && agentIdx === liveAgents.length) {
-            if (!exactEnd || srcIdx === segmentSource.length) {
-                return {
-                    matchedEnd: srcIdx,
-                    storedCallIds: curStoredCalls,
-                    sourceCallIds: curSourceCalls
-                }
-            }
-        }
-        if (srcIdx >= segmentSource.length) {
-            return null
-        }
-
-        const stateKey = `${srcIdx}|${userIdx}|${agentIdx}|${lastUserFirstSeq ?? ''}|${lastUserInvokedAt ?? ''}`
-        if (failedStates.has(stateKey)) {
-            return null
-        }
-
-        const source = segmentSource[srcIdx]!
-        const nativeContent = sourceContentById.get(source.id)
-        const nativeRole = nativeContent && typeof nativeContent === 'object'
-            ? (nativeContent as { role?: unknown }).role
-            : undefined
-
-        if (nativeRole === 'user') {
-            if (userIdx >= liveUsers.length) {
-                failedStates.add(stateKey)
-                return null
-            }
-            const batchEnd = getUserBatchEnd(liveUsers, userIdx)
-            for (let k = batchEnd - userIdx; k >= 1; k -= 1) {
-                const batch = liveUsers.slice(userIdx, userIdx + k)
-                const matches = liveUserBatchMatches
-                    ? liveUserBatchMatches(batch, nativeContent)
-                    : k === 1 && liveCompareKey(batch[0]!.content) === liveCompareKey(nativeContent)
-                if (!matches) continue
-                const result = dfs(
-                    srcIdx + 1,
-                    userIdx + k,
-                    agentIdx,
-                    batch[0]!.seq,
-                    batch[0]!.invokedAt,
-                    curStoredCalls,
-                    curSourceCalls
-                )
-                if (result) return result
-            }
-            failedStates.add(stateKey)
-            return null
-        }
-
-        const nextSourceCalls = new Map(curSourceCalls)
-        const sourceKey = liveCompareKey(nativeContent, nextSourceCalls)
-        if (sourceKey === null) {
-            const result = dfs(
-                srcIdx + 1,
-                userIdx,
-                agentIdx,
-                lastUserFirstSeq,
-                lastUserInvokedAt,
-                curStoredCalls,
-                nextSourceCalls
-            )
-            if (result) return result
-            failedStates.add(stateKey)
-            return null
-        }
-
-        if (agentIdx >= liveAgents.length) {
-            failedStates.add(stateKey)
-            return null
-        }
-        const liveAgent = liveAgents[agentIdx]!
-        const agentPos = liveAgent.invokedAt ?? liveAgent.createdAt
-        if (lastUserFirstSeq !== null && liveAgent.seq <= lastUserFirstSeq) {
-            failedStates.add(stateKey)
-            return null
-        }
-        if (lastUserInvokedAt !== null && agentPos < lastUserInvokedAt) {
-            failedStates.add(stateKey)
-            return null
-        }
-        const nextUser = liveUsers[userIdx]
-        if (nextUser && nextUser.seq < liveAgent.seq && nextUser.invokedAt !== null && agentPos > nextUser.invokedAt) {
-            failedStates.add(stateKey)
-            return null
-        }
-
-        const nextStoredCalls = new Map(curStoredCalls)
-        const storedKey = liveCompareKey(liveAgent.content, nextStoredCalls)
-        if (storedKey !== sourceKey) {
-            failedStates.add(stateKey)
-            return null
-        }
-
-        const result = dfs(
-            srcIdx + 1,
-            userIdx,
-            agentIdx + 1,
-            lastUserFirstSeq,
-            lastUserInvokedAt,
-            nextStoredCalls,
-            nextSourceCalls
-        )
-        if (result) return result
-        failedStates.add(stateKey)
-        return null
-    }
-
-    return dfs(
-        0,
-        0,
-        0,
-        null,
-        null,
-        new Map(options.storedCallIds),
-        new Map(options.sourceCallIds)
-    )
+export function computeLocalTranscriptFingerprint(content: unknown): string {
+    return createHash('sha256')
+        .update(canonicalizeLocalTranscriptContent(truncateOversizedMessageContent(content)))
+        .digest('hex')
 }
 
 export function matchAnchored(options: {
@@ -378,11 +45,10 @@ export function matchAnchored(options: {
     cursor: string | null
     /** Source-specific compare form (defaults to the full content). */
     canonicalContent?: (content: unknown) => unknown
-    liveCompareKey?: (content: unknown, callIds?: Map<string, number>) => string | null
-    liveUserBatchMatches?: (batch: StoredMessage[], nativeContent: unknown) => boolean
-    liveNativeTurns?: LiveNativeTurnRecord[]
+    /** Confirmed native transcript step ledger recorded for an imported session. */
+    recordedNativeSteps?: ReadonlyArray<RecordedNativeStep>
 }): AnchoredMatchResult {
-    const { storedMessages, transcript, importPrefix, cursor } = options
+    const { storedMessages, transcript, importPrefix, cursor, recordedNativeSteps } = options
     const canonical = options.canonicalContent ?? ((content: unknown) => content)
     const sameContent = (source: unknown, stored: unknown): boolean =>
         isDeepStrictEqual(canonical(source), canonical(stored))
@@ -440,97 +106,47 @@ export function matchAnchored(options: {
         return { status: 'ok', delta }
     }
 
-    if (options.liveCompareKey && imported.length && storedMessages.length > imported.length) {
-        const pins: Array<{ storedIndex: number; sourceIndex: number; message: StoredMessage }> = []
-        let prevPinSourceIndex = -1
-        for (let storedIndex = 0; storedIndex < storedMessages.length; storedIndex += 1) {
-            const stored = storedMessages[storedIndex]!
-            if (!stored.localId?.startsWith(importPrefix)) continue
-            const sourceIndex = sourceIndexById.get(stored.localId)
-            if (sourceIndex === undefined || sourceIndex <= prevPinSourceIndex) {
-                return { status: 'transcript_diverged', message: 'The stored conversation no longer matches the native transcript prefix' }
+    if (recordedNativeSteps && recordedNativeSteps.length > 0) {
+        let priorSourceIndex = -1
+        for (const message of imported) {
+            const sourceIndex = sourceIndexById.get(message.localId!)
+            if (
+                sourceIndex === undefined
+                || sourceIndex <= priorSourceIndex
+                || sourceIndex >= recordedNativeSteps.length
+            ) {
+                return {
+                    status: 'transcript_diverged',
+                    message: 'The stored conversation no longer matches the native transcript prefix'
+                }
             }
-            const nativeContent = sourceContentById.get(stored.localId)
-            if (!sameContent(nativeContent, stored.content)) {
-                return { status: 'transcript_diverged', message: 'The stored conversation no longer matches the native transcript prefix' }
+            if (!sameContent(sourceContentById.get(message.localId!), message.content)) {
+                return {
+                    status: 'transcript_diverged',
+                    message: `Local transcript changed imported entry ${message.localId}`
+                }
             }
-            pins.push({ storedIndex, sourceIndex, message: stored })
-            prevPinSourceIndex = sourceIndex
+            priorSourceIndex = sourceIndex
         }
 
-        const nativeTurns = options.liveNativeTurns
-        const claimedTurnIndices = new Set<number>()
-        let storedCallIds = new Map<string, number>()
-        let sourceCallIds = new Map<string, number>()
-        let prevStoredIndex = -1
-        let prevSourceIndex = -1
-        for (const pin of pins) {
-            const segmentStored = storedMessages.slice(prevStoredIndex + 1, pin.storedIndex)
-            const segmentSource = sourceMessages.slice(prevSourceIndex + 1, pin.sourceIndex)
-            const gapMatch = nativeTurns !== undefined
-                ? matchProvenanceSegment({
-                    segmentStored,
-                    segmentSource,
-                    exactEnd: true,
-                    sourceContentById,
-                    liveCompareKey: options.liveCompareKey,
-                    allNativeTurns: nativeTurns,
-                    claimedTurnIndices,
-                    storedCallIds,
-                    sourceCallIds
-                })
-                : matchLiveSegment({
-                    segmentStored,
-                    segmentSource,
-                    exactEnd: true,
-                    sourceContentById,
-                    liveCompareKey: options.liveCompareKey,
-                    liveUserBatchMatches: options.liveUserBatchMatches,
-                    storedCallIds,
-                    sourceCallIds
-                })
-            if (!gapMatch) {
-                return { status: 'transcript_diverged', message: 'The stored conversation no longer matches the native transcript prefix' }
+        if (sourceMessages.length < recordedNativeSteps.length) {
+            return {
+                status: 'transcript_diverged',
+                message: 'The stored conversation no longer matches the native transcript prefix'
             }
-            storedCallIds = gapMatch.storedCallIds
-            sourceCallIds = gapMatch.sourceCallIds
-            options.liveCompareKey(pin.message.content, storedCallIds)
-            options.liveCompareKey(sourceContentById.get(pin.message.localId!), sourceCallIds)
-            prevStoredIndex = pin.storedIndex
-            prevSourceIndex = pin.sourceIndex
         }
-
-        const tailStored = storedMessages.slice(prevStoredIndex + 1)
-        const tailSource = sourceMessages.slice(prevSourceIndex + 1)
-        const tailMatch = nativeTurns !== undefined
-            ? matchProvenanceSegment({
-                segmentStored: tailStored,
-                segmentSource: tailSource,
-                exactEnd: false,
-                sourceContentById,
-                liveCompareKey: options.liveCompareKey,
-                allNativeTurns: nativeTurns,
-                claimedTurnIndices,
-                storedCallIds,
-                sourceCallIds
-            })
-            : matchLiveSegment({
-                segmentStored: tailStored,
-                segmentSource: tailSource,
-                exactEnd: false,
-                sourceContentById,
-                liveCompareKey: options.liveCompareKey,
-                liveUserBatchMatches: options.liveUserBatchMatches,
-                storedCallIds,
-                sourceCallIds
-            })
-        if (!tailMatch) {
-            return { status: 'transcript_diverged', message: 'The stored conversation no longer matches the native transcript prefix' }
+        for (let index = 0; index < recordedNativeSteps.length; index += 1) {
+            const expected = recordedNativeSteps[index]!
+            const source = sourceMessages[index]!
+            const sourceFingerprint = computeLocalTranscriptFingerprint(sourceContentById.get(source.id))
+            if (source.anchor !== expected.anchor || sourceFingerprint !== expected.fingerprint) {
+                return {
+                    status: 'transcript_diverged',
+                    message: 'The stored conversation no longer matches the native transcript prefix'
+                }
+            }
         }
-        if (nativeTurns !== undefined && claimedTurnIndices.size !== nativeTurns.length) {
-            return { status: 'transcript_diverged', message: 'The stored conversation no longer matches the native transcript prefix' }
-        }
-        return { status: 'ok', delta: sourceMessages.slice(prevSourceIndex + 1 + tailMatch.matchedEnd) }
+        return { status: 'ok', delta: sourceMessages.slice(recordedNativeSteps.length) }
     }
 
     // No cursor: the imported prefix must align exactly with the head of the

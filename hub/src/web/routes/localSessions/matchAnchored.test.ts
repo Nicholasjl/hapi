@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import type { LocalTranscript, LocalTranscriptMessage } from '@hapi/protocol/localTranscript'
+import { TRUNCATE_STRING_LIMIT, truncateOversizedMessageContent } from '../../../store/contentCodec'
 import type { StoredMessage } from '../../../store'
-import { matchAnchored } from './matchAnchored'
+import { computeLocalTranscriptFingerprint, matchAnchored } from './matchAnchored'
 import { AGY_LOCAL_SESSION_SOURCE } from './sources'
 
 const PREFIX = 'opencode:ses-1:'
@@ -196,51 +197,27 @@ describe('anchored match: R4/R5 without a cursor', () => {
     })
 })
 
-describe('anchored match: live Antigravity delivered-turn boundaries', () => {
+describe('anchored match: Antigravity native step ledger', () => {
     const AGY_PREFIX = 'agy:ses-1:'
-    const agyMatch = AGY_LOCAL_SESSION_SOURCE.match.strategy === 'anchored'
-        ? AGY_LOCAL_SESSION_SOURCE.match
-        : null
 
-    function agyStoredUser(
-        seq: number,
-        localId: string | null,
-        text: string,
-        opts: {
-            invokedAt: number | null
-            createdAt?: number
-            attachments?: Array<{ path: string; mimeType?: string }>
-        }
-    ): StoredMessage {
+    function agyStoredUser(seq: number, localId: string | null, text: string, createdAt = seq): StoredMessage {
         return {
             id: `stored-${seq}`,
             sessionId: 'hapi-agy',
-            content: {
-                role: 'user',
-                content: {
-                    type: 'text',
-                    text,
-                    ...(opts.attachments ? { attachments: opts.attachments } : {})
-                },
-                meta: { sentFrom: localId?.startsWith(AGY_PREFIX) ? 'cli' : 'web' }
-            },
-            createdAt: opts.createdAt ?? seq,
+            content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: localId?.startsWith(AGY_PREFIX) ? 'cli' : 'web' } },
+            createdAt,
             seq,
             localId,
-            invokedAt: opts.invokedAt,
+            invokedAt: createdAt,
             scheduledAt: null
         }
     }
 
-    function agyStoredAgent(seq: number, text: string, createdAt: number, localId: string | null = null): StoredMessage {
+    function agyStoredAgent(seq: number, data: Record<string, unknown>, createdAt = seq, localId: string | null = null): StoredMessage {
         return {
             id: `stored-${seq}`,
             sessionId: 'hapi-agy',
-            content: {
-                role: 'agent',
-                content: { type: 'codex', data: { type: 'message', message: text } },
-                meta: { sentFrom: 'cli' }
-            },
+            content: { role: 'agent', content: { type: 'codex', data }, meta: { sentFrom: 'cli' } },
             createdAt,
             seq,
             localId,
@@ -258,11 +235,11 @@ describe('anchored match: live Antigravity delivered-turn boundaries', () => {
         }
     }
 
-    function agyNativeAgent(id: string, message: string): LocalTranscriptMessage {
+    function agyNativeAgent(id: string, data: Record<string, unknown>): LocalTranscriptMessage {
         return {
             id: `${AGY_PREFIX}${id}`,
             createdAt: 1,
-            content: { role: 'agent', content: { type: 'codex', data: { type: 'message', message } }, meta: { sentFrom: 'cli' } },
+            content: { role: 'agent', content: { type: 'codex', data }, meta: { sentFrom: 'cli' } },
             anchor: id
         }
     }
@@ -271,255 +248,131 @@ describe('anchored match: live Antigravity delivered-turn boundaries', () => {
         return { flavor: 'agy', id: 'ses-1', title: 't', file: '/tmp/transcript.jsonl', modifiedAt: 1, messages }
     }
 
-    it('aligns queued messages inserted mid-reply using delivered invokedAt order', () => {
+    function ledgerFor(messages: LocalTranscriptMessage[]) {
+        return messages.map((message) => ({
+            anchor: message.anchor!,
+            fingerprint: computeLocalTranscriptFingerprint(message.content)
+        }))
+    }
+
+    it('reconciles despite /swarm board, pre-dispatch restores, and completed background steer divergence between HAPI and AGY placeholder', () => {
+        expect(AGY_LOCAL_SESSION_SOURCE.match.strategy === 'anchored' && AGY_LOCAL_SESSION_SOURCE.match.nativeStepLedger).toBe(true)
+
+        const initialUser = agyNativeUser('step:0:0', 'imported start')
+        const initialAgent = agyNativeAgent('step:1:text', { type: 'message', message: 'initial reply' })
+        const liveBatchUser = agyNativeUser('step:2:0', 'first batch\nsecond batch')
+        const liveCmdCall = agyNativeAgent('step:3:call:0', { type: 'tool-call', name: 'Bash', callId: 'agy-wakeup-ses-1-3-0', input: { command: 'sleep 2' } })
+        const liveCmdBgResult = agyNativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-ses-1-3-0', output: 'Command moved to background.', is_error: false })
+        const liveFinalText = agyNativeAgent('step:5:text', { type: 'message', message: 'real answer' })
+        const tailNative = [
+            agyNativeUser('step:6:0', 'continued in native cli'),
+            agyNativeAgent('step:7:text', { type: 'message', message: 'native answer' })
+        ]
+
+        // HAPI stores /swarm board, pre-dispatch abort-restore, and the completed ACP command output
+        // whereas native transcript step:4:0 stays AGY_BACKGROUND_COMMAND_RESULT.
         const stored: StoredMessage[] = [
-            agyStoredUser(1, `${AGY_PREFIX}p0`, 'imported question', { invokedAt: 10, createdAt: 10 }),
-            agyStoredAgent(2, 'imported answer', 11, `${AGY_PREFIX}p1`),
-            agyStoredUser(3, 'live-1', 'first live prompt', { invokedAt: 20, createdAt: 20 }),
-            // Queued mid-reply: seq=4 precedes seq=5, but invokedAt=30 follows seq=5 (createdAt=25).
-            agyStoredUser(4, 'live-2', 'queued mid reply', { invokedAt: 30, createdAt: 22 }),
-            agyStoredAgent(5, 'reply to first', 25),
-            agyStoredAgent(6, 'reply to second', 35),
+            agyStoredUser(1, initialUser.id, 'imported start', 10),
+            agyStoredAgent(2, { type: 'message', message: 'initial reply' }, 11, initialAgent.id),
+            agyStoredUser(3, 'board-1', '/swarm board', 15),
+            agyStoredAgent(4, { type: 'message', message: '### Swarm Board' }, 16),
+            agyStoredUser(5, 'restore-1', 'restored prompt before dispatch', 18),
+            agyStoredUser(6, 'live-1', 'first batch', 20),
+            agyStoredUser(7, 'live-2', 'second batch', 21),
+            agyStoredAgent(8, { type: 'tool-call', name: 'Bash', callId: 'live-call-1', input: { command: 'sleep 2' } }, 22),
+            agyStoredAgent(9, { type: 'tool-call-result', callId: 'live-call-1', output: { stdout: 'completed during steer', exit_code: 0 }, is_error: false }, 23),
+            agyStoredAgent(10, { type: 'message', message: 'real answer' }, 25)
         ]
 
-        const sourceMessages = [
-            agyNativeUser('p0', 'imported question'),
-            agyNativeAgent('p1', 'imported answer'),
-            agyNativeUser('n1', 'first live prompt'),
-            agyNativeAgent('n2', 'reply to first'),
-            agyNativeUser('n3', 'queued mid reply'),
-            agyNativeAgent('n4', 'reply to second'),
-            agyNativeUser('n5', 'new native prompt'),
-        ]
+        const confirmed = [initialUser, initialAgent, liveBatchUser, liveCmdCall, liveCmdBgResult, liveFinalText]
+        const ledger = ledgerFor(confirmed)
 
+        const ok = matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([...confirmed, ...tailNative]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: ledger
+        })
+        expect(ok).toEqual({ status: 'ok', delta: tailNative })
+    })
+
+    it('matches oversized (>64KB) agent outputs using truncated canonical fingerprints across ledger and transcript', () => {
+        const bigOutput = `${'A'.repeat(TRUNCATE_STRING_LIMIT + 5_000)}END`
+        const s0 = agyNativeUser('step:0:0', 'run huge command')
+        const s1 = agyNativeAgent('step:1:0', { type: 'tool-call-result', callId: 'c1', output: bigOutput, is_error: false })
+        const s2 = agyNativeUser('step:2:0', 'follow up')
+
+        const ledger = ledgerFor([s0, s1])
         const result = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript(sourceMessages),
+            storedMessages: [
+                agyStoredUser(1, s0.id, 'run huge command', 10),
+                {
+                    id: 'stored-2',
+                    sessionId: 'hapi-agy',
+                    content: truncateOversizedMessageContent({ role: 'agent', content: { type: 'codex', data: { type: 'tool-call-result', callId: 'c1', output: bigOutput, is_error: false } }, meta: { sentFrom: 'cli' } }) as StoredMessage['content'],
+                    createdAt: 11,
+                    seq: 2,
+                    localId: s1.id,
+                    invokedAt: 11,
+                    scheduledAt: null
+                }
+            ],
+            transcript: agyTranscript([s0, s1, s2]),
             importPrefix: AGY_PREFIX,
             cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
+            recordedNativeSteps: ledger
         })
-        expect(result).toEqual({
-            status: 'ok',
-            delta: [agyNativeUser('n5', 'new native prompt')]
-        })
+        expect(result).toEqual({ status: 'ok', delta: [s2] })
     })
 
-    it('matches same-invokedAt batched prompts with inline-stripped or @path-retained image forms', () => {
+    it('rejects modified, reordered, or dropped confirmed steps in the native ledger', () => {
+        const s0 = agyNativeUser('step:0:0', 'start')
+        const s1 = agyNativeAgent('step:1:text', { type: 'message', message: 'reply' })
+        const s2 = agyNativeUser('step:2:0', 'live turn')
+        const s3 = agyNativeAgent('step:3:text', { type: 'message', message: 'live reply' })
+        const ledger = ledgerFor([s0, s1, s2, s3])
         const stored: StoredMessage[] = [
-            agyStoredUser(1, `${AGY_PREFIX}p0`, 'imported', { invokedAt: 10, createdAt: 10 }),
-            agyStoredUser(2, 'b1', 'check files', {
-                invokedAt: 50,
-                createdAt: 40,
-                attachments: [
-                    { path: '.hapi/uploads/doc.md', mimeType: 'text/markdown' },
-                    { path: '.hapi/uploads/img.png', mimeType: 'image/png' }
-                ]
-            }),
-            agyStoredUser(3, 'b2', 'follow up', { invokedAt: 50, createdAt: 45 }),
-            agyStoredAgent(4, 'done batch', 55),
+            agyStoredUser(1, s0.id, 'start', 10),
+            agyStoredAgent(2, { type: 'message', message: 'reply' }, 11, s1.id),
+            agyStoredUser(3, 'live-1', 'live turn', 20),
+            agyStoredAgent(4, { type: 'message', message: 'live reply' }, 21)
         ]
 
-        // Inline image stripped by buildAgyPromptContent; non-image @path retained.
-        const inlineStripped = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'imported'),
-                agyNativeUser('b', '@.hapi/uploads/doc.md\n\ncheck files\nfollow up'),
-                agyNativeAgent('a', 'done batch'),
-                agyNativeUser('tail', 'afterwards')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        })
-        expect(inlineStripped).toEqual({ status: 'ok', delta: [agyNativeUser('tail', 'afterwards')] })
-
-        // Image @path retained (fallback when image block encoding unavailable).
-        const pathRetained = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'imported'),
-                agyNativeUser('b', '@.hapi/uploads/doc.md @.hapi/uploads/img.png\n\ncheck files\nfollow up'),
-                agyNativeAgent('a', 'done batch'),
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        })
-        expect(pathRetained).toEqual({ status: 'ok', delta: [] })
-
-        // Different invokedAt timestamps must NOT be merged into one native batch.
-        const separateInvokedAt = [
-            agyStoredUser(1, `${AGY_PREFIX}p0`, 'imported', { invokedAt: 10, createdAt: 10 }),
-            agyStoredUser(2, 'b1', 'check files', { invokedAt: 50, createdAt: 40 }),
-            agyStoredUser(3, 'b2', 'follow up', { invokedAt: 51, createdAt: 45 }),
-        ]
-        expect(matchAnchored({
-            storedMessages: separateInvokedAt,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'imported'),
-                agyNativeUser('b', 'check files\nfollow up')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        }).status).toBe('transcript_diverged')
-    })
-
-    it('validates live gaps strictly between earlier and later imported pins and rejects missing @path or reordered replies', () => {
-        const stored: StoredMessage[] = [
-            agyStoredUser(1, `${AGY_PREFIX}p0`, 'start', { invokedAt: 10, createdAt: 10 }),
-            agyStoredUser(2, 'l1', 'mid live', { invokedAt: 20, createdAt: 20 }),
-            agyStoredAgent(3, 'mid reply', 25),
-            agyStoredUser(4, `${AGY_PREFIX}p1`, 'later imported pin', { invokedAt: 30, createdAt: 30 }),
-            agyStoredUser(5, 'l2', 'after pin', { invokedAt: 40, createdAt: 40 }),
-            agyStoredAgent(6, 'after reply', 45),
-        ]
-
-        const ok = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'start'),
-                agyNativeUser('l1', 'mid live'),
-                agyNativeAgent('a1', 'mid reply'),
-                agyNativeUser('p1', 'later imported pin'),
-                agyNativeUser('l2', 'after pin'),
-                agyNativeAgent('a2', 'after reply'),
-                agyNativeUser('tail', 'newest native')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        })
-        expect(ok).toEqual({ status: 'ok', delta: [agyNativeUser('tail', 'newest native')] })
-
-        // Extra native message inside a closed gap before p1 must diverge.
-        const extraInClosedGap = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'start'),
-                agyNativeUser('l1', 'mid live'),
-                agyNativeAgent('a1', 'mid reply'),
-                agyNativeAgent('extra', 'unmatched native message'),
-                agyNativeUser('p1', 'later imported pin'),
-                agyNativeUser('l2', 'after pin'),
-                agyNativeAgent('a2', 'after reply')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        })
-        expect(extraInClosedGap.status).toBe('transcript_diverged')
-
-        // An agent message strictly after User2 (seq & invokedAt) must not align before User2.
-        const reorderedStored: StoredMessage[] = [
-            agyStoredUser(1, `${AGY_PREFIX}p0`, 'start', { invokedAt: 10, createdAt: 10 }),
-            agyStoredUser(2, 'u1', 'first', { invokedAt: 20, createdAt: 20 }),
-            agyStoredUser(3, 'u2', 'second', { invokedAt: 30, createdAt: 25 }),
-            agyStoredAgent(4, 'reply after second', 35),
-        ]
-        expect(matchAnchored({
-            storedMessages: reorderedStored,
-            transcript: agyTranscript([
-                agyNativeUser('p0', 'start'),
-                agyNativeUser('u1', 'first'),
-                agyNativeAgent('a', 'reply after second'),
-                agyNativeUser('u2', 'second')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveUserBatchMatches: agyMatch!.liveUserBatchMatches
-        }).status).toBe('transcript_diverged')
-    })
-
-    it('reconciles using native turn provenance while skipping /swarm board and pre-dispatch restored prompts', () => {
-        const swarmUser = agyStoredUser(2, 'board-1', '/swarm board', { invokedAt: 15, createdAt: 15 })
-        const swarmReply: StoredMessage = {
-            id: 'stored-board-reply',
-            sessionId: 'hapi-agy',
-            content: {
-                role: 'agent',
-                content: { type: 'codex', data: { type: 'message', message: '### Swarm Board', hapiOnly: true } },
-                meta: { sentFrom: 'cli' }
-            },
-            createdAt: 16,
-            seq: 3,
-            localId: null,
-            invokedAt: 16,
-            scheduledAt: null
-        }
-        const restoredUser = agyStoredUser(4, 'restored-1', 'failed before dispatch', { invokedAt: 18, createdAt: 17 })
-        const realUserA = agyStoredUser(5, 'real-1', 'first batch', { invokedAt: 25, createdAt: 20 })
-        const realUserB = agyStoredUser(6, 'real-2', 'second batch', { invokedAt: 25, createdAt: 21 })
-        const realReply = agyStoredAgent(7, 'real answer', 30)
-
-        const stored: StoredMessage[] = [
-            agyStoredUser(1, `${AGY_PREFIX}step:0:0`, 'imported', { invokedAt: 10, createdAt: 10 }),
-            swarmUser,
-            swarmReply,
-            restoredUser,
-            realUserA,
-            realUserB,
-            realReply
-        ]
-        const provenance = [{
-            localIds: ['real-1', 'real-2'],
-            promptText: 'first batch\nsecond batch',
-            userStepIndex: 2,
-            endStepIndex: 3
-        }]
-
-        const ok = matchAnchored({
-            storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('step:0:0', 'imported'),
-                agyNativeUser('step:2:0', 'first batch\nsecond batch'),
-                agyNativeAgent('step:3:0', 'real answer'),
-                agyNativeUser('step:4:0', 'native tail')
-            ]),
-            importPrefix: AGY_PREFIX,
-            cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveNativeTurns: provenance
-        })
-        expect(ok).toEqual({
-            status: 'ok',
-            delta: [agyNativeUser('step:4:0', 'native tail')]
-        })
-
-        // Shifted userStepIndex or edited native prompt still diverges.
+        // Modified confirmed live step content.
         expect(matchAnchored({
             storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('step:0:0', 'imported'),
-                agyNativeUser('step:99:0', 'first batch\nsecond batch'),
-                agyNativeAgent('step:100:0', 'real answer')
-            ]),
+            transcript: agyTranscript([s0, s1, agyNativeUser('step:2:0', 'edited live turn'), s3]),
             importPrefix: AGY_PREFIX,
             cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveNativeTurns: provenance
+            recordedNativeSteps: ledger
         }).status).toBe('transcript_diverged')
 
+        // Reordered confirmed steps.
         expect(matchAnchored({
             storedMessages: stored,
-            transcript: agyTranscript([
-                agyNativeUser('step:0:0', 'imported'),
-                agyNativeUser('step:2:0', 'edited batch prompt'),
-                agyNativeAgent('step:3:0', 'real answer')
-            ]),
+            transcript: agyTranscript([s0, s1, s3, s2]),
             importPrefix: AGY_PREFIX,
             cursor: null,
-            liveCompareKey: agyMatch!.liveCompareKey,
-            liveNativeTurns: provenance
+            recordedNativeSteps: ledger
+        }).status).toBe('transcript_diverged')
+
+        // Dropped confirmed step.
+        expect(matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([s0, s1, s2]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: ledger
+        }).status).toBe('transcript_diverged')
+
+        // Imported row removed even when native tail shortened cleanly.
+        expect(matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([s0, s2, s3]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: ledger
         }).status).toBe('transcript_diverged')
     })
 })

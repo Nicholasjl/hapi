@@ -267,15 +267,6 @@ describe('bootstrapExistingSession', () => {
         const existingMetadata = session.metadata
         if (!existingMetadata) throw new Error('expected test session metadata')
 
-        const agyNativeTurns = [{
-            acpSessionId: 'agy-native',
-            localIds: ['local-agy-1'],
-            promptText: 'check tests',
-            userStepIndex: 2,
-            endStepIndex: 3,
-            kind: 'prompt' as const
-        }]
-
         session.metadata = {
             ...existingMetadata,
             claudeSessionId: 'claude-thread-1',
@@ -285,7 +276,6 @@ describe('bootstrapExistingSession', () => {
             grokSessionId: 'grok-thread-1',
             agySessionId: 'agy-native',
             agyImportedAt: 123,
-            agyNativeTurns,
             cursorSessionId: 'cursor-thread-1',
             cursorSessionProtocol: 'acp',
             piSessionId: 'pi-thread-1',
@@ -340,7 +330,6 @@ describe('bootstrapExistingSession', () => {
             grokSessionId: 'grok-thread-1',
             agySessionId: 'agy-native',
             agyImportedAt: 123,
-            agyNativeTurns,
             cursorSessionId: 'cursor-thread-1',
             cursorSessionProtocol: 'acp',
             piSessionId: 'pi-thread-1',
@@ -378,7 +367,6 @@ describe('bootstrapExistingSession', () => {
             grokSessionId: 'grok-thread-1',
             agySessionId: 'agy-native',
             agyImportedAt: 123,
-            agyNativeTurns,
             conversationHistoryEntryIds: { 'local-user-1': 'pi-entry-1' },
             opencodeHistoryCheckpoint: checkpoint,
             opencodeForkPending: true

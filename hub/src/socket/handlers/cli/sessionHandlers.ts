@@ -83,6 +83,15 @@ const updateStateSchema = z.object({
     agentState: z.unknown().nullable()
 })
 
+const nativeStepsSchema = z.object({
+    sid: z.string().min(1),
+    nativeId: z.string().min(1),
+    steps: z.array(z.object({
+        anchor: z.string().min(1).max(256),
+        fingerprint: z.string().regex(/^[0-9a-f]{64}$/)
+    })).max(1000)
+})
+
 // Hub-only merge/clear/title links. CLI update-metadata must not forge or erase them
 // (same strip/restore as supersededBySessionId — see sessionHandlers.test.ts).
 const HUB_OWNED_METADATA_KEYS = [
@@ -590,6 +599,40 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             }
         } catch (err) {
             console.error('recordSteerDeliveryState failed', err)
+            reply({ ok: false })
+        }
+    })
+
+    socket.on('session-native-steps', (
+        data: unknown,
+        ack?: (response: { ok: boolean; inserted?: number }) => void
+    ) => {
+        const reply = typeof ack === 'function' ? ack : () => {}
+        const parsed = nativeStepsSchema.safeParse(data)
+        if (!parsed.success) {
+            reply({ ok: false })
+            return
+        }
+        const sessionAccess = resolveSessionAccess(parsed.data.sid, { fresh: true })
+        if (!sessionAccess.ok) {
+            emitAccessError('session', parsed.data.sid, sessionAccess.reason)
+            reply({ ok: false })
+            return
+        }
+        const metadata = sessionAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+        if (metadata?.agyImportedAt == null || metadata.agySessionId !== parsed.data.nativeId) {
+            reply({ ok: false })
+            return
+        }
+        try {
+            const { inserted } = store.nativeSteps.recordSteps(
+                parsed.data.sid,
+                parsed.data.nativeId,
+                parsed.data.steps
+            )
+            reply({ ok: true, inserted })
+        } catch (err) {
+            console.error('recordSteps failed', err)
             reply({ ok: false })
         }
     })

@@ -15,6 +15,7 @@ import { SessionJobsStore } from './sessionJobsStore'
 import { SessionRedirectStore } from './sessionRedirectStore'
 import { SessionStore } from './sessionStore'
 import { UserStore } from './userStore'
+import { NATIVE_STEPS_TABLE_SQL, NativeStepStore } from './nativeStepStore'
 import { PASSKEY_CREDENTIALS_TABLE_SQL, PasskeyStore } from './passkeyStore'
 import { TurnStore } from './turnStore'
 import { UsageStore } from './usageStore'
@@ -48,6 +49,8 @@ export { ScratchlistStore } from './scratchlistStore'
 export { SessionJobsStore } from './sessionJobsStore'
 export { SessionStore } from './sessionStore'
 export { UserStore } from './userStore'
+export { NativeStepStore } from './nativeStepStore'
+export type { StoredNativeStep } from './nativeStepStore'
 export { PasskeyStore } from './passkeyStore'
 export type { StoredPasskeyCredential } from './passkeyStore'
 export { TurnStore } from './turnStore'
@@ -60,7 +63,7 @@ export {
     WorkGraphValidationError
 } from './workGraph'
 
-const SCHEMA_VERSION: number = 36
+const SCHEMA_VERSION: number = 37
 const REQUIRED_TABLES = [
     'sessions',
     'machines',
@@ -80,6 +83,7 @@ const REQUIRED_TABLES = [
     'event_links',
     'session_turns',
     'session_redirects',
+    'session_native_steps',
     'passkey_credentials'
 ] as const
 
@@ -98,6 +102,7 @@ export class Store {
     readonly scratchlist: ScratchlistStore
     readonly sessionJobs: SessionJobsStore
     readonly sessionRedirects: SessionRedirectStore
+    readonly nativeSteps: NativeStepStore
     readonly usage: UsageStore
     readonly turns: TurnStore
     readonly workGraph: WorkGraphStore
@@ -156,6 +161,7 @@ export class Store {
         this.scratchlist = new ScratchlistStore(this.db)
         this.sessionJobs = new SessionJobsStore(this.db)
         this.sessionRedirects = new SessionRedirectStore(this.db)
+        this.nativeSteps = new NativeStepStore(this.db)
         this.usage = new UsageStore(this.db)
         this.turns = new TurnStore(this.db)
         this.workGraph = new WorkGraphStore(this.db)
@@ -422,6 +428,7 @@ export class Store {
             33: () => this.migrateFromV33ToV34(),
             34: () => this.migrateFromV34ToV35(),
             35: () => this.migrateFromV35ToV36(),
+            36: () => this.migrateFromV36ToV37(),
         }
 
         if (currentVersion !== 0 && (currentVersion > SCHEMA_VERSION || !stepMigrations[currentVersion])) {
@@ -452,6 +459,7 @@ export class Store {
             this.migrateFromV33ToV34()
             this.migrateFromV34ToV35()
             this.migrateFromV35ToV36()
+            this.migrateFromV36ToV37()
         } else {
             for (let v = currentVersion; v < SCHEMA_VERSION; v++) {
                 const step = stepMigrations[v]
@@ -634,6 +642,8 @@ export class Store {
             );
             CREATE INDEX IF NOT EXISTS idx_session_redirects_namespace_new
                 ON session_redirects(namespace, new_id);
+
+            ${NATIVE_STEPS_TABLE_SQL}
 
             ${PASSKEY_CREDENTIALS_TABLE_SQL}
 
@@ -1388,6 +1398,11 @@ export class Store {
     /** v35→v36: WebAuthn credentials that can be exchanged for a web JWT. */
     private migrateFromV35ToV36(): void {
         this.db.exec(PASSKEY_CREDENTIALS_TABLE_SQL)
+    }
+
+    /** v36→v37: Incremental native transcript step ledger for imported sessions. */
+    private migrateFromV36ToV37(): void {
+        this.db.exec(NATIVE_STEPS_TABLE_SQL)
     }
 
     private ensureUsageScanParserVersion(): void {

@@ -6,7 +6,7 @@ import type { LocalTranscript } from '@hapi/protocol/localTranscript'
 import type { Machine, SyncEngine } from '../../../sync/syncEngine'
 import type { Store, StoredMessage, StoredSession } from '../../../store'
 import { ImportedMessageConflictError } from '../../../store/messages'
-import { matchAnchored } from './matchAnchored'
+import { computeLocalTranscriptFingerprint, matchAnchored } from './matchAnchored'
 import { collectImportCandidates, matchContentPrefix } from './matchContentPrefix'
 import type { HubLocalSessionSource } from './sources'
 
@@ -376,10 +376,8 @@ export function runLocalImportSync(options: {
                     transcript,
                     importPrefix,
                     canonicalContent: source.match.canonicalContent,
-                    liveCompareKey: source.match.liveCompareKey,
-                    liveUserBatchMatches: source.match.liveUserBatchMatches,
-                    liveNativeTurns: target && source.match.liveNativeTurns
-                        ? source.match.liveNativeTurns(storedMetadata(target), transcript.id)
+                    recordedNativeSteps: target && source.match.nativeStepLedger
+                        ? store.nativeSteps.getSteps(target.id, transcript.id)
                         : undefined,
                     cursor: target && cursorKey
                         ? (typeof storedMetadata(target)[cursorKey] === 'string' ? storedMetadata(target)[cursorKey] as string : null)
@@ -456,6 +454,20 @@ export function runLocalImportSync(options: {
                         message.createdAt ?? importedAt
                     )
                     if (result.inserted) appended.push(result.message)
+                }
+
+                if (source.match.strategy === 'anchored' && source.match.nativeStepLedger) {
+                    const stepsToRecord = transcript.messages
+                        .filter((message): message is typeof message & { anchor: string } =>
+                            typeof message.anchor === 'string' && message.anchor.length > 0
+                        )
+                        .map((message) => ({
+                            anchor: message.anchor,
+                            fingerprint: computeLocalTranscriptFingerprint(message.content)
+                        }))
+                    if (stepsToRecord.length > 0) {
+                        store.nativeSteps.recordSteps(stored.id, transcript.id, stepsToRecord, importedAt)
+                    }
                 }
 
                 const persistedLocalIds = new Set(store.messages.getAllMessages(stored.id)

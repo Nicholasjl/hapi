@@ -287,6 +287,14 @@ export interface ClientToServerEvents {
         time: number
     }) => void
     'messages-consumed': (data: { sid: string; localIds: string[]; clearQueuedThinkingGrace?: boolean; steered?: boolean }) => void
+    'session-native-steps': (
+        data: {
+            sid: string
+            nativeId: string
+            steps: Array<{ anchor: string; fingerprint: string }>
+        },
+        callback?: (response: { ok: boolean; inserted?: number }) => void
+    ) => void
     'messages-indeterminate': (data: { sid: string; localIds: string[] }) => void
     /** Native shared-engine queue projection. null = positively acknowledged removal. */
     'native-queue-message': (data: { sid: string; localId: string; text: string | null }) => void

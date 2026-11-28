@@ -90,7 +90,6 @@ const HUB_OWNED_METADATA_FIELDS = [
     'codexArchivedFork',
     'codexResumePending',
     'agyImportedAt',
-    'agyNativeTurns',
     'titleSuggestionAutoAttemptedAt',
     'titleSuggestionTurn',
     'promptTitle',

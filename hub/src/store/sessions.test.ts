@@ -1727,17 +1727,9 @@ describe('updateSessionAgentState: updated_at (#1855)', () => {
     })
 })
 
-describe('updateSessionMetadata: Antigravity import & native provenance preservation', () => {
-    it('preserves agyImportedAt and agyNativeTurns across sparse CLI metadata updates', () => {
+describe('updateSessionMetadata: Antigravity import preservation', () => {
+    it('preserves agyImportedAt across sparse CLI metadata updates', () => {
         const store = makeStore()
-        const turns = [{
-            acpSessionId: 'agy-native-1',
-            localIds: ['local-1'],
-            promptText: 'check build',
-            userStepIndex: 2,
-            endStepIndex: 4,
-            kind: 'prompt' as const
-        }]
         const session = store.sessions.getOrCreateSession(
             'agy-sparse-meta',
             {
@@ -1745,8 +1737,7 @@ describe('updateSessionMetadata: Antigravity import & native provenance preserva
                 host: 'h',
                 flavor: 'agy',
                 agySessionId: 'agy-native-1',
-                agyImportedAt: 1700,
-                agyNativeTurns: turns
+                agyImportedAt: 1700
             },
             null,
             'default'
@@ -1766,8 +1757,7 @@ describe('updateSessionMetadata: Antigravity import & native provenance preserva
         )
         expect(sparseUpdate.result).toBe('success')
         const refreshed = store.sessions.getSession(session.id)
-        expect((refreshed?.metadata as { agyImportedAt?: number; agyNativeTurns?: unknown })?.agyImportedAt).toBe(1700)
-        expect((refreshed?.metadata as { agyImportedAt?: number; agyNativeTurns?: unknown })?.agyNativeTurns).toEqual(turns)
+        expect((refreshed?.metadata as { agyImportedAt?: number })?.agyImportedAt).toBe(1700)
         store.close()
     })
 })

@@ -7,6 +7,7 @@ import { Store } from '../../../store'
 import { AGY_LOCAL_SESSION_SOURCE, CLAUDE_LOCAL_SESSION_SOURCE, CODEX_LOCAL_SESSION_SOURCE, OPENCODE_LOCAL_SESSION_SOURCE, PI_LOCAL_SESSION_SOURCE } from './sources'
 import { createLocalSessionRoutes } from './createLocalSessionRoutes'
 import { fetchLocalTranscriptSummaries, fetchLocalTranscriptsByIds } from './fetchLocalTranscripts'
+import { computeLocalTranscriptFingerprint } from './matchAnchored'
 
 function machine(id = 'm-1', capabilities: string[] = ['local-session-import', 'agy-imported-resume']): Machine {
     return {
@@ -636,11 +637,11 @@ describe('generic local session routes', () => {
             }
         })
         const native = (id: string, text: string) => ({
-            id: `agy:agy-continued:${id}`, createdAt: 20,
+            id: `agy:agy-continued:${id}`, createdAt: 20, anchor: id,
             content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } } as const
         })
         const nativeAgent = (id: string, data: Record<string, unknown>) => ({
-            id: `agy:agy-continued:${id}`, createdAt: 20,
+            id: `agy:agy-continued:${id}`, createdAt: 20, anchor: id,
             content: { role: 'agent', content: { type: 'codex', data }, meta: { sentFrom: 'cli' } } as const
         })
         const nativeTurn = (userText: string, stdout = 'README.md') => [
@@ -668,6 +669,14 @@ describe('generic local session routes', () => {
                 message: 'Found README.md'
             })
         ]
+        store.nativeSteps.recordSteps(
+            hapiId,
+            'agy-continued',
+            nativeTurn(prompt.text).map((message) => ({
+                anchor: message.anchor,
+                fingerprint: computeLocalTranscriptFingerprint(message.content)
+            }))
+        )
         const initial = agyContinued.messages
         const sync = async () => (await app.request('/api/agy/import-sessions', {
             method: 'POST', body: JSON.stringify({ sessionIds: ['agy-continued'], cwd: '/work' })
@@ -754,7 +763,7 @@ describe('generic local session routes', () => {
         })
     })
 
-    it('re-imports queued, out-of-seq-order, and batched ACP prompts with attachments and appends native tail once', async () => {
+    it('re-imports queued, out-of-seq-order, and batched ACP turns backed by the native step ledger across multiple sync rounds', async () => {
         const store = new Store(':memory:')
         stores.push(store)
         const baseMsg = (id: string, text: string, createdAt = 10) => ({
@@ -809,8 +818,7 @@ describe('generic local session routes', () => {
         expect(initRes.results[0]?.action).toBe('created')
         const hapiId = initRes.results[0]!.hapiSessionId!
 
-        // Turn 1 dispatched at t=20; reply streams at t=21..25; queued prompt u2 arrives during turn 1 (seq before a1_part2)
-        // and is only dispatched at t=30 after turn 1 completes.
+        // HAPI stores interleaved queued/batched live messages plus oversized >64KB output.
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'first live turn' }, meta: { sentFrom: 'web' } }, 'u1', null, 20)
         store.messages.markMessagesInvoked(hapiId, ['u1'], 20)
         store.messages.addMessage(hapiId, {
@@ -827,8 +835,6 @@ describe('generic local session routes', () => {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'second reply' } }
         }, undefined, null, 35)
-
-        // Two queued prompts dispatched together as one ACP batch at t=40, with non-image + inline image attachments.
         store.messages.addMessage(hapiId, {
             role: 'user',
             content: {
@@ -851,9 +857,9 @@ describe('generic local session routes', () => {
             role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'batch reply' } }
         }, undefined, null, 45)
-        // Undelivered queued prompt remains ignored until dispatched.
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'still queued' }, meta: { sentFrom: 'web' } }, 'u4-pending', null, 50)
 
+        const bigToolOutput = `Exit 0\n${'L'.repeat(70_000)}END`
         const livePrefixInNative = [
             baseMsg('step:1:0', 'first live turn', 20),
             nativeAgent('step:2:reasoning', { type: 'reasoning', message: 'Thinking', id: 'agy:agy-batch:step:2:reasoning' }, 21),
@@ -861,13 +867,23 @@ describe('generic local session routes', () => {
             baseMsg('step:3:0', 'queued during reply', 30),
             nativeAgent('step:4:text', { type: 'message', message: 'second reply' }, 35),
             baseMsg('step:5:0', '@.hapi/uploads/spec.md\n\nInspect attachment\nAnd check tests', 40),
+            nativeAgent('step:6:0', { type: 'tool-call-result', callId: 'c1', output: bigToolOutput, is_error: false }, 42),
             nativeAgent('step:6:text', { type: 'message', message: 'batch reply' }, 45)
         ]
+        // Runner incrementally persisted confirmed live native steps into the SQLite ledger.
+        store.nativeSteps.recordSteps(
+            hapiId,
+            'agy-batch',
+            livePrefixInNative.map((message) => ({
+                anchor: message.anchor,
+                fingerprint: computeLocalTranscriptFingerprint(message.content)
+            }))
+        )
+
         const nativeTail = [
             baseMsg('step:7:0', 'native follow-up', 60),
             nativeAgent('step:8:text', { type: 'message', message: 'native answer' }, 61)
         ]
-
         const initial = agySession.messages
         agySession = { ...agySession, messages: [...initial, ...livePrefixInNative, ...nativeTail] }
 
@@ -882,27 +898,33 @@ describe('generic local session routes', () => {
         expect(store.messages.getAllMessages(hapiId).filter((m) => m.localId === 'agy:agy-batch:step:7:0')).toHaveLength(1)
         expect(store.messages.getAllMessages(hapiId).filter((m) => m.localId === 'agy:agy-batch:step:8:text')).toHaveLength(1)
 
-        // Second re-import is idempotent even when live turns now sit between pins!
+        // Second re-import is idempotent and preserves all recorded steps including oversized output.
         const secondSync = await sync()
         expect(secondSync.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
         expect(store.messages.getAllMessages(hapiId)).toHaveLength(countAfterFirstSync)
 
-        // Dropping the non-image attachment or altering a reply still reports transcript_diverged.
+        // Subsequent native continuation appends strictly after step:8:text.
+        const roundTwoTail = [baseMsg('step:9:0', 'second native follow-up', 70)]
+        agySession = { ...agySession, messages: [...initial, ...livePrefixInNative, ...nativeTail, ...roundTwoTail] }
+        expect((await sync()).results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 1 })
+
+        // Altering a confirmed native step reports transcript_diverged.
         agySession = {
             ...agySession,
             messages: [
                 ...initial,
                 ...livePrefixInNative.slice(0, 5),
                 baseMsg('step:5:0', 'Inspect attachment\nAnd check tests', 40),
+                livePrefixInNative[6]!,
                 nativeAgent('step:6:text', { type: 'message', message: 'batch reply' }, 45),
-                ...nativeTail
+                ...nativeTail,
+                ...roundTwoTail
             ]
         }
         expect((await sync()).results[0]?.error?.code).toBe('transcript_diverged')
-        expect(store.messages.getAllMessages(hapiId)).toHaveLength(countAfterFirstSync)
     })
 
-    it('preserves /swarm board and pre-dispatch restored prompts across Antigravity re-imports using runner provenance', async () => {
+    it('reconciles completed steer command output vs native background placeholder, /swarm board, and pre-dispatch restores via the ledger', async () => {
         const store = new Store(':memory:')
         stores.push(store)
         const nativeUser = (id: string, text: string, createdAt = 10) => ({
@@ -911,10 +933,10 @@ describe('generic local session routes', () => {
             content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } } as const,
             anchor: id
         })
-        const nativeAgent = (id: string, message: string, createdAt = 10) => ({
+        const nativeAgent = (id: string, data: Record<string, unknown>, createdAt = 10) => ({
             id: `agy:agy-prov:${id}`,
             createdAt,
-            content: { role: 'agent', content: { type: 'codex', data: { type: 'message', message } }, meta: { sentFrom: 'cli' } } as const,
+            content: { role: 'agent', content: { type: 'codex', data }, meta: { sentFrom: 'cli' } } as const,
             anchor: id
         })
 
@@ -928,7 +950,7 @@ describe('generic local session routes', () => {
             modifiedAt: 10,
             messages: [
                 nativeUser('step:0:0', 'initial prompt', 10),
-                nativeAgent('step:1:0', 'initial answer', 11)
+                nativeAgent('step:1:text', { type: 'message', message: 'initial answer' }, 11)
             ]
         }
 
@@ -956,12 +978,12 @@ describe('generic local session routes', () => {
         })).json() as { results: Array<{ hapiSessionId?: string }> }
         const hapiId = created.results[0]!.hapiSessionId!
 
-        // HAPI-only /swarm board + pre-dispatch restored prompt + one real dispatched ACP turn.
+        // HAPI stores /swarm board, pre-dispatch abort-restore, and completed background steer output.
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: '/swarm board' }, meta: { sentFrom: 'web' } }, 'board-1', null, 20)
         store.messages.markMessagesInvoked(hapiId, ['board-1'], 20)
         store.messages.addMessage(hapiId, {
             role: 'agent',
-            content: { type: 'codex', data: { type: 'message', message: '### Swarm Board', hapiOnly: true } }
+            content: { type: 'codex', data: { type: 'message', message: '### Swarm Board' } }
         }, undefined, null, 21)
         store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'failed pre-dispatch' }, meta: { sentFrom: 'web' } }, 'restore-1', null, 22)
         store.messages.markMessagesInvoked(hapiId, ['restore-1'], 22)
@@ -969,34 +991,36 @@ describe('generic local session routes', () => {
         store.messages.markMessagesInvoked(hapiId, ['real-1'], 30)
         store.messages.addMessage(hapiId, {
             role: 'agent',
+            content: { type: 'codex', data: { type: 'tool-call', name: 'Bash', callId: 'live-cmd-1', input: { command: 'sleep 2' } } }
+        }, undefined, null, 31)
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'tool-call-result', callId: 'live-cmd-1', output: { stdout: 'finished on steer', exit_code: 0 }, is_error: false } }
+        }, undefined, null, 32)
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
             content: { type: 'codex', data: { type: 'message', message: 'real reply' } }
         }, undefined, null, 35)
 
-        const sessionRow = store.sessions.getSessionByNamespace(hapiId, 'default')!
-        store.sessions.updateSessionMetadata(
-            hapiId,
-            {
-                ...(sessionRow.metadata as object),
-                agyNativeTurns: [{
-                    acpSessionId: 'agy-prov',
-                    localIds: ['real-1'],
-                    promptText: 'real dispatched turn',
-                    userStepIndex: 2,
-                    endStepIndex: 3,
-                    kind: 'prompt'
-                }]
-            },
-            sessionRow.metadataVersion,
-            'default'
-        )
-
+        // Meanwhile native step:4:0 retains AGY_BACKGROUND_COMMAND_RESULT ('Command moved to background.').
         const nativeLivePrefix = [
             nativeUser('step:2:0', 'real dispatched turn', 30),
-            nativeAgent('step:3:0', 'real reply', 35)
+            nativeAgent('step:3:call:0', { type: 'tool-call', name: 'Bash', callId: 'agy-wakeup-agy-prov-3-0', input: { command: 'sleep 2' } }, 31),
+            nativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-agy-prov-3-0', output: 'Command moved to background.', is_error: false }, 32),
+            nativeAgent('step:5:text', { type: 'message', message: 'real reply' }, 35)
         ]
+        store.nativeSteps.recordSteps(
+            hapiId,
+            'agy-prov',
+            nativeLivePrefix.map((message) => ({
+                anchor: message.anchor,
+                fingerprint: computeLocalTranscriptFingerprint(message.content)
+            }))
+        )
+
         const nativeTail = [
-            nativeUser('step:4:0', 'continued in cli', 50),
-            nativeAgent('step:5:0', 'cli response', 55)
+            nativeUser('step:6:0', 'continued in cli', 50),
+            nativeAgent('step:7:text', { type: 'message', message: 'cli response' }, 55)
         ]
         const initial = agySession.messages
         agySession = { ...agySession, messages: [...initial, ...nativeLivePrefix, ...nativeTail] }
@@ -1009,26 +1033,100 @@ describe('generic local session routes', () => {
         const first = await sync()
         expect(first.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 2 })
         const msgsAfterFirst = store.messages.getAllMessages(hapiId)
-        expect(msgsAfterFirst.filter((m) => m.localId === 'agy:agy-prov:step:4:0')).toHaveLength(1)
+        expect(msgsAfterFirst.filter((m) => m.localId === 'agy:agy-prov:step:6:0')).toHaveLength(1)
         expect(msgsAfterFirst.some((m) => m.localId === 'board-1')).toBe(true)
         expect(msgsAfterFirst.some((m) => m.localId === 'restore-1')).toBe(true)
 
-        // Second re-import must be idempotent even after native tail pins sit after /swarm board & restore rows.
+        // Second re-import must be idempotent even with interleaved /swarm board, restore, and background command divergence.
         const second = await sync()
         expect(second.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
         expect(store.messages.getAllMessages(hapiId)).toHaveLength(msgsAfterFirst.length)
 
-        // Genuine edit to the dispatched prompt text still diverges.
+        // Tampering a confirmed native step or dropping one diverges cleanly.
         agySession = {
             ...agySession,
             messages: [
                 ...initial,
                 nativeUser('step:2:0', 'tampered dispatched turn', 30),
-                nativeAgent('step:3:0', 'real reply', 35),
+                ...nativeLivePrefix.slice(1),
                 ...nativeTail
             ]
         }
         expect((await sync()).results[0]?.error?.code).toBe('transcript_diverged')
+    })
+
+    it('backfills native step ledger entries for legacy imported AGY sessions without prior ledger rows', async () => {
+        const store = new Store(':memory:')
+        stores.push(store)
+        const s0 = {
+            id: 'agy:agy-legacy:step:0:0',
+            createdAt: 10,
+            content: { role: 'user', content: { type: 'text', text: 'legacy prompt' }, meta: { sentFrom: 'cli' } } as const,
+            anchor: 'step:0:0'
+        }
+        const s1 = {
+            id: 'agy:agy-legacy:step:1:text',
+            createdAt: 11,
+            content: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'legacy reply' } }, meta: { sentFrom: 'cli' } } as const,
+            anchor: 'step:1:text'
+        }
+        const s2 = {
+            id: 'agy:agy-legacy:step:2:0',
+            createdAt: 20,
+            content: { role: 'user', content: { type: 'text', text: 'new tail after upgrade' }, meta: { sentFrom: 'cli' } } as const,
+            anchor: 'step:2:0'
+        }
+
+        // Simulate a legacy imported session created before session_native_steps existed.
+        const legacySession = store.sessions.getOrCreateSession(
+            'agy-import:m-1:agy-legacy',
+            { path: '/work', host: 'm-1.local', machineId: 'm-1', flavor: 'agy', agySessionId: 'agy-legacy', agyImportedAt: 15 },
+            {},
+            'default'
+        )
+        store.messages.addImportedMessage(legacySession.id, s0.content, s0.id, 10)
+        store.messages.addImportedMessage(legacySession.id, s1.content, s1.id, 11)
+        expect(store.nativeSteps.getSteps(legacySession.id, 'agy-legacy')).toEqual([])
+
+        let agySession = {
+            flavor: 'agy' as const,
+            id: 'agy-legacy',
+            title: 'Legacy AGY session',
+            lastUserMessage: 'legacy prompt',
+            cwd: '/work',
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-legacy/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 20,
+            messages: [s0, s1, s2]
+        }
+
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async () => ({ success: true, sessions: [agySession] }),
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({
+            store,
+            getSyncEngine: () => engine,
+            sources: [AGY_LOCAL_SESSION_SOURCE]
+        }))
+
+        const res = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-legacy'], cwd: '/work' })
+        })).json() as { results: Array<{ action?: string; appended?: number }> }
+        expect(res.results[0]).toMatchObject({ action: 'updated', appended: 1 })
+        expect(store.nativeSteps.getSteps(legacySession.id, 'agy-legacy').map((row) => row.anchor)).toEqual([
+            'step:0:0',
+            'step:1:text',
+            'step:2:0'
+        ])
     })
 
 })

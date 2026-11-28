@@ -1717,6 +1717,68 @@ if (isReconnect) {
         return await this.drainLock(this.metadataLock, timeoutMs)
     }
 
+    /** Record confirmed native transcript steps incrementally outside session metadata. */
+    recordNativeSteps(
+        nativeId: string,
+        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+        onResult?: (ok: boolean) => void
+    ): void {
+        if (!nativeId || steps.length === 0) {
+            return
+        }
+        const MAX_NATIVE_STEPS_BATCH = 500
+        for (let i = 0; i < steps.length; i += MAX_NATIVE_STEPS_BATCH) {
+            const chunk = steps.slice(i, i + MAX_NATIVE_STEPS_BATCH)
+            this.emitOrQueue(() => {
+                this.socket.emit('session-native-steps', {
+                    sid: this.sessionId,
+                    nativeId,
+                    steps: chunk
+                }, (response) => {
+                    onResult?.(Boolean(response?.ok))
+                })
+            }, 'lossless')
+        }
+    }
+
+    /** Flush pending native step ledger records with bounded ack wait on shutdown/cleanup. */
+    async flushNativeSteps(
+        nativeId: string,
+        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+        timeoutMs: number = 2_000
+    ): Promise<boolean> {
+        if (!nativeId || steps.length === 0) {
+            return true
+        }
+        if (this.state !== 'active' || !this.socket.connected) {
+            this.recordNativeSteps(nativeId, steps)
+            return false
+        }
+        const MAX_NATIVE_STEPS_BATCH = 500
+        const deadlineMs = Date.now() + timeoutMs
+        for (let i = 0; i < steps.length; i += MAX_NATIVE_STEPS_BATCH) {
+            const chunk = steps.slice(i, i + MAX_NATIVE_STEPS_BATCH)
+            const remainingMs = Math.max(0, deadlineMs - Date.now())
+            if (remainingMs === 0) {
+                this.recordNativeSteps(nativeId, steps.slice(i))
+                return false
+            }
+            try {
+                const response = await this.socket.timeout(remainingMs).emitWithAck('session-native-steps', {
+                    sid: this.sessionId,
+                    nativeId,
+                    steps: chunk
+                })
+                if (!response?.ok) {
+                    return false
+                }
+            } catch {
+                return false
+            }
+        }
+        return true
+    }
+
     async flush(options?: { timeoutMs?: number }): Promise<boolean> {
         const deadlineMs = Date.now() + (options?.timeoutMs ?? 5_000)
         const remainingMs = () => Math.max(0, deadlineMs - Date.now())

@@ -18,11 +18,11 @@ it('adds passkey_credentials when upgrading a v35 database', () => {
         const migrated = new Store(path)
         try {
             expect(log.mock.calls).toEqual([
-                ['[Store] Migrating database schema from v35 to v36...'],
-                ['[Store] Database schema migration complete (v35 to v36).']
+                ['[Store] Migrating database schema from v35 to v37...'],
+                ['[Store] Database schema migration complete (v35 to v37).']
             ])
             const internalDb = (migrated as unknown as { db: Database }).db
-            expect((internalDb.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(36)
+            expect((internalDb.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(37)
             migrated.passkeys.add({
                 id: 'cred', namespace: 'default', rpId: 'localhost', publicKey: new Uint8Array([1, 2, 3]),
                 counter: 0, transports: ['internal'], tokenFingerprint: 'fp', name: null, createdAt: 1

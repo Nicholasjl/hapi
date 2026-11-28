@@ -181,16 +181,6 @@ export const ExternalRefsSchema = z.array(ExternalRefSchema)
 })
 export type ExternalRefs = z.infer<typeof ExternalRefsSchema>
 
-export const AgyNativeTurnProvenanceSchema = z.object({
-    acpSessionId: z.string().min(1),
-    localIds: z.array(z.string().min(1)),
-    promptText: z.string(),
-    userStepIndex: z.number().int().nonnegative().nullable().optional(),
-    endStepIndex: z.number().int().nonnegative().nullable().optional(),
-    kind: z.enum(['prompt', 'steer']).optional()
-})
-export type AgyNativeTurnProvenance = z.infer<typeof AgyNativeTurnProvenanceSchema>
-
 export const MetadataSchema = z.object({
     path: z.string(),
     host: z.string(),
@@ -248,7 +238,6 @@ export const MetadataSchema = z.object({
     // codexSessionId 保存 fork 后的 thread，codexSourceSessionId 保留来源 thread 便于同步/展示。
     codexSourceSessionId: z.string().optional(),
     agyImportedAt: z.number().nullable().optional(),
-    agyNativeTurns: z.array(AgyNativeTurnProvenanceSchema).optional(),
     codexImportedAt: z.number().nullable().optional(),
     geminiSessionId: z.string().optional(),
     opencodeSessionId: z.string().optional(),
