@@ -1779,6 +1779,71 @@ if (isReconnect) {
         return true
     }
 
+    /** Reconciles disk-settled native transcript steps against Hub's confirmed step ledger on reopen. */
+    async reconcileNativeSteps(
+        nativeId: string,
+        steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
+        timeoutMs: number = 5_000
+    ): Promise<
+        | { ok: true; status: 'up_to_date'; confirmedCount: number }
+        | { ok: true; status: 'needs_backfill'; fromIndex: number }
+        | { ok: true; status: 'diverged' }
+        | { ok: false }
+    > {
+        if (!nativeId || this.state !== 'active' || !this.socket.connected) {
+            return { ok: false }
+        }
+        try {
+            return await this.socket.timeout(timeoutMs).emitWithAck('session-reconcile-native-steps', {
+                sid: this.sessionId,
+                nativeId,
+                steps: [...steps]
+            })
+        } catch {
+            return { ok: false }
+        }
+    }
+
+    /** Backfills durable native messages and ledger fingerprints atomically after reopen reconciliation. */
+    async backfillNativeMessages(
+        nativeId: string,
+        expectedOffset: number,
+        messages: ReadonlyArray<{ localId: string; anchor: string; createdAt: number; content: unknown }>,
+        timeoutMs: number = 5_000
+    ): Promise<boolean> {
+        if (!nativeId || messages.length === 0) {
+            return true
+        }
+        if (this.state !== 'active' || !this.socket.connected) {
+            return false
+        }
+        const MAX_NATIVE_BACKFILL_BATCH = 50
+        const deadlineMs = Date.now() + timeoutMs
+        let offset = expectedOffset
+        for (let i = 0; i < messages.length; i += MAX_NATIVE_BACKFILL_BATCH) {
+            const chunk = messages.slice(i, i + MAX_NATIVE_BACKFILL_BATCH)
+            const remainingMs = Math.max(0, deadlineMs - Date.now())
+            if (remainingMs === 0) {
+                return false
+            }
+            try {
+                const response = await this.socket.timeout(remainingMs).emitWithAck('session-backfill-native-messages', {
+                    sid: this.sessionId,
+                    nativeId,
+                    expectedOffset: offset,
+                    messages: [...chunk]
+                })
+                if (!response?.ok) {
+                    return false
+                }
+                offset += chunk.length
+            } catch {
+                return false
+            }
+        }
+        return true
+    }
+
     async flush(options?: { timeoutMs?: number }): Promise<boolean> {
         const deadlineMs = Date.now() + (options?.timeoutMs ?? 5_000)
         const remainingMs = () => Math.max(0, deadlineMs - Date.now())

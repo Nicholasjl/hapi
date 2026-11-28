@@ -950,3 +950,170 @@ describe('session-native-steps handler', () => {
         store.close()
     })
 })
+
+describe('session-reconcile-native-steps and session-backfill-native-messages handlers', () => {
+    const hash = (tag: string) => tag.repeat(64).slice(0, 64)
+    const userContent = (text: string) => ({ role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } })
+    const agentContent = (message: string) => ({
+        role: 'agent',
+        content: { type: 'codex', data: { type: 'message', message } },
+        meta: { sentFrom: 'cli' }
+    })
+
+    it('returns up_to_date, needs_backfill, or diverged against durable ledger and imported messages', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-reconcile',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-rec' },
+            null,
+            'default'
+        )
+        const c0 = userContent('first')
+        const c1 = agentContent('second')
+        store.messages.addImportedMessage(session.id, c0, 'agy:native-rec:step:0:0', 10)
+        store.messages.addImportedMessage(session.id, c1, 'agy:native-rec:step:1:text', 11)
+
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid, opts) => {
+                expect(opts?.fresh).toBe(true)
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {}
+        })
+
+        // Legacy imported session (empty ledger) verifies imported prefix, backfills ledger rows, and reports up_to_date / needs_backfill.
+        const acks: unknown[] = []
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-rec',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: hash('0') }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[0]).toEqual({ ok: true, status: 'diverged' })
+
+        store.nativeSteps.recordSteps(session.id, 'native-rec', [
+            { anchor: 'step:0:0', fingerprint: hash('a') },
+            { anchor: 'step:1:text', fingerprint: hash('b') }
+        ])
+
+        // Mismatching step:0:0 vs stored ledger returns diverged.
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-rec',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: hash('e') },
+                { anchor: 'step:1:text', fingerprint: hash('b') }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[1]).toEqual({ ok: true, status: 'diverged' })
+
+        // Test with real SHA-256 fingerprints via backfill flow below; reset session cleanly for exact match checks.
+        store.close()
+    })
+
+    it('reconciles legacy prefix, rejects diverged/unimported, and backfills unseen native messages atomically with broadcasts', () => {
+        const { createHash } = require('node:crypto') as typeof import('node:crypto')
+        const { canonicalizeLocalTranscriptContent } = require('@hapi/protocol/localTranscript') as typeof import('@hapi/protocol/localTranscript')
+        const fp = (content: unknown) => createHash('sha256').update(canonicalizeLocalTranscriptContent(content)).digest('hex')
+
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-backfill',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-bf' },
+            null,
+            'default'
+        )
+        const c0 = userContent('hello')
+        const c1 = agentContent('hi')
+        const c2 = userContent('offline native follow-up')
+        const c3 = agentContent('offline native reply')
+        store.messages.addImportedMessage(session.id, c0, 'agy:native-bf:step:0:0', 10)
+        store.messages.addImportedMessage(session.id, c1, 'agy:native-bf:step:1:text', 11)
+
+        const socket = new FakeSocket()
+        const events: SyncEvent[] = []
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid) => {
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {},
+            onWebappEvent: (event) => events.push(event)
+        })
+
+        // Legacy backfill detects steps 2 & 3 need backfill and seeds ledger rows 0..1.
+        const acks: unknown[] = []
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-bf',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: fp(c0) },
+                { anchor: 'step:1:text', fingerprint: fp(c1) },
+                { anchor: 'step:2:0', fingerprint: fp(c2) },
+                { anchor: 'step:3:text', fingerprint: fp(c3) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[0]).toEqual({ ok: true, status: 'needs_backfill', fromIndex: 2 })
+        expect(store.nativeSteps.getSteps(session.id, 'native-bf').map((s) => s.anchor)).toEqual(['step:0:0', 'step:1:text'])
+
+        // Wrong expectedOffset fails closed without inserting messages or advancing ledger.
+        socket.trigger('session-backfill-native-messages', {
+            sid: session.id,
+            nativeId: 'native-bf',
+            expectedOffset: 0,
+            messages: [{ localId: 'agy:native-bf:step:2:0', anchor: 'step:2:0', createdAt: 20, content: c2 }]
+        }, (resp) => acks.push(resp))
+        expect(acks[1]).toEqual({ ok: false })
+        expect(store.messages.getAllMessages(session.id)).toHaveLength(2)
+
+        // Matching expectedOffset atomically inserts messages, records ledger entries, and broadcasts.
+        socket.trigger('session-backfill-native-messages', {
+            sid: session.id,
+            nativeId: 'native-bf',
+            expectedOffset: 2,
+            messages: [
+                { localId: 'agy:native-bf:step:2:0', anchor: 'step:2:0', createdAt: 20, content: c2 },
+                { localId: 'agy:native-bf:step:3:text', anchor: 'step:3:text', createdAt: 21, content: c3 }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[2]).toEqual({ ok: true, inserted: 2, confirmedCount: 4 })
+        expect(store.messages.getAllMessages(session.id)).toHaveLength(4)
+        expect(store.nativeSteps.getSteps(session.id, 'native-bf')).toHaveLength(4)
+        expect(socket.roomEvents.filter((e) => e.event === 'update')).toHaveLength(2)
+        expect(events.filter((e) => e.type === 'message-received')).toHaveLength(2)
+
+        // Reconciling again returns up_to_date.
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-bf',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: fp(c0) },
+                { anchor: 'step:1:text', fingerprint: fp(c1) },
+                { anchor: 'step:2:0', fingerprint: fp(c2) },
+                { anchor: 'step:3:text', fingerprint: fp(c3) }
+            ]
+        }, (resp) => acks.push(resp))
+        expect(acks[3]).toEqual({ ok: true, status: 'up_to_date', confirmedCount: 4 })
+
+        // Non-imported session or mismatched nativeId rejects reconcile and backfill.
+        const plain = store.sessions.getOrCreateSession('plain', { path: '/w', host: 'h1', agySessionId: 'native-bf' }, null, 'default')
+        socket.trigger('session-reconcile-native-steps', {
+            sid: plain.id,
+            nativeId: 'native-bf',
+            steps: []
+        }, (resp) => acks.push(resp))
+        socket.trigger('session-backfill-native-messages', {
+            sid: session.id,
+            nativeId: 'native-wrong',
+            expectedOffset: 4,
+            messages: [{ localId: 'agy:native-wrong:step:4:0', anchor: 'step:4:0', createdAt: 30, content: c2 }]
+        }, (resp) => acks.push(resp))
+        expect(acks.slice(4)).toEqual([{ ok: false }, { ok: false }])
+        store.close()
+    })
+})

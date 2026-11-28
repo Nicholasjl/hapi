@@ -3,7 +3,10 @@ import { randomUUID } from 'node:crypto';
 import type { RawJSONLines } from '@/claude/types';
 import { statSync, watch, type BigIntStats, type FSWatcher } from 'node:fs';
 import { RPC_METHODS, splitAgyModelSelection } from '@hapi/protocol';
-import { collectSettledAgyNativeStepFingerprints } from '@/modules/common/agySessions';
+import {
+    collectSettledAgyNativeStepFingerprints,
+    collectSettledAgyTranscriptForReconcile
+} from '@/modules/common/agySessions';
 import type { PermissionMode as ProtocolPermissionMode } from '@hapi/protocol/types';
 import { getBuiltinSlashCommands, mergeSlashCommands } from '@hapi/protocol/slashCommands';
 import { logger } from '@/ui/logger';
@@ -353,8 +356,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private readonly activeBgTasks = new Map<string, string>();
     private lastBgSnapshotIds: string[] = [];
     private acpSessionId: string | null = null;
-    private liveNativeTrackingSessionId: string | null = null;
-    private liveNativeTrackingStartStepIndex: number | null = null;
+    private nativeStepTrackingSessionId: string | null = null;
+    private nativeStepTrackingReady = false;
+    private maxRenderedNativeStepIndex = -1;
     private readonly recordedNativeStepAnchors = new Set<string>();
     private lastTranscriptStepIndex = -1;
     // Latest step_index seen when an unfinished wakeup hit `maxIdleMs`, so
@@ -514,25 +518,75 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         return this.session.client.getMetadata?.()?.agyImportedAt != null;
     }
 
-    private initializeNativeStepTracking(): void {
-        if (!this.isImportedSession() || !this.acpSessionId) return;
-        if (this.liveNativeTrackingSessionId !== this.acpSessionId) {
-            this.liveNativeTrackingSessionId = this.acpSessionId;
-            this.liveNativeTrackingStartStepIndex = this.lastTranscriptStepIndex;
+    private async reconcileImportedNativeSteps(): Promise<void> {
+        const acpSessionId = this.acpSessionId;
+        if (!this.isImportedSession() || !acpSessionId) return;
+        if (this.nativeStepTrackingSessionId !== acpSessionId) {
+            this.nativeStepTrackingSessionId = acpSessionId;
+            this.nativeStepTrackingReady = false;
+            this.maxRenderedNativeStepIndex = -1;
             this.recordedNativeStepAnchors.clear();
         }
+        const snapshot = collectSettledAgyTranscriptForReconcile(this.brainDir, acpSessionId);
+        if (!snapshot.ready) {
+            this.nativeStepTrackingReady = false;
+            return;
+        }
+        if (typeof this.session.client.reconcileNativeSteps !== 'function') {
+            this.maxRenderedNativeStepIndex = Math.max(this.maxRenderedNativeStepIndex, this.lastTranscriptStepIndex);
+            for (const entry of snapshot.fingerprints) {
+                const match = /^step:(-?\d+):/.exec(entry.anchor);
+                const stepIndex = match ? Number(match[1]) : -1;
+                if (stepIndex <= this.maxRenderedNativeStepIndex) {
+                    this.recordedNativeStepAnchors.add(entry.anchor);
+                }
+            }
+            this.nativeStepTrackingReady = true;
+            return;
+        }
+        const res = await this.session.client.reconcileNativeSteps(acpSessionId, snapshot.fingerprints);
+        if (!res?.ok || res.status === 'diverged') {
+            this.nativeStepTrackingReady = false;
+            return;
+        }
+        if (res.status === 'needs_backfill') {
+            if (
+                res.fromIndex < 0
+                || res.fromIndex > snapshot.messages.length
+                || typeof this.session.client.backfillNativeMessages !== 'function'
+            ) {
+                this.nativeStepTrackingReady = false;
+                return;
+            }
+            const ok = await this.session.client.backfillNativeMessages(
+                acpSessionId,
+                res.fromIndex,
+                snapshot.messages.slice(res.fromIndex)
+            );
+            if (!ok) {
+                this.nativeStepTrackingReady = false;
+                return;
+            }
+        }
+        for (const entry of snapshot.fingerprints) {
+            this.recordedNativeStepAnchors.add(entry.anchor);
+        }
+        this.maxRenderedNativeStepIndex = Math.max(this.maxRenderedNativeStepIndex, snapshot.maxStepIndex);
+        this.lastTranscriptStepIndex = Math.max(this.lastTranscriptStepIndex, snapshot.maxStepIndex);
+        this.nativeStepTrackingReady = true;
     }
 
     private collectUnseenNativeSteps(acpSessionId: string): Array<{ anchor: string; fingerprint: string }> {
+        if (!this.nativeStepTrackingReady) return [];
         const steps = readAgyTranscriptStepsAfter(this.brainDir, acpSessionId, -1);
         const fingerprints = collectSettledAgyNativeStepFingerprints(acpSessionId, steps, {
-            afterStepIndex: this.liveNativeTrackingStartStepIndex ?? -1
+            maxStepIndex: this.maxRenderedNativeStepIndex
         });
         return fingerprints.filter((entry) => !this.recordedNativeStepAnchors.has(entry.anchor));
     }
 
     private syncConfirmedNativeSteps(): void {
-        if (!this.isImportedSession() || !this.acpSessionId) return;
+        if (!this.isImportedSession() || !this.acpSessionId || !this.nativeStepTrackingReady) return;
         const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
         if (unseen.length === 0) return;
         for (const entry of unseen) {
@@ -548,7 +602,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     }
 
     private async flushConfirmedNativeSteps(): Promise<void> {
-        if (!this.isImportedSession() || !this.acpSessionId) return;
+        if (!this.isImportedSession() || !this.acpSessionId || !this.nativeStepTrackingReady) return;
         const unseen = this.collectUnseenNativeSteps(this.acpSessionId);
         if (unseen.length === 0) return;
         for (const entry of unseen) {
@@ -586,9 +640,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         this.pausedWakeupStepIndex = null;
     }
 
-    private syncTurnTranscriptCursor(turn: AgyTurn, turnStartStepIndex: number, countFromStepIndex?: number): void {
+    private syncTurnTranscriptCursor(turn: AgyTurn, turnStartStepIndex: number, countFromStepIndex?: number): number | null {
         const acpSessionId = this.acpSessionId;
-        if (!acpSessionId) return;
+        if (!acpSessionId) return null;
         this.lastTurnTranscriptState = {
             turnStartStepIndex,
             ...(countFromStepIndex !== undefined && countFromStepIndex < turnStartStepIndex
@@ -596,8 +650,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 : {}),
             streamedTextCounts: new Map(turn.streamedTextCounts)
         };
-        this.advanceCursorFromLastTurnState(turn);
+        const nextCursor = this.advanceCursorFromLastTurnState(turn);
         this.pausedWakeupStepIndex = null;
+        return nextCursor;
     }
 
     private advanceCursorFromLastTurnState(turn?: AgyTurn): number | null {
@@ -959,6 +1014,10 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                         );
                     }
                     session.onThinkingChange(false);
+                    if (inspection.latestStepIndex > this.maxRenderedNativeStepIndex) {
+                        this.maxRenderedNativeStepIndex = inspection.latestStepIndex;
+                    }
+                    this.syncConfirmedNativeSteps();
                     if (session.queue.size() === 0 && !this.shouldExit) {
                         session.sendSessionEvent({ type: 'ready' });
                     }
@@ -1136,7 +1195,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
             this.syncTranscriptCursor();
             session.onSessionFound(acpSessionId);
-            this.initializeNativeStepTracking();
+            await this.reconcileImportedNativeSteps();
             session.client.emitSessionReady();
             if (resumeSessionId === acpSessionId) {
                 const existingTitle = await readAgyConversationTitle(acpSessionId);
@@ -1356,6 +1415,18 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 restoreIfUserTurn();
                 return;
             }
+            if (
+                this.isImportedSession()
+                && !internalWakeup
+                && Math.max(this.lastTranscriptStepIndex, readLatestAgyTranscriptStepIndex(this.brainDir, acpSessionId))
+                    > this.maxRenderedNativeStepIndex
+            ) {
+                await this.reconcileImportedNativeSteps();
+                if (turn.aborted) {
+                    restoreIfUserTurn();
+                    return;
+                }
+            }
             if (!await this.applyTurnConfig(backend, acpSessionId, mode) || turn.aborted) {
                 restoreIfUserTurn();
                 return;
@@ -1464,7 +1535,10 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             await this.waitForSteers(turn);
             this.flushDeferredLiveCommandCalls(turn);
             if (!turn.aborted && !this.backendLost) {
-                this.syncTurnTranscriptCursor(turn, turnStartStepIndex, internalWakeup ? commandWindowAfterStepIndex : undefined);
+                const nextCursor = this.syncTurnTranscriptCursor(turn, turnStartStepIndex, internalWakeup ? commandWindowAfterStepIndex : undefined);
+                if (nextCursor !== null && nextCursor > this.maxRenderedNativeStepIndex) {
+                    this.maxRenderedNativeStepIndex = nextCursor;
+                }
                 this.syncConfirmedNativeSteps();
             }
             this.closeBackgroundCommands(turn, commandWindowAfterStepIndex, false, internalWakeup);

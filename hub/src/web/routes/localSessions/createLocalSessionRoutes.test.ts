@@ -8,6 +8,8 @@ import { AGY_LOCAL_SESSION_SOURCE, CLAUDE_LOCAL_SESSION_SOURCE, CODEX_LOCAL_SESS
 import { createLocalSessionRoutes } from './createLocalSessionRoutes'
 import { fetchLocalTranscriptSummaries, fetchLocalTranscriptsByIds } from './fetchLocalTranscripts'
 import { computeLocalTranscriptFingerprint } from './matchAnchored'
+import { registerSessionHandlers } from '../../../socket/handlers/cli/sessionHandlers'
+import type { CliSocketWithData } from '../../../socket/socketTypes'
 
 function machine(id = 'm-1', capabilities: string[] = ['local-session-import', 'agy-imported-resume']): Machine {
     return {
@@ -1127,6 +1129,149 @@ describe('generic local session routes', () => {
             'step:1:text',
             'step:2:0'
         ])
+    })
+
+    it('reconciles offline native turns via socket handlers on direct reopen and preserves late unrecorded disk replies for next re-import', async () => {
+        const store = new Store(':memory:')
+        stores.push(store)
+        const nativeUser = (nativeId: string, id: string, text: string, createdAt = 10) => ({
+            id: `agy:${nativeId}:${id}`,
+            createdAt,
+            content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } } as const,
+            anchor: id
+        })
+        const nativeAgent = (nativeId: string, id: string, message: string, createdAt = 10) => ({
+            id: `agy:${nativeId}:${id}`,
+            createdAt,
+            content: { role: 'agent', content: { type: 'codex', data: { type: 'message', message } }, meta: { sentFrom: 'cli' } } as const,
+            anchor: id
+        })
+
+        let agySession = {
+            flavor: 'agy' as const,
+            id: 'agy-e2e',
+            title: 'E2E reconcile session',
+            lastUserMessage: 'initial prompt',
+            cwd: '/work',
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-e2e/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10,
+            messages: [
+                nativeUser('agy-e2e', 'step:0:0', 'initial prompt', 10),
+                nativeAgent('agy-e2e', 'step:1:text', 'initial reply', 11)
+            ]
+        }
+
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async () => ({ success: true, sessions: [agySession] }),
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({
+            store,
+            getSyncEngine: () => engine,
+            sources: [AGY_LOCAL_SESSION_SOURCE]
+        }))
+
+        const created = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string }> }
+        const hapiId = created.results[0]!.hapiSessionId!
+
+        const handlers = new Map<string, (data: unknown, ack?: (response: unknown) => void) => void>()
+        const socket = {
+            on(event: string, fn: (data: unknown, ack?: (response: unknown) => void) => void) {
+                handlers.set(event, fn)
+                return this
+            },
+            to: () => ({ emit: () => {} })
+        }
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid) => {
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {}
+        })
+
+        // 1. User continued in native AGY CLI while archived; HAPI directly reopens without explicit UI re-import.
+        const s2 = nativeUser('agy-e2e', 'step:2:0', 'offline cli turn', 20)
+        const s3 = nativeAgent('agy-e2e', 'step:3:text', 'offline cli reply', 21)
+        const allSteps = [...agySession.messages, s2, s3]
+        let reconcileAck: unknown
+        handlers.get('session-reconcile-native-steps')!(
+            {
+                sid: hapiId,
+                nativeId: 'agy-e2e',
+                steps: allSteps.map((m) => ({ anchor: m.anchor, fingerprint: computeLocalTranscriptFingerprint(m.content) }))
+            },
+            (resp) => { reconcileAck = resp }
+        )
+        expect(reconcileAck).toEqual({ ok: true, status: 'needs_backfill', fromIndex: 2 })
+
+        let backfillAck: unknown
+        handlers.get('session-backfill-native-messages')!(
+            {
+                sid: hapiId,
+                nativeId: 'agy-e2e',
+                expectedOffset: 2,
+                messages: [
+                    { localId: s2.id, anchor: s2.anchor, createdAt: s2.createdAt, content: s2.content },
+                    { localId: s3.id, anchor: s3.anchor, createdAt: s3.createdAt, content: s3.content }
+                ]
+            },
+            (resp) => { backfillAck = resp }
+        )
+        expect(backfillAck).toEqual({ ok: true, inserted: 2, confirmedCount: 4 })
+
+        // 2. Live HAPI turn runs next and incrementally records steps 4 & 5; step 6 finishes disk-only unrecorded.
+        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'live turn in hapi' }, meta: { sentFrom: 'web' } }, 'live-1', null, 30)
+        store.messages.markMessagesInvoked(hapiId, ['live-1'], 30)
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: 'live reply' } }
+        }, undefined, null, 35)
+        const s4 = nativeUser('agy-e2e', 'step:4:0', 'live turn in hapi', 30)
+        const s5 = nativeAgent('agy-e2e', 'step:5:text', 'live reply', 35)
+        let recordAck: unknown
+        handlers.get('session-native-steps')!(
+            {
+                sid: hapiId,
+                nativeId: 'agy-e2e',
+                steps: [s4, s5].map((m) => ({ anchor: m.anchor, fingerprint: computeLocalTranscriptFingerprint(m.content) }))
+            },
+            (resp) => { recordAck = resp }
+        )
+        expect(recordAck).toEqual({ ok: true, inserted: 2 })
+
+        // 3. A late disk-only reply (step:6:text) wasn't rendered in HAPI or recorded in ledger, plus step:7..8 follow natively.
+        const lateDiskReply = nativeAgent('agy-e2e', 'step:6:text', 'late disk-only reply', 40)
+        const nativeTail = [
+            nativeUser('agy-e2e', 'step:7:0', 'later native prompt', 50),
+            nativeAgent('agy-e2e', 'step:8:text', 'later native answer', 55)
+        ]
+        agySession = { ...agySession, messages: [...allSteps, s4, s5, lateDiskReply, ...nativeTail] }
+
+        const syncRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+
+        expect(syncRes.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 3 })
+        const storedLocalIds = store.messages.getAllMessages(hapiId).map((m) => m.localId)
+        expect(storedLocalIds).toContain('agy:agy-e2e:step:2:0')
+        expect(storedLocalIds).toContain('agy:agy-e2e:step:3:text')
+        expect(storedLocalIds).toContain('agy:agy-e2e:step:6:text')
+        expect(storedLocalIds).toContain('agy:agy-e2e:step:7:0')
+        expect(storedLocalIds).toContain('agy:agy-e2e:step:8:text')
     })
 
 })

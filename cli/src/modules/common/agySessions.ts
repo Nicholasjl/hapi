@@ -310,16 +310,26 @@ function parseStepIndexFromAnchor(anchor: string): number | null {
     return match ? Number(match[1]) : null
 }
 
+function computeAgyNativeStepFingerprints(
+    messages: ReadonlyArray<Pick<AgyImportedMessage, 'anchor' | 'content'>>
+): Array<{ anchor: string; fingerprint: string }> {
+    return messages.map((message) => {
+        const canonical = canonicalizeLocalTranscriptContent(truncateOversizedMessageContent(message.content))
+        const fingerprint = createHash('sha256').update(canonical).digest('hex')
+        return { anchor: message.anchor, fingerprint }
+    })
+}
+
 /**
  * Computes incremental `(anchor, sha256)` ledger entries for the contiguous prefix
- * of settled steps in an Antigravity transcript while skipping steps at or before
- * `options.afterStepIndex`. Stops at the first unsettled step so ledger sequence
- * positions stay aligned with `convertAgyTranscriptStepsToMessages`.
+ * of settled steps in an Antigravity transcript while skipping steps outside
+ * `(afterStepIndex, maxStepIndex]`. Stops at the first unsettled step so ledger
+ * sequence positions stay aligned with `convertAgyTranscriptStepsToMessages`.
  */
 export function collectSettledAgyNativeStepFingerprints(
     sessionId: string,
     steps: AgyTranscriptStep[],
-    options?: { afterStepIndex?: number }
+    options?: { afterStepIndex?: number; maxStepIndex?: number }
 ): Array<{ anchor: string; fingerprint: string }> {
     const settledSteps: AgyTranscriptStep[] = []
     for (const step of steps) {
@@ -332,18 +342,47 @@ export function collectSettledAgyNativeStepFingerprints(
         return []
     }
     const afterStepIndex = options?.afterStepIndex ?? -1
+    const maxStepIndex = options?.maxStepIndex ?? Number.POSITIVE_INFINITY
     const { messages } = convertAgyTranscriptStepsToMessages(sessionId, settledSteps, 0)
-    const fingerprints: Array<{ anchor: string; fingerprint: string }> = []
-    for (const message of messages) {
+    const filtered = messages.filter((message) => {
         const stepIndex = parseStepIndexFromAnchor(message.anchor)
-        if (stepIndex === null || stepIndex <= afterStepIndex) {
-            continue
-        }
-        const canonical = canonicalizeLocalTranscriptContent(truncateOversizedMessageContent(message.content))
-        const fingerprint = createHash('sha256').update(canonical).digest('hex')
-        fingerprints.push({ anchor: message.anchor, fingerprint })
+        return stepIndex !== null && stepIndex > afterStepIndex && stepIndex <= maxStepIndex
+    })
+    return computeAgyNativeStepFingerprints(filtered)
+}
+
+/**
+ * Reads the full settled native transcript snapshot for reopen reconciliation.
+ * Fails closed (`ready: false`) if the transcript is mid-flush or contains any
+ * unsettled/truncated step.
+ */
+export function collectSettledAgyTranscriptForReconcile(
+    brainDir: string,
+    sessionId: string
+):
+    | { ready: false }
+    | {
+        ready: true
+        messages: AgyImportedMessage[]
+        fingerprints: Array<{ anchor: string; fingerprint: string }>
+        maxStepIndex: number
+    } {
+    const paths = agyTranscriptPaths(brainDir, sessionId)
+    if (!paths || !safeFileStat(paths.compactPath)) {
+        return { ready: true, messages: [], fingerprints: [], maxStepIndex: -1 }
     }
-    return fingerprints
+    const { steps: allSteps, incompleteTail } = readAgyTranscriptForImport(brainDir, sessionId)
+    const { steps, hadMissingFullRows } = selectStableCompleteAgySteps(allSteps)
+    if (incompleteTail || hadMissingFullRows || steps.some((step) => !isAgyTranscriptStepSettled(step))) {
+        return { ready: false }
+    }
+    const { messages } = convertAgyTranscriptStepsToMessages(sessionId, steps, Date.now())
+    return {
+        ready: true,
+        messages,
+        fingerprints: computeAgyNativeStepFingerprints(messages),
+        maxStepIndex: steps.length > 0 ? steps[steps.length - 1]!.step_index : -1
+    }
 }
 
 export function convertAgyTranscriptStepsToMessages(
@@ -612,7 +651,7 @@ export async function listLocalAgySessionSummaries(
     }
 }
 
-function selectStableCompleteAgySteps(steps: AgyTranscriptStep[]): {
+export function selectStableCompleteAgySteps(steps: AgyTranscriptStep[]): {
     steps: AgyTranscriptStep[]
     hadMissingFullRows: boolean
 } {

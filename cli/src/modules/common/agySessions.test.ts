@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { TRUNCATE_STRING_LIMIT } from '@hapi/protocol/localTranscript'
 import {
     collectSettledAgyNativeStepFingerprints,
+    collectSettledAgyTranscriptForReconcile,
     isAgyTranscriptStepSettled
 } from './agySessions'
 
@@ -721,5 +722,58 @@ describe('agy native step ledger settlement and fingerprinting', () => {
         ])
         expect(largeStep.map((e) => e.anchor)).toEqual(['step:0:0', 'step:1:text', 'step:1:call:0', 'step:2:0'])
         expect(largeStep[3]!.fingerprint).toMatch(/^[0-9a-f]{64}$/)
+
+        // maxStepIndex caps emitted fingerprints without disturbing earlier tool_call pairing context.
+        const capped = collectSettledAgyNativeStepFingerprints('conv-bg', [
+            ...commonPrefix,
+            bgDoneSamePlaceholder
+        ], { maxStepIndex: 1 })
+        expect(capped.map((e) => e.anchor)).toEqual(['step:0:0', 'step:1:text', 'step:1:call:0'])
+    })
+
+    it('fails closed on collectSettledAgyTranscriptForReconcile when unsettled or truncated rows exist, and returns messages+fingerprints when settled', () => {
+        const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = require('node:fs') as typeof import('node:fs')
+        const { tmpdir } = require('node:os') as typeof import('node:os')
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-reconcile-helper-'))
+        try {
+            const logsDir = join(brainDir, 'conv-rec', '.system_generated', 'logs')
+            mkdirSync(logsDir, { recursive: true })
+            const stepsPath = join(logsDir, 'transcript.jsonl')
+
+            // Empty / missing transcript is ready with maxStepIndex -1.
+            expect(collectSettledAgyTranscriptForReconcile(brainDir, 'conv-missing')).toEqual({
+                ready: true,
+                messages: [],
+                fingerprints: [],
+                maxStepIndex: -1
+            })
+
+            // Non-background RUNNING step makes snapshot not ready.
+            writeFileSync(stepsPath, [
+                JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }),
+                JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'RUNNING', content: 'partial' })
+            ].join('\n') + '\n')
+            expect(collectSettledAgyTranscriptForReconcile(brainDir, 'conv-rec')).toEqual({ ready: false })
+
+            // Incomplete JSONL tail also fails closed.
+            writeFileSync(stepsPath, JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }) + '\n{"step_index": 1')
+            expect(collectSettledAgyTranscriptForReconcile(brainDir, 'conv-rec')).toEqual({ ready: false })
+
+            // Once settled, returns messages, matching fingerprints, and maxStepIndex.
+            writeFileSync(stepsPath, [
+                JSON.stringify({ step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' }),
+                JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', content: 'done' })
+            ].join('\n') + '\n')
+            const settled = collectSettledAgyTranscriptForReconcile(brainDir, 'conv-rec')
+            expect(settled.ready).toBe(true)
+            if (settled.ready) {
+                expect(settled.maxStepIndex).toBe(1)
+                expect(settled.messages.map((m) => m.anchor)).toEqual(['step:0:0', 'step:1:text'])
+                expect(settled.fingerprints).toHaveLength(2)
+                expect(settled.fingerprints[0]!.fingerprint).toMatch(/^[0-9a-f]{64}$/)
+            }
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true })
+        }
     })
 })

@@ -4,12 +4,13 @@ import { randomUUID } from 'node:crypto'
 import type { CopilotAgentMode } from '@hapi/protocol'
 import type { AgentState, BackgroundTask, CodexCollaborationMode, Metadata, PermissionMode } from '@hapi/protocol/types'
 import { getToolCallId, isRedundantGoalStatusEventContent } from '@hapi/protocol/messages'
-import type { Store, StoredSession } from '../../../store'
+import type { Store, StoredMessage, StoredSession } from '../../../store'
 import type { SyncEvent } from '../../../sync/syncEngine'
 import { extractTodoWriteTodosFromMessageContent } from '../../../sync/todos'
 import { extractTeamStateFromMessageContent, applyTeamStateDelta } from '../../../sync/teams'
 import { extractBackgroundTasks } from '../../../sync/backgroundTasks'
 import { shouldRecordSessionActivity } from '../../../sync/sessionActivity'
+import { computeLocalTranscriptFingerprint } from '../../../web/routes/localSessions/matchAnchored'
 import type { CliSocketWithData } from '../../socketTypes'
 import type { SessionEndReason } from '@hapi/protocol'
 import type { AccessErrorReason, AccessResult } from './types'
@@ -90,6 +91,27 @@ const nativeStepsSchema = z.object({
         anchor: z.string().min(1).max(256),
         fingerprint: z.string().regex(/^[0-9a-f]{64}$/)
     })).max(1000)
+})
+
+const reconcileNativeStepsSchema = z.object({
+    sid: z.string().min(1),
+    nativeId: z.string().min(1),
+    steps: z.array(z.object({
+        anchor: z.string().min(1).max(256),
+        fingerprint: z.string().regex(/^[0-9a-f]{64}$/)
+    })).max(10_000)
+})
+
+const backfillNativeMessagesSchema = z.object({
+    sid: z.string().min(1),
+    nativeId: z.string().min(1),
+    expectedOffset: z.number().int().min(0),
+    messages: z.array(z.object({
+        localId: z.string().min(1),
+        anchor: z.string().min(1).max(256),
+        createdAt: z.number(),
+        content: z.unknown()
+    })).max(100)
 })
 
 // Hub-only merge/clear/title links. CLI update-metadata must not forge or erase them
@@ -633,6 +655,196 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             reply({ ok: true, inserted })
         } catch (err) {
             console.error('recordSteps failed', err)
+            reply({ ok: false })
+        }
+    })
+
+    socket.on('session-reconcile-native-steps', (
+        data: unknown,
+        ack?: (
+            response:
+                | { ok: true; status: 'up_to_date'; confirmedCount: number }
+                | { ok: true; status: 'needs_backfill'; fromIndex: number }
+                | { ok: true; status: 'diverged' }
+                | { ok: false }
+        ) => void
+    ) => {
+        const reply = typeof ack === 'function' ? ack : () => {}
+        const parsed = reconcileNativeStepsSchema.safeParse(data)
+        if (!parsed.success) {
+            reply({ ok: false })
+            return
+        }
+        const sessionAccess = resolveSessionAccess(parsed.data.sid, { fresh: true })
+        if (!sessionAccess.ok) {
+            emitAccessError('session', parsed.data.sid, sessionAccess.reason)
+            reply({ ok: false })
+            return
+        }
+        const metadata = sessionAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+        if (metadata?.agyImportedAt == null || metadata.agySessionId !== parsed.data.nativeId) {
+            reply({ ok: false })
+            return
+        }
+        try {
+            const { sid, nativeId, steps } = parsed.data
+            const recorded = store.nativeSteps.getSteps(sid, nativeId)
+            const storedMessages = store.messages.getAllMessages(sid)
+            const importPrefix = `agy:${nativeId}:`
+            const imported = storedMessages.filter((msg) => msg.localId?.startsWith(importPrefix))
+
+            if (recorded.length > 0) {
+                if (steps.length < recorded.length) {
+                    reply({ ok: true, status: 'diverged' })
+                    return
+                }
+                const stepIndexByAnchor = new Map<string, number>()
+                for (let i = 0; i < recorded.length; i += 1) {
+                    const expected = recorded[i]!
+                    const actual = steps[i]!
+                    if (actual.anchor !== expected.anchor || actual.fingerprint !== expected.fingerprint) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    stepIndexByAnchor.set(actual.anchor, i)
+                }
+                let priorIndex = -1
+                for (const msg of imported) {
+                    const expectedAnchor = msg.localId!.slice(importPrefix.length)
+                    const sourceIndex = stepIndexByAnchor.get(expectedAnchor)
+                    if (sourceIndex === undefined || sourceIndex <= priorIndex || sourceIndex >= recorded.length) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    if (computeLocalTranscriptFingerprint(msg.content) !== steps[sourceIndex]!.fingerprint) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    priorIndex = sourceIndex
+                }
+                if (steps.length === recorded.length) {
+                    reply({ ok: true, status: 'up_to_date', confirmedCount: recorded.length })
+                } else {
+                    reply({ ok: true, status: 'needs_backfill', fromIndex: recorded.length })
+                }
+                return
+            }
+
+            if (imported.length === 0 || storedMessages.length > imported.length || steps.length < imported.length) {
+                reply({ ok: true, status: 'diverged' })
+                return
+            }
+            for (let i = 0; i < imported.length; i += 1) {
+                const msg = imported[i]!
+                const step = steps[i]!
+                if (
+                    msg.localId !== `${importPrefix}${step.anchor}`
+                    || computeLocalTranscriptFingerprint(msg.content) !== step.fingerprint
+                ) {
+                    reply({ ok: true, status: 'diverged' })
+                    return
+                }
+            }
+            store.nativeSteps.recordSteps(sid, nativeId, steps.slice(0, imported.length))
+            if (steps.length === imported.length) {
+                reply({ ok: true, status: 'up_to_date', confirmedCount: imported.length })
+            } else {
+                reply({ ok: true, status: 'needs_backfill', fromIndex: imported.length })
+            }
+        } catch (err) {
+            console.error('reconcileNativeSteps failed', err)
+            reply({ ok: false })
+        }
+    })
+
+    socket.on('session-backfill-native-messages', (
+        data: unknown,
+        ack?: (response: { ok: true; inserted: number; confirmedCount: number } | { ok: false }) => void
+    ) => {
+        const reply = typeof ack === 'function' ? ack : () => {}
+        const parsed = backfillNativeMessagesSchema.safeParse(data)
+        if (!parsed.success) {
+            reply({ ok: false })
+            return
+        }
+        const sessionAccess = resolveSessionAccess(parsed.data.sid, { fresh: true })
+        if (!sessionAccess.ok) {
+            emitAccessError('session', parsed.data.sid, sessionAccess.reason)
+            reply({ ok: false })
+            return
+        }
+        const metadata = sessionAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+        if (metadata?.agyImportedAt == null || metadata.agySessionId !== parsed.data.nativeId) {
+            reply({ ok: false })
+            return
+        }
+        const appended: StoredMessage[] = []
+        try {
+            const { sid, nativeId, expectedOffset, messages } = parsed.data
+            const confirmedCount = store.runInTransaction(() => {
+                const currentCount = store.nativeSteps.getSteps(sid, nativeId).length
+                if (currentCount !== expectedOffset) {
+                    throw new Error('NATIVE_STEP_OFFSET_MISMATCH')
+                }
+                const ledgerSteps: Array<{ anchor: string; fingerprint: string }> = []
+                for (const item of messages) {
+                    if (item.localId !== `agy:${nativeId}:${item.anchor}`) {
+                        throw new Error('INVALID_NATIVE_LOCAL_ID')
+                    }
+                    const added = store.messages.addImportedMessage(
+                        sid,
+                        item.content,
+                        item.localId,
+                        item.createdAt
+                    )
+                    if (added.inserted) {
+                        appended.push(added.message)
+                    }
+                    ledgerSteps.push({
+                        anchor: item.anchor,
+                        fingerprint: computeLocalTranscriptFingerprint(item.content)
+                    })
+                }
+                store.nativeSteps.recordSteps(sid, nativeId, ledgerSteps)
+                return store.nativeSteps.getSteps(sid, nativeId).length
+            })
+            for (const msg of appended) {
+                const update = {
+                    id: randomUUID(),
+                    seq: msg.seq,
+                    createdAt: Date.now(),
+                    body: {
+                        t: 'new-message' as const,
+                        sid,
+                        message: {
+                            id: msg.id,
+                            seq: msg.seq,
+                            createdAt: msg.createdAt,
+                            localId: msg.localId,
+                            content: msg.content
+                        }
+                    }
+                }
+                socket.to(`session:${sid}`).emit('update', update)
+                onWebappEvent?.({
+                    type: 'message-received',
+                    sessionId: sid,
+                    message: {
+                        id: msg.id,
+                        seq: msg.seq,
+                        localId: msg.localId,
+                        content: msg.content,
+                        createdAt: msg.createdAt,
+                        invokedAt: msg.invokedAt,
+                        ...(msg.contentRevision ? { contentRevision: msg.contentRevision } : {})
+                    }
+                })
+            }
+            reply({ ok: true, inserted: appended.length, confirmedCount })
+        } catch (err) {
+            if (!(err instanceof Error && (err.message === 'NATIVE_STEP_OFFSET_MISMATCH' || err.message === 'INVALID_NATIVE_LOCAL_ID'))) {
+                console.error('backfillNativeMessages failed', err)
+            }
             reply({ ok: false })
         }
     })

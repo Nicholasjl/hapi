@@ -295,6 +295,29 @@ export interface ClientToServerEvents {
         },
         callback?: (response: { ok: boolean; inserted?: number }) => void
     ) => void
+    'session-reconcile-native-steps': (
+        data: {
+            sid: string
+            nativeId: string
+            steps: Array<{ anchor: string; fingerprint: string }>
+        },
+        callback?: (
+            response:
+                | { ok: true; status: 'up_to_date'; confirmedCount: number }
+                | { ok: true; status: 'needs_backfill'; fromIndex: number }
+                | { ok: true; status: 'diverged' }
+                | { ok: false }
+        ) => void
+    ) => void
+    'session-backfill-native-messages': (
+        data: {
+            sid: string
+            nativeId: string
+            expectedOffset: number
+            messages: Array<{ localId: string; anchor: string; createdAt: number; content: unknown }>
+        },
+        callback?: (response: { ok: true; inserted: number; confirmedCount: number } | { ok: false }) => void
+    ) => void
     'messages-indeterminate': (data: { sid: string; localIds: string[] }) => void
     /** Native shared-engine queue projection. null = positively acknowledged removal. */
     'native-queue-message': (data: { sid: string; localId: string; text: string | null }) => void
