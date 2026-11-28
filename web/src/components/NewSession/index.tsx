@@ -1462,6 +1462,7 @@ export function NewSession(props: {
         if (code === 'transcript_diverged') return t('agyImport.error.diverged')
         if (code === 'already_in_hapi') return t('agyImport.error.alreadyImported')
         if (code === 'session_active') return t('agyImport.error.active')
+        if (code === 'pending_native_flush') return t('agyImport.error.pendingFlush')
         return message?.trim() || t('agyImport.failed.body')
     }, [t])
 

@@ -200,6 +200,7 @@ export default {
   'agyImport.error.diverged': 'Локальный транскрипт Antigravity изменился после предыдущего импорта. Проверьте сессию перед продолжением.',
   'agyImport.error.alreadyImported': 'Эта сессия Antigravity уже импортирована в HAPI и не содержит новых сообщений.',
   'agyImport.error.active': 'Остановите активную сессию Hapi Antigravity перед импортом более новой нативной истории.',
+  'agyImport.error.pendingFlush': 'Antigravity всё ещё записывает недавние сообщения на диск. Подождите немного и повторите попытку.',
   'cursorImport.inline.title': 'Import Cursor history',
   'cursorImport.inline.description': 'Optional: choose an existing local Cursor chat to verify and continue.',
   'cursorImport.inline.clear': 'Clear',

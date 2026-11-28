@@ -335,14 +335,15 @@ export interface ClientToServerEvents {
         },
         callback?: (
             response:
-                | { ok: true; status: 'up_to_date'; confirmedCount: number }
+                | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
+                | { ok: true; status: 'pending_flush'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }
                 | {
                     ok: true
                     status: 'needs_reconcile'
                     fromIndex: number
                     pendingDeliveries: Array<
-                        | { kind: 'user'; localIds: string[]; texts: string[] }
+                        | { kind: 'user'; localIds: string[]; texts: string[]; uncertain?: boolean; awaitingResolution?: boolean }
                         | { kind: 'agent'; localId: string; data: Record<string, unknown> }
                     >
                 }
@@ -362,7 +363,7 @@ export interface ClientToServerEvents {
     'messages-indeterminate': (data: { sid: string; localIds: string[] }) => void
     /** Native shared-engine queue projection. null = positively acknowledged removal. */
     'native-queue-message': (data: { sid: string; localId: string; text: string | null }) => void
-    'messages-steer-state': (data: { sid: string; localIds: string[]; state: 'queued' | 'dispatching' }, cb: (response: { ok: boolean }) => void) => void
+    'messages-steer-state': (data: { sid: string; localIds: string[]; state: 'queued' | 'dispatching'; nativeId?: string }, cb: (response: { ok: boolean }) => void) => void
     'update-metadata': (data: { sid: string; expectedVersion: number; metadata: unknown }, cb: (answer: UpdateMetadataAck) => void) => void
     'update-state': (data: { sid: string; expectedVersion: number; agentState: unknown | null }, cb: (answer: UpdateStateAck) => void) => void
     'machine-alive': (data: { machineId: string; time: number; health?: unknown }) => void

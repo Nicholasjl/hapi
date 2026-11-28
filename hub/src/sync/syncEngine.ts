@@ -1028,7 +1028,7 @@ export class SyncEngine {
 
     private reconcileSteerDeliveryOwner(before: Session['metadata'], after: Session | undefined): void {
         const current = after?.metadata
-        if ((before?.flavor !== 'opencode' && before?.flavor !== 'claude')
+        if ((before?.flavor !== 'opencode' && before?.flavor !== 'claude' && before?.flavor !== 'agy')
             || current?.flavor !== before.flavor) return
         // Steer admission closes before an existing request finishes draining.
         // Only replacement of the owning worker ends its confirmation lease.
@@ -1041,7 +1041,7 @@ export class SyncEngine {
     private markSteerDispatchesUncertain(session: Session | undefined): void {
         // These launchers own confirmation through a single worker. Shared-client
         // runtimes have separate delivery ownership and are not fenced here.
-        if (session?.metadata?.flavor !== 'opencode' && session?.metadata?.flavor !== 'claude') return
+        if (session?.metadata?.flavor !== 'opencode' && session?.metadata?.flavor !== 'claude' && session?.metadata?.flavor !== 'agy') return
         const localIds = this.store.messages.markDispatchingMessagesIndeterminate(session.id)
         if (localIds.length > 0) {
             this.eventPublisher.emit({ type: 'messages-indeterminate', sessionId: session.id, localIds })

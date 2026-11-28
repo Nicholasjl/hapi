@@ -716,6 +716,38 @@ describe('MessageService.cancelQueuedMessage race scenarios', () => {
             expect(store.messages.lookupQueuedMessage(session.id, msg.id)).toEqual({ status: 'absent' })
             expect(publisher.events.some((event) => event.type === 'message-cancelled')).toBe(true)
         })
+
+        it('cleans up imported agy pending native deliveries when an indeterminate row is explicitly cancelled', async () => {
+            const store = makeStore()
+            const session = store.sessions.getOrCreateSession(
+                'agy-indeterminate-cancel',
+                { path: '/work', host: 'h1', flavor: 'agy', agyImportedAt: 100, agySessionId: 'native-agy-cancel' },
+                null,
+                'default'
+            )
+            const msg = store.messages.addMessage(
+                session.id,
+                { role: 'user', content: { type: 'text', text: 'discard agy' } },
+                'agy-u-cancel'
+            )
+            store.messages.markMessagesIndeterminate(session.id, [msg.localId!])
+            store.nativeSteps.recordPendingDelivery(session.id, 'native-agy-cancel', {
+                kind: 'user',
+                messageId: msg.id,
+                localIds: ['agy-u-cancel']
+            })
+            expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-agy-cancel')).toHaveLength(1)
+
+            const publisher = makePublisher()
+            const service = new MessageService(store, makeIo((callback) => {
+                callback(null, [{ removed: true }])
+            }), publisher as any)
+
+            const result = await service.cancelQueuedMessage(session.id, msg.id)
+            expect(result).toEqual({ status: 'cancelled', localId: 'agy-u-cancel' })
+            expect(store.messages.lookupQueuedMessage(session.id, msg.id)).toEqual({ status: 'absent' })
+            expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-agy-cancel')).toEqual([])
+        })
     })
 
     describe('Race-A: CLI ack removed:true → DELETE + status=cancelled', () => {

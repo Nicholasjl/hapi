@@ -3652,4 +3652,151 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             rmSync(brainDir, { recursive: true, force: true });
         }
     });
+
+    it('tracks imported prompt dispatch via setSteerDeliveryState until live activity or disk corroboration and holds ACP_INDETERMINATE prompts without restore', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-uncertain-dispatch-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            writeFileSync(stepsPath, '');
+
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            client.reconcileNativeSteps
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 0 })
+                .mockResolvedValue({ ok: true, status: 'up_to_date', confirmedCount: 0, unresolvedLocalIds: ['u-lost'] });
+            client.commitNativeSteps.mockResolvedValue({ ok: true, confirmedCount: 2, inserted: 0, updated: 0 });
+
+            const backend = new FakeAgyBackend();
+            let consumedDuringOnSent = 0;
+            backend.promptScripts.push(async (onUpdate) => {
+                consumedDuringOnSent = client.emitMessagesConsumed.mock.calls.length;
+                writeFileSync(stepsPath, [
+                    JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\nlive confirmed\n</USER_REQUEST>' }),
+                    JSON.stringify({ step_index: 1, type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'confirmed live reply' })
+                ].join('\n') + '\n');
+                onUpdate({ type: 'text', text: 'confirmed live reply' });
+                onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
+            });
+            backend.promptScripts.push(async () => {
+                const err = new Error('child exited mid prompt');
+                Object.defineProperty(err, ACP_INDETERMINATE_SYMBOL, { value: true });
+                throw err;
+            });
+
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+
+            // 1. Live activity turn: setSteerDeliveryState persisted before prompt; onSent does NOT consume early;
+            //    live output consumes with nativeId.
+            queue.push('live confirmed', REVIEW, 'u-ok');
+            await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['u-ok'], { nativeId: 'agy-conv-new' }));
+            expect(client.setSteerDeliveryState).toHaveBeenCalledWith(['u-ok'], 'dispatching', { nativeId: 'agy-conv-new' });
+            expect(consumedDuringOnSent).toBe(0);
+
+            // 2. ACP_INDETERMINATE error before output emits emitSteerIndeterminate without abort-restore or consumed.
+            queue.push('indeterminate prompt', REVIEW, 'u-lost');
+            await vi.waitFor(() => expect(client.emitSteerIndeterminate).toHaveBeenCalledWith(['u-lost']));
+            expect(client.sendSessionEvent.mock.calls.filter(([e]) => (e as { type?: string }).type === 'abort-restore')).toHaveLength(0);
+            expect(client.emitMessagesConsumed.mock.calls.some(([ids]) => ids.includes('u-lost'))).toBe(false);
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('permits reopen with unresolvedLocalIds without replay, gates new prompts, corroborates retry without duplicate prompt, and surfaces pending_flush as retryable', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-uncertain-reopen-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            writeFileSync(stepsPath, JSON.stringify({
+                step_index: 0,
+                type: 'USER_INPUT',
+                source: 'USER_EXPLICIT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\ninitial\n</USER_REQUEST>'
+            }) + '\n');
+
+            // 1. Reopen with status: 'pending_flush' fails as retryable (NOT diverged) without ready.
+            const pendingFlush = makeSession();
+            pendingFlush.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            pendingFlush.client.reconcileNativeSteps.mockResolvedValue({ ok: true, status: 'pending_flush', confirmedCount: 1 });
+            pendingFlush.queue.close();
+            await expect(launch(pendingFlush.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toMatchObject({ name: 'AgyNativeReconcileError', kind: 'retryable' });
+            expect(pendingFlush.client.emitSessionReady).not.toHaveBeenCalled();
+
+            // 2. Reopen with up_to_date + unresolvedLocalIds emits ready without automatic replay and blocks unrelated prompts.
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            client.reconcileNativeSteps
+                // Initial startup reconcile: u-1 unresolved (absent on disk).
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 1, unresolvedLocalIds: ['u-1'] })
+                // Triggered before u-2: still unresolved.
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 1, unresolvedLocalIds: ['u-1'] })
+                // Triggered on explicit Retry of u-1 after disk actually persisted u-1!
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 'needs_reconcile',
+                    fromIndex: 1,
+                    pendingDeliveries: [{
+                        kind: 'user',
+                        localIds: ['u-1'],
+                        texts: ['unresolved prompt'],
+                        uncertain: true,
+                        awaitingResolution: true
+                    }]
+                })
+                // Subsequent u-3: clear!
+                .mockResolvedValueOnce({ ok: true, status: 'up_to_date', confirmedCount: 2 });
+            client.commitNativeSteps.mockResolvedValue({ ok: true, confirmedCount: 2, inserted: 0, updated: 0 });
+
+            const backend = new FakeAgyBackend();
+            backend.promptScripts.push(async (onUpdate) => {
+                onUpdate({ type: 'text', text: 'after resolve' });
+                onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
+            });
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+            expect(backend.prompts).toHaveLength(0);
+
+            // Different prompt u-2 is blocked and restored to composer while u-1 remains unresolved.
+            queue.push('unrelated second prompt', REVIEW, 'u-2');
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'abort-restore',
+                text: 'unrelated second prompt'
+            }));
+            expect(backend.prompts).toHaveLength(0);
+            expect(sessionEvents(client)).toContainEqual({
+                type: 'error',
+                message: expect.stringContaining('unconfirmed delivery')
+            });
+
+            // Once u-1 is written to disk and explicitly retried, CLI corroborates it via commitNativeSteps
+            // and consumes it WITHOUT sending a duplicate prompt to Antigravity.
+            writeFileSync(stepsPath, [
+                JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\ninitial\n</USER_REQUEST>' }),
+                JSON.stringify({ step_index: 1, type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\nunresolved prompt\n</USER_REQUEST>' })
+            ].join('\n') + '\n');
+            queue.push('unresolved prompt', REVIEW, 'u-1');
+            await vi.waitFor(() => expect(client.commitNativeSteps).toHaveBeenCalledTimes(1));
+            await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['u-1']));
+            expect(backend.prompts).toHaveLength(0);
+
+            // Next prompt u-3 dispatches normally once u-1 is cleared.
+            queue.push('clean follow up', REVIEW, 'u-3');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(1));
+            expect(backend.prompts[0]).toEqual([{ type: 'text', text: 'clean follow up' }]);
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
 });

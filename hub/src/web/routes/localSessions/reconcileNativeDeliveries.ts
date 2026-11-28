@@ -199,8 +199,22 @@ export function mergeNativeReconcileContentPreservingCallId(existingContent: unk
 }
 
 export type EffectivePendingDelivery =
-    | { kind: 'user'; messageId: string; localIds: string[]; rows: StoredMessage[]; texts: string[] }
-    | { kind: 'agent'; messageId: string; localId: string; row: StoredMessage }
+    | {
+        kind: 'user'
+        messageId: string
+        localIds: string[]
+        rows: StoredMessage[]
+        texts: string[]
+        uncertain: boolean
+        awaitingResolution: boolean
+    }
+    | {
+        kind: 'agent'
+        messageId: string
+        localId: string
+        row: StoredMessage
+        uncertain: false
+    }
 
 export function collectEffectivePendingDeliveries(
     storedMessages: ReadonlyArray<StoredMessage>,
@@ -239,7 +253,7 @@ export function collectEffectivePendingDeliveries(
             let valid = true
             for (const lid of entry.localIds) {
                 const row = byLocalId.get(lid)
-                if (!row || row.invokedAt === null) {
+                if (!row) {
                     valid = false
                     break
                 }
@@ -253,12 +267,18 @@ export function collectEffectivePendingDeliveries(
                 coveredMessageIds.add(row.id)
             }
             coveredMessageIds.add(entry.messageId)
+            const uncertain = rows.some((row) => row.invokedAt === null)
+            const awaitingResolution = rows.some(
+                (row) => row.invokedAt === null && row.deliveryState === 'indeterminate'
+            )
             result.push({
                 kind: 'user',
                 messageId: entry.messageId,
                 localIds: rows.map((row) => row.localId!),
                 rows,
-                texts
+                texts,
+                uncertain,
+                awaitingResolution
             })
         } else {
             const localId = entry.localIds[0] ?? anchorRow.localId
@@ -268,7 +288,8 @@ export function collectEffectivePendingDeliveries(
                 kind: 'agent',
                 messageId: entry.messageId,
                 localId,
-                row: anchorRow
+                row: anchorRow,
+                uncertain: false
             })
         }
     }
@@ -286,7 +307,28 @@ export function collectEffectivePendingDeliveries(
                 kind: 'agent',
                 messageId: msg.id,
                 localId: msg.localId,
-                row: msg
+                row: msg,
+                uncertain: false
+            })
+            continue
+        }
+        if (
+            msg.invokedAt === null
+            && msg.deliveryState === 'indeterminate'
+            && typeof msg.localId === 'string'
+            && !coveredMessageIds.has(msg.id)
+        ) {
+            const texts = buildUserCandidateTexts([msg])
+            if (texts.length === 0) continue
+            coveredMessageIds.add(msg.id)
+            result.push({
+                kind: 'user',
+                messageId: msg.id,
+                localIds: [msg.localId],
+                rows: [msg],
+                texts,
+                uncertain: true,
+                awaitingResolution: true
             })
         }
     }
@@ -295,7 +337,7 @@ export function collectEffectivePendingDeliveries(
 }
 
 export type SerializedPendingNativeDelivery =
-    | { kind: 'user'; localIds: string[]; texts: string[] }
+    | { kind: 'user'; localIds: string[]; texts: string[]; uncertain: boolean; awaitingResolution: boolean }
     | { kind: 'agent'; localId: string; data: Record<string, unknown> }
 
 export function serializePendingDeliveriesForCli(
@@ -307,7 +349,9 @@ export function serializePendingDeliveriesForCli(
             serialized.push({
                 kind: 'user',
                 localIds: [...entry.localIds],
-                texts: [...entry.texts]
+                texts: [...entry.texts],
+                uncertain: entry.uncertain,
+                awaitingResolution: entry.awaitingResolution
             })
         } else {
             const data = unwrapAgentPayload(entry.row.content)
@@ -336,7 +380,11 @@ export type MatchPendingDeliveriesResult =
         reconciledSteps: Array<{ anchor: string; fingerprint: string; messageId: string }>
         reconciledUpdates: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }>
         resolvedPendingMessageIds: string[]
+        corroboratedUserLocalIds: string[]
+        demoteDispatchingLocalIds: string[]
+        hasUnresolvedUncertain: boolean
     }
+    | { status: 'pending_flush'; message: string }
     | { status: 'diverged'; message: string }
 
 export function matchPendingDeliveriesAgainstTranscript(
@@ -356,6 +404,8 @@ export function matchPendingDeliveriesAgainstTranscript(
     const reconciledUpdates: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }> = []
     const intermediateBackfills: LocalTranscriptMessage[] = []
     const resolvedPendingMessageIds: string[] = []
+    const corroboratedUserLocalIds: string[] = []
+    const unresolvedUncertain: Array<Extract<EffectivePendingDelivery, { kind: 'user' }>> = []
 
     let dIdx = 0
     let pIdx = 0
@@ -377,6 +427,9 @@ export function matchPendingDeliveriesAgainstTranscript(
                 messageId: pending.messageId
             })
             resolvedPendingMessageIds.push(pending.messageId)
+            if (pending.kind === 'user' && pending.uncertain) {
+                corroboratedUserLocalIds.push(...pending.localIds)
+            }
             dIdx += 1
             pIdx += 1
             continue
@@ -427,13 +480,44 @@ export function matchPendingDeliveriesAgainstTranscript(
             continue
         }
 
+        if (pending.kind === 'user' && pending.uncertain) {
+            unresolvedUncertain.push(pending)
+            pIdx += 1
+            continue
+        }
+
         break
     }
 
-    if (pIdx < effectivePending.length) {
+    let hasUnmatchedCorroborated = false
+    for (let i = pIdx; i < effectivePending.length; i += 1) {
+        const pending = effectivePending[i]!
+        if (pending.kind === 'user' && pending.uncertain) {
+            unresolvedUncertain.push(pending)
+        } else {
+            hasUnmatchedCorroborated = true
+        }
+    }
+
+    if (hasUnmatchedCorroborated) {
+        if (tailMessages.length === 0) {
+            return {
+                status: 'pending_flush',
+                message: 'Antigravity has not finished writing uncommitted live messages to disk yet; retry shortly.'
+            }
+        }
         return {
             status: 'diverged',
             message: 'Uncommitted HAPI live turns conflict with the Antigravity native transcript'
+        }
+    }
+
+    const demoteSet = new Set<string>()
+    for (const pending of unresolvedUncertain) {
+        for (const row of pending.rows) {
+            if (row.invokedAt === null && row.deliveryPending === true && typeof row.localId === 'string') {
+                demoteSet.add(row.localId)
+            }
         }
     }
 
@@ -442,6 +526,9 @@ export function matchPendingDeliveriesAgainstTranscript(
         delta: [...intermediateBackfills, ...tailMessages.slice(dIdx)],
         reconciledSteps,
         reconciledUpdates,
-        resolvedPendingMessageIds
+        resolvedPendingMessageIds,
+        corroboratedUserLocalIds,
+        demoteDispatchingLocalIds: [...demoteSet],
+        hasUnresolvedUncertain: unresolvedUncertain.length > 0
     }
 }

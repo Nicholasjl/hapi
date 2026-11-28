@@ -7,7 +7,7 @@ import { Store } from '../store'
 import { RpcRegistry } from '../socket/rpcRegistry'
 import { SyncEngine } from './syncEngine'
 
-function createEngine(store = new Store(':memory:'), flavor: 'opencode' | 'claude' | 'codex' | 'cursor' = 'opencode') {
+function createEngine(store = new Store(':memory:'), flavor: 'opencode' | 'claude' | 'agy' | 'codex' | 'cursor' = 'opencode') {
     const events: SyncEvent[] = []
     const io = { of: () => ({ to: () => ({ emit() {} }) }) }
     const engine = new SyncEngine(store, io as never, new RpcRegistry(), { broadcast(event: SyncEvent) { events.push(event) } } as never)
@@ -28,7 +28,7 @@ function expectUnknown(store: Store, engine: SyncEngine, sessionId: string) {
     expect(engine.getDeliverableMessagesAfter(sessionId, { afterSeq: 0, limit: 100, now: Date.now() }).map(message => message.localId)).not.toContain('pending')
 }
 
-describe.each(['opencode', 'claude'] as const)('%s pending delivery ownership', (flavor) => {
+describe.each(['opencode', 'claude', 'agy'] as const)('%s pending delivery ownership', (flavor) => {
     it('holds only unconfirmed dispatches as unknown when the session ends', () => {
         const { store, engine, session, events } = createEngine(new Store(':memory:'), flavor)
         const other = store.sessions.getOrCreateSession('other', { path: '/tmp/other', flavor: 'opencode' }, null, 'other-namespace')

@@ -271,6 +271,7 @@ export default {
   'agyImport.error.diverged': 'The local Antigravity transcript changed after the previous import. Review the session before continuing.',
   'agyImport.error.alreadyImported': 'This Antigravity session is already imported into HAPI and has no new messages to add.',
   'agyImport.error.active': 'Stop the active Hapi Antigravity session before importing newer native history.',
+  'agyImport.error.pendingFlush': 'Antigravity is still finishing writing recent messages to disk. Wait a moment and try again.',
   'cursorImport.inline.title': 'Import Cursor history',
   'cursorImport.inline.description': 'Optional: choose an existing local Cursor chat to verify and continue.',
   'cursorImport.inline.clear': 'Clear',

@@ -689,6 +689,10 @@ export class MessageService {
             if (recheck.status !== 'absent') {
                 return { status: 'busy', localId }
             }
+            const meta = this.store.sessions.getSession(sessionId)?.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
+            if (meta?.agyImportedAt != null && typeof meta.agySessionId === 'string' && meta.agySessionId.length > 0) {
+                this.store.nativeSteps.removePendingDeliveriesByLocalIds(sessionId, meta.agySessionId, [localId])
+            }
             this.publisher.emit({ type: 'message-cancelled', sessionId, messageId, localId })
             return { status: 'cancelled', localId }
         }

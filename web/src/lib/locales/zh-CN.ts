@@ -271,6 +271,7 @@ export default {
   'agyImport.error.diverged': '本机 Antigravity 记录在上次导入后发生变化，请先检查会话再继续。',
   'agyImport.error.alreadyImported': '该 Antigravity session 已导入 HAPI，没有可新增的消息。',
   'agyImport.error.active': '请先停止正在运行的 Hapi Antigravity session，再导入新增的原生历史。',
+  'agyImport.error.pendingFlush': 'Antigravity 仍在将近期消息写入磁盘，请稍候重试。',
   'cursorImport.inline.title': '导入 Cursor 历史',
   'cursorImport.inline.description': '可选：选择本机已有的 Cursor 会话，校验后继续对话。',
   'cursorImport.inline.clear': '清除',

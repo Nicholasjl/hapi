@@ -672,7 +672,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
     })
 
     socket.on('messages-steer-state', (
-        data: { sid: string; localIds: string[]; state: 'queued' | 'dispatching' },
+        data: { sid: string; localIds: string[]; state: 'queued' | 'dispatching'; nativeId?: string },
         ack?: (response: { ok: boolean }) => void
     ) => {
         const reply = typeof ack === 'function' ? ack : () => {}
@@ -693,12 +693,42 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         try {
-            const ok = store.recordSteerDeliveryState(
-                data.sid,
-                localIds,
-                data.state,
-                sessionAccess.value.namespace
-            )
+            const nativeId = typeof data.nativeId === 'string' && data.nativeId.length > 0 ? data.nativeId : null
+            const ok = store.runInTransaction(() => {
+                const transitioned = store.recordSteerDeliveryState(
+                    data.sid,
+                    localIds,
+                    data.state,
+                    sessionAccess.value.namespace
+                )
+                if (!transitioned || !nativeId) {
+                    return transitioned
+                }
+                const freshAccess = resolveSessionAccess(data.sid, { fresh: true })
+                const metadata = freshAccess.ok
+                    ? (freshAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null)
+                    : null
+                if (metadata?.agyImportedAt != null && metadata.agySessionId === nativeId) {
+                    if (data.state === 'dispatching') {
+                        const idSet = new Set(localIds)
+                        const matchedRows = store.messages.getAllMessages(data.sid)
+                            .filter((m) => m.localId && idSet.has(m.localId))
+                            .sort((a, b) => a.seq - b.seq)
+                        if (matchedRows.length > 0) {
+                            const anchorRow = matchedRows[matchedRows.length - 1]!
+                            store.nativeSteps.recordPendingDelivery(
+                                data.sid,
+                                nativeId,
+                                { kind: 'user', messageId: anchorRow.id, localIds: matchedRows.map((row) => row.localId!) },
+                                Date.now()
+                            )
+                        }
+                    } else {
+                        store.nativeSteps.removePendingDeliveriesByLocalIds(data.sid, nativeId, localIds)
+                    }
+                }
+                return true
+            })
             reply({ ok })
             if (ok) {
                 onWebappEvent?.(data.state === 'queued'
@@ -871,6 +901,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
 
                 const ledgerSteps: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
+                const corroboratedLocalIdSet = new Set<string>()
                 let insertedCount = 0
                 let updatedCount = 0
                 for (let i = overlap; i < entries.length; i += 1) {
@@ -894,6 +925,11 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                         }
                         if (!storedHapiMessagesMatchNativeContent(targetRows, entry.content)) {
                             throw new NativeCommitError('content_mismatch')
+                        }
+                        for (const row of targetRows) {
+                            if (row.invokedAt === null && typeof row.localId === 'string') {
+                                corroboratedLocalIdSet.add(row.localId)
+                            }
                         }
                         const anchorRow = targetRows.reduce((latest, row) => (row.seq > latest.seq ? row : latest), targetRows[0]!)
                         committedMessageIds.push(anchorRow.id)
@@ -970,8 +1006,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                         messageId: added.message.id
                     })
                 }
+                const now = Date.now()
+                const corroboratedLocalIds = [...corroboratedLocalIdSet]
+                if (corroboratedLocalIds.length > 0) {
+                    store.messages.markMessagesInvoked(sid, corroboratedLocalIds, now)
+                }
                 if (ledgerSteps.length > 0) {
-                    const { inserted } = store.nativeSteps.recordSteps(sid, nativeId, ledgerSteps)
+                    const { inserted } = store.nativeSteps.recordSteps(sid, nativeId, ledgerSteps, now)
                     if (inserted !== ledgerSteps.length) {
                         throw new NativeCommitError('offset_mismatch')
                     }
@@ -982,16 +1023,31 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 return {
                     confirmedCount: store.nativeSteps.getSteps(sid, nativeId).length,
                     inserted: insertedCount,
-                    updated: updatedCount
+                    updated: updatedCount,
+                    corroboratedLocalIds,
+                    invokedAt: now
                 }
             })
+            if (result.corroboratedLocalIds.length > 0) {
+                onWebappEvent?.({
+                    type: 'messages-consumed',
+                    sessionId: sid,
+                    localIds: result.corroboratedLocalIds,
+                    invokedAt: result.invokedAt
+                })
+            }
             for (const msg of appended) {
                 broadcastMessageUpdate(sid, msg)
             }
             for (const msg of updatedMessages) {
                 broadcastMessageUpdate(sid, msg)
             }
-            reply({ ok: true, ...result })
+            reply({
+                ok: true,
+                confirmedCount: result.confirmedCount,
+                inserted: result.inserted,
+                updated: result.updated
+            })
         } catch (err) {
             if (err instanceof NativeCommitError) {
                 reply({ ok: false, reason: err.reason })
@@ -1006,14 +1062,15 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         data: unknown,
         ack?: (
             response:
-                | { ok: true; status: 'up_to_date'; confirmedCount: number }
+                | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
+                | { ok: true; status: 'pending_flush'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }
                 | {
                     ok: true
                     status: 'needs_reconcile'
                     fromIndex: number
                     pendingDeliveries: Array<
-                        | { kind: 'user'; localIds: string[]; texts: string[] }
+                        | { kind: 'user'; localIds: string[]; texts: string[]; uncertain?: boolean; awaitingResolution?: boolean }
                         | { kind: 'agent'; localId: string; data: Record<string, unknown> }
                     >
                 }
@@ -1084,14 +1141,34 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     }
                     priorIndex = sourceIndex
                 }
+                const demoted = store.messages.markDispatchingMessagesIndeterminate(sid)
+                if (demoted.length > 0) {
+                    onWebappEvent?.({ type: 'messages-indeterminate', sessionId: sid, localIds: demoted })
+                }
+                const latestStoredMessages = demoted.length > 0 ? store.messages.getAllMessages(sid) : storedMessages
                 const effectivePending = collectEffectivePendingDeliveries(
-                    storedMessages,
+                    latestStoredMessages,
                     recorded,
                     store.nativeSteps.getPendingDeliveries(sid, nativeId)
                 )
                 if (effectivePending.length > 0) {
                     if (steps.length === recorded.length) {
-                        reply({ ok: true, status: 'diverged' })
+                        const hasCorroborated = effectivePending.some((entry) => !entry.uncertain)
+                        if (hasCorroborated) {
+                            reply({ ok: true, status: 'pending_flush', confirmedCount: recorded.length })
+                            return
+                        }
+                        const unresolvedLocalIds = Array.from(new Set(
+                            effectivePending.flatMap((entry) =>
+                                entry.kind === 'user' && entry.awaitingResolution ? entry.localIds : []
+                            )
+                        ))
+                        reply({
+                            ok: true,
+                            status: 'up_to_date',
+                            confirmedCount: recorded.length,
+                            ...(unresolvedLocalIds.length > 0 ? { unresolvedLocalIds } : {})
+                        })
                         return
                     }
                     reply({

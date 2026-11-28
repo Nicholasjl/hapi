@@ -1438,13 +1438,18 @@ if (isReconnect) {
     }
 
     /** Persist the durable pre-dispatch/restore state with a hub ACK. */
-    async setSteerDeliveryState(localIds: string[], state: 'queued' | 'dispatching'): Promise<boolean> {
+    async setSteerDeliveryState(
+        localIds: string[],
+        state: 'queued' | 'dispatching',
+        options?: { nativeId?: string }
+    ): Promise<boolean> {
         if (localIds.length === 0 || this.state !== 'active') return false
         try {
             const response = await this.socket.timeout(5_000).emitWithAck('messages-steer-state', {
                 sid: this.sessionId,
                 localIds,
-                state
+                state,
+                ...(options?.nativeId ? { nativeId: options.nativeId } : {})
             })
             return response?.ok === true
         } catch (error) {
@@ -1818,14 +1823,15 @@ if (isReconnect) {
         steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
         timeoutMs: number = 5_000
     ): Promise<
-        | { ok: true; status: 'up_to_date'; confirmedCount: number }
+        | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
+        | { ok: true; status: 'pending_flush'; confirmedCount: number }
         | { ok: true; status: 'needs_backfill'; fromIndex: number }
         | {
             ok: true
             status: 'needs_reconcile'
             fromIndex: number
             pendingDeliveries: Array<
-                | { kind: 'user'; localIds: string[]; texts: string[] }
+                | { kind: 'user'; localIds: string[]; texts: string[]; uncertain?: boolean; awaitingResolution?: boolean }
                 | { kind: 'agent'; localId: string; data: Record<string, unknown> }
             >
         }

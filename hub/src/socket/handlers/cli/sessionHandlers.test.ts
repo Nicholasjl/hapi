@@ -1177,18 +1177,121 @@ describe('session-commit-native-steps handler', () => {
             status: 'needs_reconcile',
             fromIndex: 1,
             pendingDeliveries: [
-                { kind: 'user', localIds: ['u-live'], texts: ['live turn'] },
+                { kind: 'user', localIds: ['u-live'], texts: ['live turn'], uncertain: false, awaitingResolution: false },
                 { kind: 'agent', localId: 'agy-live:partial-1', data: { type: 'message', message: 'live partial' } }
             ]
         })
 
-        // If disk didn't advance past step:0:0 while pending deliveries exist, reconcile reports diverged.
+        // If disk didn't advance past step:0:0 while corroborated pending deliveries exist, reconcile reports pending_flush (retryable).
         socket.trigger('session-reconcile-native-steps', {
             sid: session.id,
             nativeId: 'native-pend',
             steps: [{ anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0) }]
         }, (resp) => acks.push(resp))
-        expect(acks[1]).toEqual({ ok: true, status: 'diverged' })
+        expect(acks[1]).toEqual({ ok: true, status: 'pending_flush', confirmedCount: 1 })
+        store.close()
+    })
+
+    it('tracks dispatched user prompts via messages-steer-state until disk corroborates, demotes dispatching to indeterminate, and does not falsely diverge', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-uncertain-dispatch',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-uncertain' },
+            null,
+            'default'
+        )
+        const s0 = userContent('seed prompt')
+        const m0 = store.messages.addImportedMessage(session.id, s0, 'agy:native-uncertain:step:0:0', 10).message
+        store.nativeSteps.recordSteps(session.id, 'native-uncertain', [
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0), messageId: m0.id }
+        ])
+
+        const events: SyncEvent[] = []
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: (sid, opts) => {
+                void opts
+                const found = store.sessions.getSession(sid)
+                return found ? { ok: true, value: found } : { ok: false, reason: 'not-found' }
+            },
+            emitAccessError() {},
+            onWebappEvent: (event) => events.push(event)
+        })
+
+        // Dispatch before disk flush: stays un-invoked in deliveryState='dispatching' with pending delivery record.
+        const queued = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'uncertain turn' } }, 'u-dispatch', null, 20)
+        expect(queued.invokedAt).toBeNull()
+        const steerAcks: Array<unknown> = []
+        socket.trigger('messages-steer-state', {
+            sid: session.id,
+            localIds: ['u-dispatch'],
+            state: 'dispatching',
+            nativeId: 'native-uncertain'
+        }, (resp) => steerAcks.push(resp))
+        expect(steerAcks[0]).toEqual({ ok: true })
+        expect(store.messages.lookupQueuedMessage(session.id, 'u-dispatch').status).toBe('dispatching')
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-uncertain')).toHaveLength(1)
+
+        // Crash & reopen while disk did not advance past step:0:0: demotes dispatching -> indeterminate,
+        // emits messages-indeterminate, and returns up_to_date with unresolvedLocalIds (NOT diverged).
+        const reconcileAcks: Array<unknown> = []
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-uncertain',
+            steps: [{ anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0) }]
+        }, (resp) => reconcileAcks.push(resp))
+        expect(reconcileAcks[0]).toEqual({
+            ok: true,
+            status: 'up_to_date',
+            confirmedCount: 1,
+            unresolvedLocalIds: ['u-dispatch']
+        })
+        expect(store.messages.lookupQueuedMessage(session.id, 'u-dispatch').status).toBe('indeterminate')
+        expect(events).toContainEqual({ type: 'messages-indeterminate', sessionId: session.id, localIds: ['u-dispatch'] })
+
+        // Once disk later persists that prompt, reconcile returns needs_reconcile with uncertain: true,
+        // and session-commit-native-steps corroborates the row (stamping invokedAt + emitting messages-consumed).
+        const s1 = userContent('uncertain turn')
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-uncertain',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(s0) },
+                { anchor: 'step:1:0', fingerprint: computeLocalTranscriptFingerprint(s1) }
+            ]
+        }, (resp) => reconcileAcks.push(resp))
+        expect(reconcileAcks[1]).toEqual({
+            ok: true,
+            status: 'needs_reconcile',
+            fromIndex: 1,
+            pendingDeliveries: [{
+                kind: 'user',
+                localIds: ['u-dispatch'],
+                texts: ['uncertain turn'],
+                uncertain: true,
+                awaitingResolution: true
+            }]
+        })
+
+        const commitAcks: Array<unknown> = []
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-uncertain',
+            expectedOffset: 1,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:1:0',
+                fingerprint: computeLocalTranscriptFingerprint(s1),
+                targetLocalIds: ['u-dispatch'],
+                content: s1,
+                createdAt: 21
+            }]
+        }, (resp) => commitAcks.push(resp))
+        expect(commitAcks[0]).toEqual({ ok: true, confirmedCount: 2, inserted: 0, updated: 0 })
+        expect(store.messages.lookupQueuedMessage(session.id, 'u-dispatch').status).toBe('invoked')
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-uncertain')).toEqual([])
+        expect(events).toContainEqual(expect.objectContaining({ type: 'messages-consumed', sessionId: session.id, localIds: ['u-dispatch'] }))
         store.close()
     })
 

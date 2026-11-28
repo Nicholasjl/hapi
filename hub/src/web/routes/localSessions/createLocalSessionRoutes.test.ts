@@ -1335,13 +1335,49 @@ describe('generic local session routes', () => {
         })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
         expect(repeatAfterRecover.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
 
-        // 4. Verified conflict (uncommitted agy-live: agent message that does not match next native step) fails closed with transcript_diverged.
+        // 3c. Interrupted prompt dispatch before disk write (deliveryState = 'dispatching') does NOT diverge on re-import:
+        //     unchanged disk demotes dispatching -> indeterminate, and later native flush corroborates & marks it invoked.
+        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'uncertain crash turn' }, meta: { sentFrom: 'web' } }, 'uncertain-u-1', null, 66)
+        handlers.get('messages-steer-state')!(
+            { sid: hapiId, localIds: ['uncertain-u-1'], state: 'dispatching', nativeId: 'agy-e2e' },
+            () => {}
+        )
+        expect(store.messages.lookupQueuedMessage(hapiId, 'uncertain-u-1').status).toBe('dispatching')
+        expect(store.nativeSteps.getPendingDeliveries(hapiId, 'agy-e2e')).toHaveLength(1)
+
+        const uncertainPreFlushRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number; error?: { code: string } }> }
+        expect(uncertainPreFlushRes.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
+        expect(store.messages.lookupQueuedMessage(hapiId, 'uncertain-u-1').status).toBe('indeterminate')
+
+        const s11bUser = nativeUser('agy-e2e', 'step:11b:0', 'uncertain crash turn', 66)
+        const s11cReply = nativeAgent('agy-e2e', 'step:11c:text', 'uncertain crash reply', 67)
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9CrashUser, s10CrashFull, s11Offline, s11bUser, s11cReply] }
+
+        const uncertainFlushedRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(uncertainFlushedRes.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 1 })
+        expect(store.messages.lookupQueuedMessage(hapiId, 'uncertain-u-1').status).toBe('invoked')
+        expect(store.nativeSteps.getPendingDeliveries(hapiId, 'agy-e2e')).toEqual([])
+
+        // 3d. Corroborated agy-live: message while disk hasn't caught up yet returns retryable pending_native_flush (NOT transcript_diverged).
         store.messages.addMessage(hapiId, {
             role: 'agent',
-            content: { type: 'codex', data: { type: 'message', message: 'uncommitted conflicting live' } }
-        }, 'agy-live:trailing', null, 70)
+            content: { type: 'codex', data: { type: 'message', message: 'still flushing reply' } }
+        }, 'agy-live:flushing', null, 68)
+        const flushWaitRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; error?: { code: string } }> }
+        expect(flushWaitRes.results[0]?.error?.code).toBe('pending_native_flush')
+
+        // 4. Verified conflict (uncommitted agy-live: agent message that does not match next native step) fails closed with transcript_diverged.
         const s12 = nativeUser('agy-e2e', 'step:12:0', 'another native prompt', 75)
-        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9CrashUser, s10CrashFull, s11Offline, s12] }
+        agySession = { ...agySession, messages: [...allSteps, s4, s5Full, lateDiskReply, ...nativeTail, s9CrashUser, s10CrashFull, s11Offline, s11bUser, s11cReply, s12] }
         const divRes = await (await app.request('/api/agy/import-sessions', {
             method: 'POST',
             body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })

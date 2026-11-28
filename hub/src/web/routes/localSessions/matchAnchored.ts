@@ -33,9 +33,12 @@ export type AnchoredMatchResult =
         reconciledSteps?: Array<{ anchor: string; fingerprint: string; messageId: string }>
         reconciledUpdates?: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }>
         resolvedPendingMessageIds?: string[]
+        corroboratedUserLocalIds?: string[]
+        demoteDispatchingLocalIds?: string[]
     }
     | { status: 'transcript_diverged'; message: string }
     | { status: 'already_in_hapi'; message: string }
+    | { status: 'pending_native_flush'; message: string }
 
 export type RecordedNativeStep = {
     anchor: string
@@ -183,6 +186,12 @@ export function matchAnchored(options: {
         const tail = sourceMessages.slice(recordedNativeSteps.length)
         if (effectivePending.length > 0) {
             const matched = matchPendingDeliveriesAgainstTranscript(tail, effectivePending)
+            if (matched.status === 'pending_flush') {
+                return {
+                    status: 'pending_native_flush',
+                    message: matched.message
+                }
+            }
             if (matched.status !== 'ok') {
                 return {
                     status: 'transcript_diverged',
@@ -194,7 +203,9 @@ export function matchAnchored(options: {
                 delta: matched.delta,
                 reconciledSteps: matched.reconciledSteps,
                 reconciledUpdates: matched.reconciledUpdates,
-                resolvedPendingMessageIds: matched.resolvedPendingMessageIds
+                resolvedPendingMessageIds: matched.resolvedPendingMessageIds,
+                corroboratedUserLocalIds: matched.corroboratedUserLocalIds,
+                demoteDispatchingLocalIds: matched.demoteDispatchingLocalIds
             }
         }
         return { status: 'ok', delta: tail }

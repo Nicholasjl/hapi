@@ -451,5 +451,76 @@ describe('anchored match: Antigravity native step ledger', () => {
             cursor: null,
             recordedNativeSteps: linkedLedger
         })).toEqual({ status: 'ok', delta: [s2] })
+
+        // Uncertain dispatching user prompt with unchanged disk: demotes dispatching -> indeterminate, NOT diverged.
+        const uncertainDispatch = {
+            ...agyStoredUser(3, 'u-uncertain', 'unsaved prompt', 12),
+            invokedAt: null,
+            deliveryState: 'indeterminate' as const,
+            deliveryPending: true as const
+        }
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, uncertainDispatch],
+            transcript: agyTranscript([s0, s1]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: uncertainDispatch.id, localIds: ['u-uncertain'] }
+            ]
+        })).toMatchObject({
+            status: 'ok',
+            delta: [],
+            demoteDispatchingLocalIds: ['u-uncertain'],
+            corroboratedUserLocalIds: []
+        })
+
+        // Uncertain user prompt when disk later writes a DIFFERENT native turn: appends native turn and keeps prompt indeterminate.
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, uncertainDispatch],
+            transcript: agyTranscript([s0, s1, s2]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: uncertainDispatch.id, localIds: ['u-uncertain'] }
+            ]
+        })).toMatchObject({
+            status: 'ok',
+            delta: [s2],
+            demoteDispatchingLocalIds: ['u-uncertain'],
+            corroboratedUserLocalIds: []
+        })
+
+        // Uncertain user prompt matched on disk: corroborates localId so importer marks it invoked + links step.
+        const matchingDiskUser = agyNativeUser('step:2:0', 'unsaved prompt')
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, uncertainDispatch],
+            transcript: agyTranscript([s0, s1, matchingDiskUser]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: uncertainDispatch.id, localIds: ['u-uncertain'] }
+            ]
+        })).toMatchObject({
+            status: 'ok',
+            delta: [],
+            corroboratedUserLocalIds: ['u-uncertain'],
+            resolvedPendingMessageIds: [uncertainDispatch.id],
+            demoteDispatchingLocalIds: []
+        })
+
+        // Corroborated agy-live message still awaiting disk flush returns retryable pending_native_flush, not diverged.
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, pendingAgent],
+            transcript: agyTranscript([s0, s1]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
+            ]
+        }).status).toBe('pending_native_flush')
     })
 })

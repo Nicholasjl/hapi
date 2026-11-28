@@ -256,7 +256,7 @@ type ImportedReconcileState =
     | { status: 'diverged'; reason: string };
 
 type PendingNativeDelivery =
-    | { kind: 'user'; localIds: string[]; texts: string[] }
+    | { kind: 'user'; localIds: string[]; texts: string[]; uncertain?: boolean; awaitingResolution?: boolean }
     | { kind: 'agent'; localId: string; data: CodexMessage };
 
 type NativeCommitEntry = Parameters<NonNullable<AgySession['client']['commitNativeSteps']>>[2][number];
@@ -495,6 +495,8 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
     private confirmedNativeMaxStepIndex = -1;
     private readonly pendingNativeDeliveries: PendingNativeDelivery[] = [];
     private readonly liveToolCallLocalIds = new Map<string, string>();
+    private readonly unresolvedNativeUserLocalIds = new Set<string>();
+    private readonly corroboratedNativeUserLocalIds = new Set<string>();
     private lastTranscriptStepIndex = -1;
     // Latest step_index seen when an unfinished wakeup hit `maxIdleMs`, so
     // tracking resumes as soon as late output appends a newer step.
@@ -664,6 +666,8 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         this.confirmedNativeMaxStepIndex = -1;
         this.pendingNativeDeliveries.length = 0;
         this.liveToolCallLocalIds.clear();
+        this.unresolvedNativeUserLocalIds.clear();
+        this.corroboratedNativeUserLocalIds.clear();
     }
 
     private async reconcileImportedNativeSteps(): Promise<void> {
@@ -720,6 +724,14 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             };
             return;
         }
+        this.unresolvedNativeUserLocalIds.clear();
+        if (res.status === 'pending_flush') {
+            this.importedReconcileState = {
+                status: 'retryable',
+                reason: 'Waiting for Antigravity native transcript to finish writing uncommitted live messages; retry shortly.'
+            };
+            return;
+        }
         if (res.status === 'needs_reconcile') {
             if (res.fromIndex < 0 || res.fromIndex > snapshot.messages.length) {
                 this.importedReconcileState = {
@@ -736,7 +748,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     this.pendingNativeDeliveries.push({
                         kind: 'user',
                         localIds: [...item.localIds],
-                        texts: [...item.texts]
+                        texts: [...item.texts],
+                        ...(item.uncertain !== undefined ? { uncertain: item.uncertain } : {}),
+                        ...(item.awaitingResolution !== undefined ? { awaitingResolution: item.awaitingResolution } : {})
                     });
                 } else {
                     const data = item.data as CodexMessage;
@@ -754,12 +768,25 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 const committed = await this.commitSettledNativeSteps();
                 if (!committed) return;
                 if (this.pendingNativeDeliveries.length > 0) {
+                    const hasHardConflict = this.pendingNativeDeliveries.some(
+                        (item) => item.kind !== 'user' || item.uncertain !== true
+                    );
+                    if (hasHardConflict) {
+                        this.pendingNativeDeliveries.length = 0;
+                        this.importedReconcileState = {
+                            status: 'diverged',
+                            reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
+                        };
+                        return;
+                    }
+                    for (const item of this.pendingNativeDeliveries) {
+                        if (item.kind === 'user' && item.awaitingResolution !== false) {
+                            for (const lid of item.localIds) {
+                                this.unresolvedNativeUserLocalIds.add(lid);
+                            }
+                        }
+                    }
                     this.pendingNativeDeliveries.length = 0;
-                    this.importedReconcileState = {
-                        status: 'diverged',
-                        reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
-                    };
-                    return;
                 }
             }
             if (this.confirmedNativeStepCount < snapshot.messages.length) {
@@ -800,6 +827,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             this.confirmedNativeStepCount = snapshot.messages.length;
         } else {
             this.confirmedNativeStepCount = res.confirmedCount;
+            for (const lid of res.unresolvedLocalIds ?? []) {
+                this.unresolvedNativeUserLocalIds.add(lid);
+            }
         }
         this.confirmedNativeMaxStepIndex = Math.max(this.confirmedNativeMaxStepIndex, snapshot.maxStepIndex);
         this.lastTranscriptStepIndex = Math.max(this.lastTranscriptStepIndex, snapshot.maxStepIndex);
@@ -843,6 +873,8 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         }
 
         const entries: NativeCommitEntry[] = [];
+        const unresolvedDuringCommit: PendingNativeDelivery[] = [];
+        const matchedUncertainUserLocalIds: string[] = [];
         let dIdx = 0;
         let pIdx = 0;
         while (dIdx < candidateMessages.length && pIdx < this.pendingNativeDeliveries.length) {
@@ -859,6 +891,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     content: diskMsg.content,
                     createdAt: diskMsg.createdAt
                 });
+                if (delivery.kind === 'user' && delivery.uncertain) {
+                    matchedUncertainUserLocalIds.push(...delivery.localIds);
+                }
                 dIdx += 1;
                 pIdx += 1;
                 continue;
@@ -919,10 +954,20 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 continue;
             }
 
+            if (delivery.kind === 'user' && delivery.uncertain === true) {
+                unresolvedDuringCommit.push(delivery);
+                pIdx += 1;
+                continue;
+            }
+
             break;
         }
 
         if (entries.length === 0) {
+            if (unresolvedDuringCommit.length > 0) {
+                const remaining = [...unresolvedDuringCommit, ...this.pendingNativeDeliveries.slice(pIdx)];
+                this.pendingNativeDeliveries.splice(0, this.pendingNativeDeliveries.length, ...remaining);
+            }
             return true;
         }
 
@@ -946,7 +991,12 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             return false;
         }
 
-        this.pendingNativeDeliveries.splice(0, pIdx);
+        for (const lid of matchedUncertainUserLocalIds) {
+            this.unresolvedNativeUserLocalIds.delete(lid);
+            this.corroboratedNativeUserLocalIds.add(lid);
+        }
+        const remaining = [...unresolvedDuringCommit, ...this.pendingNativeDeliveries.slice(pIdx)];
+        this.pendingNativeDeliveries.splice(0, this.pendingNativeDeliveries.length, ...remaining);
         this.confirmedNativeStepCount = res.confirmedCount;
         let maxCommitted = this.confirmedNativeMaxStepIndex;
         for (const entry of entries) {
@@ -1667,30 +1717,52 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         const steerWaitReleased = new Promise<void>((resolve) => { releaseSteerWait = resolve; });
         let acknowledged = false;
         let acknowledgedNative = false;
+        let dispatchPersisted = false;
+        const trackNativeUserDispatch = this.isImportedSession() && !internalWakeup && !swarmBoardCommand && localIds.length > 0;
+        let batchHeldInQueue = false;
+        const heldBatch = localIds.map((localId) => ({ message, localId }));
+        const releaseHeldBatch = () => {
+            if (!batchHeldInQueue) return;
+            batchHeldInQueue = false;
+            session.queue.releaseBatch?.({ items: heldBatch });
+        };
         let answerMain!: () => void;
         const mainAnswered = new Promise<void>((resolve) => { answerMain = resolve; });
-        let userDelivery: Extract<PendingNativeDelivery, { kind: 'user' }> | null = null;
-        const recordDispatchedUserDelivery = () => {
-            if (
-                userDelivery !== null
-                || !this.isImportedSession()
-                || internalWakeup
-                || swarmBoardCommand
-                || localIds.length === 0
-            ) {
+        const userDeliveryRef: { current: Extract<PendingNativeDelivery, { kind: 'user' }> | null } = { current: null };
+        const recordDispatchedUserDelivery = (options?: { uncertain?: boolean }) => {
+            if (!trackNativeUserDispatch) {
                 return;
             }
-            userDelivery = { kind: 'user', localIds: [...localIds], texts: [message] };
-            this.pendingNativeDeliveries.push(userDelivery);
+            if (userDeliveryRef.current !== null) {
+                if (options?.uncertain === false) {
+                    userDeliveryRef.current.uncertain = false;
+                    userDeliveryRef.current.awaitingResolution = false;
+                }
+                return;
+            }
+            userDeliveryRef.current = {
+                kind: 'user',
+                localIds: [...localIds],
+                texts: [message],
+                ...(options?.uncertain ? { uncertain: true, awaitingResolution: true } : {})
+            };
+            this.pendingNativeDeliveries.push(userDeliveryRef.current);
         };
         const restoreIfUserTurn = () => {
-            if (userDelivery !== null) {
-                const idx = this.pendingNativeDeliveries.indexOf(userDelivery);
+            releaseHeldBatch();
+            const currentDelivery = userDeliveryRef.current;
+            if (currentDelivery !== null) {
+                const idx = this.pendingNativeDeliveries.indexOf(currentDelivery);
                 if (idx >= 0) this.pendingNativeDeliveries.splice(idx, 1);
-                if (acknowledgedNative && this.acpSessionId) {
-                    session.client.discardPendingNativeDelivery?.(this.acpSessionId, userDelivery.localIds);
+                if ((acknowledgedNative || dispatchPersisted) && this.acpSessionId) {
+                    session.client.discardPendingNativeDelivery?.(this.acpSessionId, currentDelivery.localIds);
                 }
-                userDelivery = null;
+                userDeliveryRef.current = null;
+            } else if (dispatchPersisted && this.acpSessionId) {
+                session.client.discardPendingNativeDelivery?.(this.acpSessionId, localIds);
+            }
+            for (const lid of localIds) {
+                this.unresolvedNativeUserLocalIds.delete(lid);
             }
             if (!internalWakeup) this.restorePrompt(turn, message);
         };
@@ -1716,16 +1788,19 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             usage: null,
             sawActivity: false,
             // AgySession does not acknowledge on dequeue so startup failures
-            // leave messages queued. A prompt counts as delivered once
-            // `session/prompt` is dispatched (agy 1.5.11 suppresses
-            // `user_message_chunk` for the client's own prompts), or when it
-            // goes back to the composer.
+            // leave messages queued. Imported turns persist an uncertain
+            // dispatching state before `session/prompt` and consume only once
+            // Antigravity corroborates delivery via output, echo, or disk.
             acknowledge: (asNativeTurn = false) => {
                 if (acknowledged || localIds.length === 0) return;
                 acknowledged = true;
+                releaseHeldBatch();
                 if (asNativeTurn && this.isImportedSession() && !internalWakeup && !swarmBoardCommand && this.acpSessionId) {
                     acknowledgedNative = true;
-                    recordDispatchedUserDelivery();
+                    recordDispatchedUserDelivery({ uncertain: false });
+                    for (const lid of localIds) {
+                        this.unresolvedNativeUserLocalIds.delete(lid);
+                    }
                     session.client.emitMessagesConsumed(localIds, { nativeId: this.acpSessionId });
                 } else {
                     session.client.emitMessagesConsumed(localIds);
@@ -1801,6 +1876,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (
                     this.importedReconcileState.status !== 'ready'
                     || this.pendingNativeDeliveries.length > 0
+                    || this.unresolvedNativeUserLocalIds.size > 0
                     || Math.max(this.lastTranscriptStepIndex, latestStepIndex) > this.confirmedNativeMaxStepIndex
                 ) {
                     await this.reconcileImportedNativeSteps();
@@ -1815,6 +1891,21 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                         ? state.reason
                         : 'Antigravity native history reconciliation failed.';
                     this.reportTurnError(reason);
+                    restoreIfUserTurn();
+                    return;
+                }
+                if (localIds.length > 0 && localIds.every((id) => this.corroboratedNativeUserLocalIds.has(id))) {
+                    for (const id of localIds) {
+                        this.corroboratedNativeUserLocalIds.delete(id);
+                        this.unresolvedNativeUserLocalIds.delete(id);
+                    }
+                    acknowledged = true;
+                    session.client.emitMessagesConsumed(localIds);
+                    return;
+                }
+                const blockingUnresolved = [...this.unresolvedNativeUserLocalIds].filter((id) => !localIds.includes(id));
+                if (blockingUnresolved.length > 0) {
+                    this.reportTurnError('An earlier prompt has an unconfirmed delivery in Antigravity. Retry or cancel it in the queue bar, or retry shortly if Antigravity is still saving.');
                     restoreIfUserTurn();
                     return;
                 }
@@ -1880,6 +1971,29 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             if (!internalWakeup) {
                 this.messageBuffer.addMessage(message, 'user');
             }
+            if (trackNativeUserDispatch) {
+                if (typeof session.client.setSteerDeliveryState === 'function') {
+                    const persisted = await session.client.setSteerDeliveryState(localIds, 'dispatching', { nativeId: acpSessionId });
+                    if (!persisted) {
+                        this.reportTurnError('Failed to record Antigravity prompt dispatch state with HAPI; retry or cancel the prompt in the queue bar.');
+                        for (const lid of localIds) {
+                            this.unresolvedNativeUserLocalIds.add(lid);
+                        }
+                        session.client.emitSteerIndeterminate?.(localIds);
+                        return;
+                    }
+                }
+                dispatchPersisted = true;
+                if (turn.aborted) {
+                    restoreIfUserTurn();
+                    return;
+                }
+                recordDispatchedUserDelivery({ uncertain: true });
+                if (typeof session.queue.beginBatch === 'function') {
+                    session.queue.beginBatch({ items: heldBatch });
+                    batchHeldInQueue = true;
+                }
+            }
             session.client.updateAgentState((state) => ({ ...state, steeringActive: true }));
             try {
                 promptDispatched = true;
@@ -1888,12 +2002,11 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     timing: {
                         onSent: () => {
                             turn.sentAt = Date.now();
-                            // agy 1.5.11 suppresses `user_message_chunk` for
-                            // the client's own `session/prompt`, so waiting for
-                            // an echo or first output leaves the message stuck
-                            // in `Queued` while the model is thinking.
-                            if (!turn.aborted) {
-                                turn.acknowledge(true);
+                            // Non-imported turns count as delivered on dispatch because agy 1.5.11
+                            // suppresses `user_message_chunk` echoes. Imported turns hold off until
+                            // Antigravity corroborates delivery via output, echo, or settled transcript.
+                            if (!turn.aborted && !trackNativeUserDispatch) {
+                                turn.acknowledge(false);
                             }
                         },
                         onAnswered: () => {
@@ -1903,10 +2016,20 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     }
                 });
                 // agy answers a cancel with a normal `cancelled` result; with no
-                // output yet, the prompt goes back to the composer.
+                // output yet, the prompt goes back to the composer unless native
+                // history already persisted it.
                 if (turn.stopReason === 'cancelled' && !turn.sawActivity && turn.steersTaken === 0) {
-                    restoreIfUserTurn();
-                } else {
+                    if (trackNativeUserDispatch && !this.backendLost) {
+                        await this.commitSettledNativeSteps();
+                    }
+                    const currentDelivery = userDeliveryRef.current;
+                    if (!trackNativeUserDispatch || (currentDelivery !== null && this.pendingNativeDeliveries.includes(currentDelivery))) {
+                        restoreIfUserTurn();
+                    } else {
+                        releaseHeldBatch();
+                        userDeliveryRef.current = null;
+                    }
+                } else if (turn.sawActivity || turn.steersTaken > 0 || !trackNativeUserDispatch) {
                     turn.acknowledge(true);
                 }
             } catch (error) {
@@ -1915,7 +2038,19 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 if (!turn.aborted) {
                     this.reportTurnError(`Antigravity prompt failed: ${errorMessage(error)}`);
                 }
-                if (!turn.sawActivity && turn.steersTaken === 0) {
+                if (trackNativeUserDispatch && isAcpIndeterminateError(error) && !turn.sawActivity && turn.steersTaken === 0) {
+                    releaseHeldBatch();
+                    const currentDelivery = userDeliveryRef.current;
+                    if (currentDelivery !== null) {
+                        const idx = this.pendingNativeDeliveries.indexOf(currentDelivery);
+                        if (idx >= 0) this.pendingNativeDeliveries.splice(idx, 1);
+                        userDeliveryRef.current = null;
+                    }
+                    for (const lid of localIds) {
+                        this.unresolvedNativeUserLocalIds.add(lid);
+                    }
+                    session.client.emitSteerIndeterminate?.(localIds);
+                } else if (!turn.sawActivity && turn.steersTaken === 0) {
                     restoreIfUserTurn();
                 } else {
                     turn.acknowledge(true);
@@ -1961,10 +2096,23 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 const generationMs = turn.generation.generationMs(turn.sentAt, turn.answeredAt);
                 session.sendAgentMessage(agyRoundSummary(turn.usage, durationMs, this.currentModelId, generationMs, turn.numTurns ?? turn.transcriptNumTurns ?? null));
             }
+            releaseHeldBatch();
             session.onThinkingChange(false);
             await this.permissionHandler?.cancelAll('Prompt finished');
             if (promptDispatched && !this.backendLost && this.pendingNativeDeliveries.length > 0) {
                 await this.commitSettledNativeSteps();
+            }
+            const remainingUserDelivery = userDeliveryRef.current;
+            if (remainingUserDelivery !== null) {
+                const idx = this.pendingNativeDeliveries.indexOf(remainingUserDelivery);
+                if (idx >= 0 && remainingUserDelivery.uncertain) {
+                    this.pendingNativeDeliveries.splice(idx, 1);
+                    for (const lid of remainingUserDelivery.localIds) {
+                        this.unresolvedNativeUserLocalIds.add(lid);
+                    }
+                    session.client.emitSteerIndeterminate?.(remainingUserDelivery.localIds);
+                }
+                userDeliveryRef.current = null;
             }
             if (session.queue.size() === 0 && !this.shouldExit) {
                 session.sendSessionEvent({ type: 'ready' });
@@ -2149,7 +2297,13 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         if (!session.queue.beginReservationDispatch(taken)) {
             return { steered: false, error: 'Steer cancelled' };
         }
-        if (!await session.client.setSteerDeliveryState([localId], 'dispatching')) {
+        const steerNativeOpts = this.isImportedSession() && this.acpSessionId
+            ? { nativeId: this.acpSessionId }
+            : undefined;
+        const steerDispatchPersisted = steerNativeOpts
+            ? await session.client.setSteerDeliveryState([localId], 'dispatching', steerNativeOpts)
+            : await session.client.setSteerDeliveryState([localId], 'dispatching');
+        if (!steerDispatchPersisted) {
             session.queue.markReservationIndeterminate(taken);
             session.client.emitSteerIndeterminate([localId]);
             return { steered: false, error: 'Steer state is indeterminate' };
@@ -2162,6 +2316,9 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             resolved = true;
             forgetEcho();
             if (session.queue.markReservationIndeterminate(taken)) {
+                if (this.isImportedSession()) {
+                    this.unresolvedNativeUserLocalIds.add(localId);
+                }
                 session.client.emitSteerIndeterminate([localId]);
             }
         };
@@ -2173,14 +2330,23 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 steerCounted = false;
                 turn.steersTaken -= 1;
             }
-            if (!taken.originIndeterminate
-                && !await session.client.setSteerDeliveryState([localId], 'queued')) {
+            const restoredToQueue = taken.originIndeterminate
+                || (steerNativeOpts
+                    ? await session.client.setSteerDeliveryState([localId], 'queued', steerNativeOpts)
+                    : await session.client.setSteerDeliveryState([localId], 'queued'));
+            if (!restoredToQueue) {
                 if (session.queue.markReservationIndeterminate(taken)) {
+                    if (this.isImportedSession()) {
+                        this.unresolvedNativeUserLocalIds.add(localId);
+                    }
                     session.client.emitSteerIndeterminate([localId]);
                 }
                 return;
             }
             if (taken.state !== 'dispatching' || !session.queue.restoreReservation(taken)) {
+                if (this.isImportedSession()) {
+                    this.unresolvedNativeUserLocalIds.add(localId);
+                }
                 session.client.emitSteerIndeterminate([localId]);
             }
         };
@@ -2261,6 +2427,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             resolved = true;
             forgetEcho();
             if (this.isImportedSession()) {
+                this.unresolvedNativeUserLocalIds.delete(localId);
                 this.pendingNativeDeliveries.push({ kind: 'user', localIds: [localId], texts: [taken.item.message] });
             }
             session.queue.commitReservation(taken);

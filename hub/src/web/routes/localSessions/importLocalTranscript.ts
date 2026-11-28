@@ -345,6 +345,8 @@ export function runLocalImportSync(options: {
             let reconciledSteps: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
             let reconciledUpdates: Array<{ messageId: string; localId: string; anchor: string; nextContent: unknown }> = []
             let resolvedPendingMessageIds: string[] = []
+            let corroboratedUserLocalIds: string[] = []
+            let demoteDispatchingLocalIds: string[] = []
             if (source.match.strategy === 'contentPrefix') {
                 const candidates = collectImportCandidates(store, namespace, () => engine)
                 const result = matchContentPrefix({
@@ -394,12 +396,14 @@ export function runLocalImportSync(options: {
                         sessionId: transcript.id,
                         ...(target ? { hapiSessionId: target.id } : {}),
                         error: { code: match.status, message: match.message }
-                    }, match.status === 'already_in_hapi' ? 'failed' : 'diverged')
+                    }, (match.status === 'already_in_hapi' || match.status === 'pending_native_flush') ? 'failed' : 'diverged')
                 }
                 delta = match.delta
                 reconciledSteps = match.reconciledSteps ?? []
                 reconciledUpdates = match.reconciledUpdates ?? []
                 resolvedPendingMessageIds = match.resolvedPendingMessageIds ?? []
+                corroboratedUserLocalIds = match.corroboratedUserLocalIds ?? []
+                demoteDispatchingLocalIds = match.demoteDispatchingLocalIds ?? []
             }
 
             // R6: never interleave into a live session.
@@ -410,6 +414,8 @@ export function runLocalImportSync(options: {
                     || reconciledUpdates.length > 0
                     || reconciledSteps.length > 0
                     || resolvedPendingMessageIds.length > 0
+                    || corroboratedUserLocalIds.length > 0
+                    || demoteDispatchingLocalIds.length > 0
                 )
             ) {
                 return finishErrorState({
@@ -512,6 +518,12 @@ export function runLocalImportSync(options: {
                     if (stepsToRecord.length > 0) {
                         store.nativeSteps.recordSteps(stored.id, transcript.id, stepsToRecord, importedAt)
                     }
+                    if (corroboratedUserLocalIds.length > 0) {
+                        store.messages.markMessagesInvoked(stored.id, corroboratedUserLocalIds, importedAt)
+                    }
+                    if (demoteDispatchingLocalIds.length > 0) {
+                        store.messages.setMessagesDeliveryState(stored.id, demoteDispatchingLocalIds, 'indeterminate')
+                    }
                     if (resolvedPendingMessageIds.length > 0) {
                         store.nativeSteps.removePendingDeliveriesByMessageIds(
                             stored.id,
@@ -560,9 +572,10 @@ export function runLocalImportSync(options: {
                     hapiSessionId: stored.id,
                     appended,
                     updated: updatedMessages,
+                    importedAt,
                     action: created
                         ? 'created' as const
-                        : (appended.length > 0 || updatedMessages.length > 0) ? 'updated' as const : 'unchanged' as const
+                        : (appended.length > 0 || updatedMessages.length > 0 || corroboratedUserLocalIds.length > 0) ? 'updated' as const : 'unchanged' as const
                 }
             })
 
@@ -592,6 +605,21 @@ export function runLocalImportSync(options: {
                 ?? committed.updated.at(-1)?.createdAt
                 ?? transcript.modifiedAt
             engine.recordSessionActivity(hapiSessionId, activityAt)
+            if (corroboratedUserLocalIds.length > 0) {
+                engine.handleRealtimeEvent({
+                    type: 'messages-consumed',
+                    sessionId: hapiSessionId,
+                    localIds: corroboratedUserLocalIds,
+                    invokedAt: committed.importedAt
+                })
+            }
+            if (demoteDispatchingLocalIds.length > 0) {
+                engine.handleRealtimeEvent({
+                    type: 'messages-indeterminate',
+                    sessionId: hapiSessionId,
+                    localIds: demoteDispatchingLocalIds
+                })
+            }
             emitImportedMessages(engine, hapiSessionId, [...committed.updated, ...committed.appended])
             engine.handleRealtimeEvent({ type: 'session-updated', sessionId: hapiSessionId })
             return outcome

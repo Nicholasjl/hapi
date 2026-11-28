@@ -256,6 +256,7 @@ export default {
   'agyImport.error.diverged': '前回のインポート後にローカルの Antigravity トランスクリプトが変更されました。続行する前にセッションを確認してください。',
   'agyImport.error.alreadyImported': 'この Antigravity セッションはすでに HAPI にインポートされており、追加する新しいメッセージはありません。',
   'agyImport.error.active': 'より新しいネイティブ履歴をインポートする前に、アクティブな Hapi Antigravity セッションを停止してください。',
+  'agyImport.error.pendingFlush': 'Antigravity は最近のメッセージをディスクへ書き込み中です。しばらく待ってから再試行してください。',
   'cursorImport.inline.title': 'Import Cursor history',
   'cursorImport.inline.description': 'Optional: choose an existing local Cursor chat to verify and continue.',
   'cursorImport.inline.clear': 'Clear',
