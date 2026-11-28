@@ -522,5 +522,36 @@ describe('anchored match: Antigravity native step ledger', () => {
                 { deliverySeq: 1, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
             ]
         }).status).toBe('pending_native_flush')
+
+        // Partial turn flush: disk contains matching user prompt while corroborated agent reply has not flushed yet -> pending_native_flush.
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, pendingUser, pendingAgent],
+            transcript: agyTranscript([s0, s1, s2]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: pendingUser.id, localIds: ['u-live'] },
+                { deliverySeq: 2, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
+            ]
+        }).status).toBe('pending_native_flush')
+
+        // Mismatch after matching user prompt (disk wrote a conflicting reply) still diverges.
+        expect(matchAnchored({
+            storedMessages: [stored0, stored1, pendingUser, pendingAgent],
+            transcript: agyTranscript([
+                s0,
+                s1,
+                s2,
+                agyNativeAgent('step:3:text', { type: 'message', message: 'conflicting reply' })
+            ]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: pendingUser.id, localIds: ['u-live'] },
+                { deliverySeq: 2, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
+            ]
+        }).status).toBe('transcript_diverged')
     })
 })

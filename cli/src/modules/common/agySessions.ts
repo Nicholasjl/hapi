@@ -369,17 +369,8 @@ export function collectSettledAgyNativeMessagesPrefix(
         return { messages: [], fingerprints: [], maxStepIndex: -1, hasUnsettledTail: false }
     }
     const { steps: allSteps, incompleteTail } = readAgyTranscriptForImport(brainDir, sessionId)
-    const { steps: completeSteps, hadMissingFullRows } = selectStableCompleteAgySteps(allSteps)
-    const settledSteps: AgyTranscriptStep[] = []
-    let sawUnsettled = false
-    for (const step of completeSteps) {
-        if (!isAgyTranscriptStepSettled(step)) {
-            sawUnsettled = true
-            break
-        }
-        settledSteps.push(step)
-    }
-    const hasUnsettledTail = incompleteTail || hadMissingFullRows || sawUnsettled
+    const { steps: settledSteps, hadMissingFullRows, hadUnsettledSteps } = selectStableCompleteAgySteps(allSteps)
+    const hasUnsettledTail = incompleteTail || hadMissingFullRows || hadUnsettledSteps
     if (settledSteps.length === 0) {
         return { messages: [], fingerprints: [], maxStepIndex: -1, hasUnsettledTail }
     }
@@ -689,14 +680,20 @@ export async function listLocalAgySessionSummaries(
 export function selectStableCompleteAgySteps(steps: AgyTranscriptStep[]): {
     steps: AgyTranscriptStep[]
     hadMissingFullRows: boolean
+    hadUnsettledSteps: boolean
 } {
     for (let i = 0; i < steps.length; i += 1) {
         const step = steps[i]!
-        if (Array.isArray(step.truncated_fields) && step.truncated_fields.length > 0) {
-            return { steps: steps.slice(0, i), hadMissingFullRows: true }
+        const isTruncated = Array.isArray(step.truncated_fields) && step.truncated_fields.length > 0
+        if (isTruncated || !isAgyTranscriptStepSettled(step)) {
+            return {
+                steps: steps.slice(0, i),
+                hadMissingFullRows: isTruncated,
+                hadUnsettledSteps: !isTruncated
+            }
         }
     }
-    return { steps, hadMissingFullRows: false }
+    return { steps, hadMissingFullRows: false, hadUnsettledSteps: false }
 }
 
 export async function listLocalAgySessionsWithMessagesByIds(
@@ -743,10 +740,10 @@ export async function listLocalAgySessionsWithMessagesByIds(
         const row = rowsById.get(sessionId)
         const modifiedAt = parseAgyTimestampMs(row?.last_modified_time) ?? stats.mtimeMs
         const { steps: allSteps, incompleteTail } = readAgyTranscriptForImport(brainDir, sessionId)
-        const { steps, hadMissingFullRows } = selectStableCompleteAgySteps(allSteps)
+        const { steps, hadMissingFullRows, hadUnsettledSteps } = selectStableCompleteAgySteps(allSteps)
         const converted = convertAgyTranscriptStepsToMessages(sessionId, steps, modifiedAt)
         let importError: string | undefined
-        if (incompleteTail || hadMissingFullRows || allSteps.length === 0) {
+        if (incompleteTail || hadMissingFullRows || hadUnsettledSteps || allSteps.length === 0) {
             importError = 'Antigravity full transcript is still flushing; please retry import shortly'
         } else if (converted.messages.length === 0) {
             importError = 'Antigravity session transcript contains no importable messages'

@@ -7,7 +7,8 @@ import { RPC_METHODS, splitAgyModelSelection } from '@hapi/protocol';
 import type { AgyImportedMessage } from '@hapi/protocol/apiTypes';
 import {
     collectSettledAgyNativeMessagesPrefix,
-    collectSettledAgyTranscriptForReconcile
+    collectSettledAgyTranscriptForReconcile,
+    getAgyBrainDir
 } from '@/modules/common/agySessions';
 import type { PermissionMode as ProtocolPermissionMode } from '@hapi/protocol/types';
 import { getBuiltinSlashCommands, mergeSlashCommands } from '@hapi/protocol/slashCommands';
@@ -44,7 +45,6 @@ import {
     advanceAgyTurnTranscriptCursor,
     agyTranscriptPaths,
     convertAgyReactiveSteps,
-    defaultAgyBrainDir,
     extractAgyBackgroundTaskIds,
     inspectAgyReactiveSteps,
     inspectSyntheticBackgroundCommandMatch,
@@ -557,7 +557,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         this.steerCancelGraceMs = opts.steerCancelGraceMs ?? STEER_CANCEL_GRACE_MS;
         this.cancelHardStopMs = opts.cancelHardStopMs ?? CANCEL_HARD_STOP_MS;
         this.killSettleMs = opts.killSettleMs ?? KILL_SETTLE_MS;
-        this.brainDir = opts.brainDir ?? defaultAgyBrainDir();
+        this.brainDir = opts.brainDir ?? getAgyBrainDir();
         this.reactivePollMs = opts.reactivePollMs ?? REACTIVE_POLL_MS;
         this.reactiveTimings = {
             settleMs: opts.reactiveSettleMs ?? REACTIVE_SETTLE_MS,
@@ -691,14 +691,27 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             return;
         }
         if (this.pendingNativeDeliveries.length > 0 && this.confirmedNativeStepCount !== null) {
-            const committed = await this.commitSettledNativeSteps();
-            if (!committed) return;
-            if (this.pendingNativeDeliveries.length > 0) {
+            const commitResult = await this.commitSettledNativeSteps();
+            if (!commitResult.ok) return;
+            if (commitResult.conflicted) {
+                this.pendingNativeDeliveries.length = 0;
                 this.importedReconcileState = {
-                    status: 'retryable',
-                    reason: 'Waiting for Antigravity native transcript to finish flushing before sending the next prompt.'
+                    status: 'diverged',
+                    reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
                 };
                 return;
+            }
+            if (this.pendingNativeDeliveries.length > 0) {
+                const hasCorroboratedRemaining = this.pendingNativeDeliveries.some(
+                    (item) => item.kind !== 'user' || item.uncertain !== true
+                );
+                if (hasCorroboratedRemaining) {
+                    this.importedReconcileState = {
+                        status: 'retryable',
+                        reason: 'Waiting for Antigravity native transcript to finish flushing before sending the next prompt.'
+                    };
+                    return;
+                }
             }
         }
         const snapshot = collectSettledAgyTranscriptForReconcile(this.brainDir, acpSessionId);
@@ -765,17 +778,24 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                 }
             }
             if (this.pendingNativeDeliveries.length > 0) {
-                const committed = await this.commitSettledNativeSteps();
-                if (!committed) return;
+                const commitResult = await this.commitSettledNativeSteps(snapshot);
+                if (!commitResult.ok) return;
+                if (commitResult.conflicted) {
+                    this.pendingNativeDeliveries.length = 0;
+                    this.importedReconcileState = {
+                        status: 'diverged',
+                        reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
+                    };
+                    return;
+                }
                 if (this.pendingNativeDeliveries.length > 0) {
-                    const hasHardConflict = this.pendingNativeDeliveries.some(
+                    const hasCorroboratedRemaining = this.pendingNativeDeliveries.some(
                         (item) => item.kind !== 'user' || item.uncertain !== true
                     );
-                    if (hasHardConflict) {
-                        this.pendingNativeDeliveries.length = 0;
+                    if (hasCorroboratedRemaining) {
                         this.importedReconcileState = {
-                            status: 'diverged',
-                            reason: 'Antigravity native history diverged from uncommitted HAPI live turns; cannot safely continue this imported session.'
+                            status: 'retryable',
+                            reason: 'Waiting for Antigravity native transcript to finish writing uncommitted live messages; retry shortly.'
                         };
                         return;
                     }
@@ -836,7 +856,12 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
         this.importedReconcileState = { status: 'ready' };
     }
 
-    private async commitSettledNativeSteps(): Promise<boolean> {
+    private async commitSettledNativeSteps(
+        overridePrefix?: {
+            messages: AgyImportedMessage[];
+            fingerprints: Array<{ anchor: string; fingerprint: string }>;
+        }
+    ): Promise<{ ok: boolean; conflicted: boolean }> {
         const acpSessionId = this.acpSessionId;
         if (
             !this.isImportedSession()
@@ -844,32 +869,32 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             || this.confirmedNativeStepCount === null
             || this.importedReconcileState.status === 'diverged'
         ) {
-            return false;
+            return { ok: false, conflicted: false };
         }
         if (this.pendingNativeDeliveries.length === 0) {
-            return this.importedReconcileState.status === 'ready';
+            return { ok: this.importedReconcileState.status === 'ready', conflicted: false };
         }
         if (typeof this.session.client.commitNativeSteps !== 'function') {
             this.importedReconcileState = {
                 status: 'retryable',
                 reason: 'Antigravity native transcript sync is unavailable on this connection.'
             };
-            return false;
+            return { ok: false, conflicted: false };
         }
 
-        const prefix = collectSettledAgyNativeMessagesPrefix(this.brainDir, acpSessionId);
+        const prefix = overridePrefix ?? collectSettledAgyNativeMessagesPrefix(this.brainDir, acpSessionId);
         if (prefix.messages.length < this.confirmedNativeStepCount) {
             this.importedReconcileState = {
                 status: 'retryable',
                 reason: 'Antigravity native transcript shrank below the confirmed ledger; re-reconciling before next turn.'
             };
-            return false;
+            return { ok: false, conflicted: false };
         }
 
         const candidateMessages = prefix.messages.slice(this.confirmedNativeStepCount);
         const candidateFingerprints = prefix.fingerprints.slice(this.confirmedNativeStepCount);
         if (candidateMessages.length === 0) {
-            return true;
+            return { ok: true, conflicted: false };
         }
 
         const entries: NativeCommitEntry[] = [];
@@ -963,12 +988,19 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             break;
         }
 
+        const remaining = [...unresolvedDuringCommit, ...this.pendingNativeDeliveries.slice(pIdx)];
+        const hasRemainingCorroborated = remaining.some(
+            (item) => item.kind !== 'user' || item.uncertain !== true
+        );
+        const conflicted = dIdx < candidateMessages.length && hasRemainingCorroborated;
+        if (conflicted) {
+            return { ok: true, conflicted: true };
+        }
         if (entries.length === 0) {
             if (unresolvedDuringCommit.length > 0) {
-                const remaining = [...unresolvedDuringCommit, ...this.pendingNativeDeliveries.slice(pIdx)];
                 this.pendingNativeDeliveries.splice(0, this.pendingNativeDeliveries.length, ...remaining);
             }
-            return true;
+            return { ok: true, conflicted: false };
         }
 
         const res = await this.session.client.commitNativeSteps(
@@ -988,14 +1020,13 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
                     reason: 'Failed to sync Antigravity transcript ledger with HAPI; retrying before next turn.'
                 };
             }
-            return false;
+            return { ok: false, conflicted: false };
         }
 
         for (const lid of matchedUncertainUserLocalIds) {
             this.unresolvedNativeUserLocalIds.delete(lid);
             this.corroboratedNativeUserLocalIds.add(lid);
         }
-        const remaining = [...unresolvedDuringCommit, ...this.pendingNativeDeliveries.slice(pIdx)];
         this.pendingNativeDeliveries.splice(0, this.pendingNativeDeliveries.length, ...remaining);
         this.confirmedNativeStepCount = res.confirmedCount;
         let maxCommitted = this.confirmedNativeMaxStepIndex;
@@ -1006,7 +1037,7 @@ export class AgyAcpRemoteLauncher extends RemoteLauncherBase {
             }
         }
         this.confirmedNativeMaxStepIndex = maxCommitted;
-        return true;
+        return { ok: true, conflicted: false };
     }
 
     private syncTranscriptCursor(): void {

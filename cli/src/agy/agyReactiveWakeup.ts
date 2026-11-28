@@ -107,7 +107,8 @@ const AGY_TURN_TERMINATING_TOOLS = new Set([
 ]);
 
 export function defaultAgyBrainDir(): string {
-    return join(homedir(), '.gemini', 'antigravity-cli', 'brain');
+    const overrideRoot = process.env.AGY_APP_DATA_DIR?.trim();
+    return join(overrideRoot || join(homedir(), '.gemini', 'antigravity-cli'), 'brain');
 }
 
 function isSafeSessionSegment(sessionId: string): boolean {

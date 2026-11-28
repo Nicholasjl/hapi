@@ -430,6 +430,46 @@ const results: Record<string, unknown> = {}
         const headError = unfinishedHead?.importError ?? null
         const emptyError = emptyFile?.importError ?? null
         results.truncated = { beforeFull, afterFull, headError, emptyError, batchIds: batchWithUnfinished.map((item) => item.id) }
+
+        writeTranscript(root, 'conv-running-planner', [
+            {
+                step_index: 0,
+                source: 'USER_EXPLICIT',
+                type: 'USER_INPUT',
+                status: 'DONE',
+                created_at: '2026-11-22T05:00:00Z',
+                content: '<USER_REQUEST>\\nFinish answer\\n</USER_REQUEST>'
+            },
+            {
+                step_index: 1,
+                source: 'MODEL',
+                type: 'PLANNER_RESPONSE',
+                status: 'RUNNING',
+                created_at: '2026-11-22T05:00:01Z',
+                content: 'partial text'
+            }
+        ])
+        const beforeSettled = (await listLocalAgySessionsWithMessagesByIds(new Set(['conv-running-planner']), { appDataDir: root }))[0]!
+        writeTranscript(root, 'conv-running-planner', [
+            {
+                step_index: 0,
+                source: 'USER_EXPLICIT',
+                type: 'USER_INPUT',
+                status: 'DONE',
+                created_at: '2026-11-22T05:00:00Z',
+                content: '<USER_REQUEST>\\nFinish answer\\n</USER_REQUEST>'
+            },
+            {
+                step_index: 1,
+                source: 'MODEL',
+                type: 'PLANNER_RESPONSE',
+                status: 'DONE',
+                created_at: '2026-11-22T05:00:01Z',
+                content: 'complete rewritten text'
+            }
+        ])
+        const afterSettled = (await listLocalAgySessionsWithMessagesByIds(new Set(['conv-running-planner']), { appDataDir: root }))[0]!
+        results.runningPlanner = { beforeSettled, afterSettled }
     } finally {
         rmSync(root, { recursive: true, force: true })
     }
@@ -476,6 +516,10 @@ function runBunSuite() {
             headError: string | null
             emptyError: string | null
             batchIds: string[]
+        }
+        runningPlanner: {
+            beforeSettled: { importError?: string; messages: Array<{ localId: string; anchor: string; content: Record<string, unknown> }> }
+            afterSettled: { importError?: string; messages: Array<{ localId: string; anchor: string; content: Record<string, unknown> }> }
         }
     }
 }
@@ -583,6 +627,21 @@ describe('agySessions', () => {
         expect(headError).toContain('full transcript is still flushing')
         expect(emptyError).toContain('full transcript is still flushing')
         expect(output.truncated.batchIds).toEqual(expect.arrayContaining(['conv-trunc-head', 'conv-empty-file', 'conv-trunc-prefix']))
+
+        expect(output.runningPlanner.beforeSettled.importError).toContain('still flushing')
+        expect(output.runningPlanner.beforeSettled.messages).toHaveLength(1)
+        expect(output.runningPlanner.afterSettled.importError).toBeUndefined()
+        expect(output.runningPlanner.afterSettled.messages).toHaveLength(2)
+        expect(output.runningPlanner.afterSettled.messages[1]).toMatchObject({
+            localId: 'agy:conv-running-planner:step:1:text',
+            content: {
+                role: 'agent',
+                content: {
+                    type: 'codex',
+                    data: { type: 'message', message: 'complete rewritten text' }
+                }
+            }
+        })
     })
 })
 

@@ -129,7 +129,7 @@ vi.mock('axios', () => ({
     }
 }))
 
-import { ApiSessionClient, isExternalUserMessage, IncomingMessageFilter } from './apiSession'
+import { ApiSessionClient, isExternalUserMessage, IncomingMessageFilter, MAX_NATIVE_RECONCILE_BATCH } from './apiSession'
 
 function createSession(overrides: Partial<Session> = {}): Session {
     return {
@@ -2492,5 +2492,74 @@ describe('ApiSessionClient metadata cancellation and reconnect ordering', () => 
         } finally {
             vi.useRealTimers()
         }
+    })
+
+    it('batches reconcileNativeSteps beyond the per-request limit and fails closed on premature or diverged responses', async () => {
+        socketHarness.sockets.length = 0
+        axiosHarness.get.mockResolvedValue({ data: { messages: [] } })
+        const client = new ApiSessionClient('token', createSession({
+            namespace: 'default',
+            metadata: { path: '/tmp', host: 'h', flavor: 'agy' },
+            metadataVersion: 1
+        }))
+        const socket = socketHarness.sockets[0]!
+        socket.triggerConnect()
+
+        const totalSteps = 10_005
+        const fp = 'a'.repeat(64)
+        const steps = Array.from({ length: totalSteps }, (_, idx) => ({
+            anchor: `step:${idx}:0`,
+            fingerprint: fp
+        }))
+
+        const seenBatches: Array<{ offset?: number; totalSteps?: number; count: number }> = []
+        socket.emitWithAckImpl = async (event, payload) => {
+            if (event !== 'session-reconcile-native-steps') return {}
+            const req = payload as { offset?: number; totalSteps?: number; steps: Array<{ anchor: string; fingerprint: string }> }
+            seenBatches.push({ offset: req.offset, totalSteps: req.totalSteps, count: req.steps.length })
+            const nextOffset = (req.offset ?? 0) + req.steps.length
+            if (nextOffset < (req.totalSteps ?? req.steps.length)) {
+                return { ok: true, status: 'continue', nextOffset, confirmedCount: 10_002 }
+            }
+            return { ok: true, status: 'needs_backfill', fromIndex: 10_002 }
+        }
+
+        const result = await client.reconcileNativeSteps('agy-large', steps)
+        expect(result).toEqual({ ok: true, status: 'needs_backfill', fromIndex: 10_002 })
+        expect(seenBatches).toEqual([
+            { offset: 0, totalSteps, count: MAX_NATIVE_RECONCILE_BATCH },
+            { offset: 2_000, totalSteps, count: MAX_NATIVE_RECONCILE_BATCH },
+            { offset: 4_000, totalSteps, count: MAX_NATIVE_RECONCILE_BATCH },
+            { offset: 6_000, totalSteps, count: MAX_NATIVE_RECONCILE_BATCH },
+            { offset: 8_000, totalSteps, count: MAX_NATIVE_RECONCILE_BATCH },
+            { offset: 10_000, totalSteps, count: 5 }
+        ])
+
+        // Early diverged response stops sending remaining batches.
+        seenBatches.length = 0
+        socket.emitWithAckImpl = async (event, payload) => {
+            if (event !== 'session-reconcile-native-steps') return {}
+            const req = payload as { offset?: number; totalSteps?: number; steps: unknown[] }
+            seenBatches.push({ offset: req.offset, totalSteps: req.totalSteps, count: req.steps.length })
+            if (seenBatches.length === 2) {
+                return { ok: true, status: 'diverged' }
+            }
+            return { ok: true, status: 'continue', nextOffset: (req.offset ?? 0) + req.steps.length, confirmedCount: 1 }
+        }
+        expect(await client.reconcileNativeSteps('agy-large', steps)).toEqual({ ok: true, status: 'diverged' })
+        expect(seenBatches).toHaveLength(2)
+
+        // Premature needs_backfill on an intermediate batch fails closed.
+        seenBatches.length = 0
+        socket.emitWithAckImpl = async (event, payload) => {
+            if (event !== 'session-reconcile-native-steps') return {}
+            const req = payload as { offset?: number; totalSteps?: number; steps: unknown[] }
+            seenBatches.push({ offset: req.offset, totalSteps: req.totalSteps, count: req.steps.length })
+            return { ok: true, status: 'needs_backfill', fromIndex: 0 }
+        }
+        expect(await client.reconcileNativeSteps('agy-large', steps)).toEqual({ ok: false })
+        expect(seenBatches).toHaveLength(1)
+
+        client.close()
     })
 })

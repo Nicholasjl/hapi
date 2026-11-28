@@ -141,13 +141,58 @@ class NativeCommitError extends Error {
     }
 }
 
+export const MAX_RECONCILE_NATIVE_STEPS_PER_REQUEST = 10_000
+const MAX_PENDING_NATIVE_RECONCILES = 16
+
+type PendingNativeReconcileCursor = {
+    totalSteps: number
+    validatedCount: number
+    legacyMode: boolean
+    recordedCount: number
+    lastRecordedStepSeq: number
+    importedCount: number
+    storedMessageCount: number
+    lastStoredSeq: number
+    hasEffectivePending: boolean
+    trailingUserFingerprints: Set<string>
+}
+
+function computeTrailingInvokedUserFingerprints(
+    storedMessages: ReadonlyArray<StoredMessage>,
+    lastRecordedSeq: number
+): Set<string> {
+    const fingerprints = new Set<string>()
+    for (const msg of storedMessages) {
+        if (msg.seq <= lastRecordedSeq || msg.invokedAt === null) continue
+        const record = unwrapRoleWrappedRecordEnvelope(msg.content)
+        if (!record || record.role !== 'user' || !isPlainRecord(record.content) || record.content.type !== 'text') {
+            continue
+        }
+        const rawText = typeof record.content.text === 'string' ? record.content.text : ''
+        if (!rawText) continue
+        fingerprints.add(computeLocalTranscriptFingerprint({
+            role: 'user',
+            content: { type: 'text', text: rawText },
+            meta: { sentFrom: 'cli' }
+        }))
+        fingerprints.add(computeLocalTranscriptFingerprint({
+            role: 'user',
+            content: { type: 'text', text: rawText.trim() },
+            meta: { sentFrom: 'cli' }
+        }))
+    }
+    return fingerprints
+}
+
 const reconcileNativeStepsSchema = z.object({
     sid: z.string().min(1),
     nativeId: z.string().min(1),
+    offset: z.number().int().min(0).optional(),
+    totalSteps: z.number().int().min(0).optional(),
     steps: z.array(z.object({
         anchor: z.string().min(1).max(256),
         fingerprint: z.string().regex(/^[0-9a-f]{64}$/)
-    })).max(10_000)
+    })).max(MAX_RECONCILE_NATIVE_STEPS_PER_REQUEST)
 })
 
 const backfillNativeMessagesSchema = z.object({
@@ -218,6 +263,10 @@ export type SessionHandlersDeps = {
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
     const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTasks, onSessionActivity, onAgentProgress, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const pendingNativeReconciles = new Map<string, PendingNativeReconcileCursor>()
+    socket.on('disconnect', () => {
+        pendingNativeReconciles.clear()
+    })
 
     socket.on('native-queue-message', data => {
         const parsed = z.object({ sid: z.string(), localId: z.string().min(1), text: z.string().nullable() }).safeParse(data)
@@ -1062,6 +1111,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         data: unknown,
         ack?: (
             response:
+                | { ok: true; status: 'continue'; nextOffset: number; confirmedCount: number }
                 | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
                 | { ok: true; status: 'pending_flush'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }
@@ -1097,50 +1147,178 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
         try {
             const { sid, nativeId, steps } = parsed.data
+            const offset = parsed.data.offset ?? 0
+            if (offset > 0 && parsed.data.totalSteps === undefined) {
+                reply({ ok: false })
+                return
+            }
+            const totalSteps = parsed.data.totalSteps ?? (offset + steps.length)
+            const endOffset = offset + steps.length
+            if (endOffset > totalSteps || (totalSteps > 0 && steps.length === 0)) {
+                reply({ ok: false })
+                return
+            }
+
+            const cursorKey = `${sid}\0${nativeId}`
             const recorded = store.nativeSteps.getSteps(sid, nativeId)
             const storedMessages = store.messages.getAllMessages(sid)
             const storedById = new Map(storedMessages.map((msg) => [msg.id, msg]))
             const importPrefix = `agy:${nativeId}:`
             const imported = storedMessages.filter((msg) => msg.localId?.startsWith(importPrefix))
+            const lastRecordedStepSeq = recorded.length > 0 ? recorded[recorded.length - 1]!.seq : -1
+            const lastStoredSeq = storedMessages.length > 0 ? storedMessages[storedMessages.length - 1]!.seq : -1
 
-            if (recorded.length > 0) {
-                if (steps.length < recorded.length) {
-                    reply({ ok: true, status: 'diverged' })
+            let cursor: PendingNativeReconcileCursor
+            if (offset === 0) {
+                pendingNativeReconciles.delete(cursorKey)
+                if (recorded.length > 0) {
+                    if (totalSteps < recorded.length) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    const stepIndexByAnchor = new Map<string, number>()
+                    let lastRecordedSeq = -1
+                    for (let i = 0; i < recorded.length; i += 1) {
+                        const expected = recorded[i]!
+                        const linked = storedById.get(expected.messageId)
+                        if (!linked) {
+                            reply({ ok: true, status: 'diverged' })
+                            return
+                        }
+                        if (linked.seq > lastRecordedSeq) {
+                            lastRecordedSeq = linked.seq
+                        }
+                        stepIndexByAnchor.set(expected.anchor, i)
+                    }
+                    let priorIndex = -1
+                    for (const msg of imported) {
+                        const expectedAnchor = msg.localId!.slice(importPrefix.length)
+                        const sourceIndex = stepIndexByAnchor.get(expectedAnchor)
+                        if (sourceIndex === undefined || sourceIndex <= priorIndex || sourceIndex >= recorded.length) {
+                            reply({ ok: true, status: 'diverged' })
+                            return
+                        }
+                        if (computeLocalTranscriptFingerprint(msg.content) !== recorded[sourceIndex]!.fingerprint) {
+                            reply({ ok: true, status: 'diverged' })
+                            return
+                        }
+                        priorIndex = sourceIndex
+                    }
+                    const hasEffectivePending = collectEffectivePendingDeliveries(
+                        storedMessages,
+                        recorded,
+                        store.nativeSteps.getPendingDeliveries(sid, nativeId)
+                    ).length > 0
+                    const trailingUserFingerprints = !hasEffectivePending && totalSteps > recorded.length
+                        ? computeTrailingInvokedUserFingerprints(storedMessages, lastRecordedSeq)
+                        : new Set<string>()
+                    cursor = {
+                        totalSteps,
+                        validatedCount: 0,
+                        legacyMode: false,
+                        recordedCount: recorded.length,
+                        lastRecordedStepSeq,
+                        importedCount: imported.length,
+                        storedMessageCount: storedMessages.length,
+                        lastStoredSeq,
+                        hasEffectivePending,
+                        trailingUserFingerprints
+                    }
+                } else {
+                    if (imported.length === 0 || storedMessages.length > imported.length || totalSteps < imported.length) {
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                    cursor = {
+                        totalSteps,
+                        validatedCount: 0,
+                        legacyMode: true,
+                        recordedCount: 0,
+                        lastRecordedStepSeq: -1,
+                        importedCount: imported.length,
+                        storedMessageCount: storedMessages.length,
+                        lastStoredSeq,
+                        hasEffectivePending: false,
+                        trailingUserFingerprints: new Set<string>()
+                    }
+                }
+            } else {
+                const existing = pendingNativeReconciles.get(cursorKey)
+                if (
+                    !existing
+                    || existing.totalSteps !== totalSteps
+                    || existing.validatedCount !== offset
+                    || existing.recordedCount !== recorded.length
+                    || existing.lastRecordedStepSeq !== lastRecordedStepSeq
+                    || existing.importedCount !== imported.length
+                    || existing.storedMessageCount !== storedMessages.length
+                    || existing.lastStoredSeq !== lastStoredSeq
+                ) {
+                    pendingNativeReconciles.delete(cursorKey)
+                    reply({ ok: false })
                     return
                 }
-                const stepIndexByAnchor = new Map<string, number>()
-                let lastRecordedSeq = -1
-                for (let i = 0; i < recorded.length; i += 1) {
-                    const expected = recorded[i]!
-                    const actual = steps[i]!
+                cursor = existing
+            }
+
+            if (!cursor.legacyMode) {
+                const recordedEnd = Math.min(endOffset, recorded.length)
+                for (let idx = offset; idx < recordedEnd; idx += 1) {
+                    const expected = recorded[idx]!
+                    const actual = steps[idx - offset]!
                     if (actual.anchor !== expected.anchor || actual.fingerprint !== expected.fingerprint) {
+                        pendingNativeReconciles.delete(cursorKey)
                         reply({ ok: true, status: 'diverged' })
                         return
                     }
-                    const linked = storedById.get(expected.messageId)
-                    if (!linked) {
-                        reply({ ok: true, status: 'diverged' })
-                        return
-                    }
-                    if (linked.seq > lastRecordedSeq) {
-                        lastRecordedSeq = linked.seq
-                    }
-                    stepIndexByAnchor.set(actual.anchor, i)
                 }
-                let priorIndex = -1
-                for (const msg of imported) {
-                    const expectedAnchor = msg.localId!.slice(importPrefix.length)
-                    const sourceIndex = stepIndexByAnchor.get(expectedAnchor)
-                    if (sourceIndex === undefined || sourceIndex <= priorIndex || sourceIndex >= recorded.length) {
-                        reply({ ok: true, status: 'diverged' })
-                        return
+                if (!cursor.hasEffectivePending && cursor.trailingUserFingerprints.size > 0 && endOffset > recorded.length) {
+                    const tailStart = Math.max(offset, recorded.length)
+                    for (let idx = tailStart; idx < endOffset; idx += 1) {
+                        if (cursor.trailingUserFingerprints.has(steps[idx - offset]!.fingerprint)) {
+                            pendingNativeReconciles.delete(cursorKey)
+                            reply({ ok: true, status: 'diverged' })
+                            return
+                        }
                     }
-                    if (computeLocalTranscriptFingerprint(msg.content) !== steps[sourceIndex]!.fingerprint) {
-                        reply({ ok: true, status: 'diverged' })
-                        return
-                    }
-                    priorIndex = sourceIndex
                 }
+            } else {
+                const legacyEnd = Math.min(endOffset, imported.length)
+                for (let idx = offset; idx < legacyEnd; idx += 1) {
+                    const msg = imported[idx]!
+                    const actual = steps[idx - offset]!
+                    if (
+                        msg.localId !== `${importPrefix}${actual.anchor}`
+                        || computeLocalTranscriptFingerprint(msg.content) !== actual.fingerprint
+                    ) {
+                        pendingNativeReconciles.delete(cursorKey)
+                        reply({ ok: true, status: 'diverged' })
+                        return
+                    }
+                }
+            }
+
+            if (endOffset < totalSteps) {
+                cursor.validatedCount = endOffset
+                if (pendingNativeReconciles.size >= MAX_PENDING_NATIVE_RECONCILES && !pendingNativeReconciles.has(cursorKey)) {
+                    const oldestKey = pendingNativeReconciles.keys().next().value
+                    if (oldestKey !== undefined) {
+                        pendingNativeReconciles.delete(oldestKey)
+                    }
+                }
+                pendingNativeReconciles.delete(cursorKey)
+                pendingNativeReconciles.set(cursorKey, cursor)
+                reply({
+                    ok: true,
+                    status: 'continue',
+                    nextOffset: endOffset,
+                    confirmedCount: cursor.legacyMode ? imported.length : recorded.length
+                })
+                return
+            }
+
+            pendingNativeReconciles.delete(cursorKey)
+            if (!cursor.legacyMode) {
                 const demoted = store.messages.markDispatchingMessagesIndeterminate(sid)
                 if (demoted.length > 0) {
                     onWebappEvent?.({ type: 'messages-indeterminate', sessionId: sid, localIds: demoted })
@@ -1151,8 +1329,12 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     recorded,
                     store.nativeSteps.getPendingDeliveries(sid, nativeId)
                 )
+                if (!cursor.hasEffectivePending && effectivePending.length > 0) {
+                    reply({ ok: false })
+                    return
+                }
                 if (effectivePending.length > 0) {
-                    if (steps.length === recorded.length) {
+                    if (totalSteps === recorded.length) {
                         const hasCorroborated = effectivePending.some((entry) => !entry.uncertain)
                         if (hasCorroborated) {
                             reply({ ok: true, status: 'pending_flush', confirmedCount: recorded.length })
@@ -1179,34 +1361,7 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                     })
                     return
                 }
-                const trailingStored = storedMessages.filter((msg) => msg.seq > lastRecordedSeq)
-                if (steps.length > recorded.length) {
-                    const pendingFingerprints = new Set(steps.slice(recorded.length).map((step) => step.fingerprint))
-                    for (const msg of trailingStored) {
-                        if (msg.invokedAt === null) continue
-                        const record = unwrapRoleWrappedRecordEnvelope(msg.content)
-                        if (!record || record.role !== 'user' || !isPlainRecord(record.content) || record.content.type !== 'text') {
-                            continue
-                        }
-                        const rawText = typeof record.content.text === 'string' ? record.content.text : ''
-                        if (!rawText) continue
-                        const fp = computeLocalTranscriptFingerprint({
-                            role: 'user',
-                            content: { type: 'text', text: rawText },
-                            meta: { sentFrom: 'cli' }
-                        })
-                        const trimmedFp = computeLocalTranscriptFingerprint({
-                            role: 'user',
-                            content: { type: 'text', text: rawText.trim() },
-                            meta: { sentFrom: 'cli' }
-                        })
-                        if (pendingFingerprints.has(fp) || pendingFingerprints.has(trimmedFp)) {
-                            reply({ ok: true, status: 'diverged' })
-                            return
-                        }
-                    }
-                }
-                if (steps.length === recorded.length) {
+                if (totalSteps === recorded.length) {
                     reply({ ok: true, status: 'up_to_date', confirmedCount: recorded.length })
                 } else {
                     reply({ ok: true, status: 'needs_backfill', fromIndex: recorded.length })
@@ -1214,29 +1369,13 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 return
             }
 
-            if (imported.length === 0 || storedMessages.length > imported.length || steps.length < imported.length) {
-                reply({ ok: true, status: 'diverged' })
-                return
-            }
-            const legacySteps: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
-            for (let i = 0; i < imported.length; i += 1) {
-                const msg = imported[i]!
-                const step = steps[i]!
-                if (
-                    msg.localId !== `${importPrefix}${step.anchor}`
-                    || computeLocalTranscriptFingerprint(msg.content) !== step.fingerprint
-                ) {
-                    reply({ ok: true, status: 'diverged' })
-                    return
-                }
-                legacySteps.push({
-                    anchor: step.anchor,
-                    fingerprint: step.fingerprint,
-                    messageId: msg.id
-                })
-            }
+            const legacySteps = imported.map((msg) => ({
+                anchor: msg.localId!.slice(importPrefix.length),
+                fingerprint: computeLocalTranscriptFingerprint(msg.content),
+                messageId: msg.id
+            }))
             store.nativeSteps.recordSteps(sid, nativeId, legacySteps)
-            if (steps.length === imported.length) {
+            if (totalSteps === imported.length) {
                 reply({ ok: true, status: 'up_to_date', confirmedCount: imported.length })
             } else {
                 reply({ ok: true, status: 'needs_backfill', fromIndex: imported.length })

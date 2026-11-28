@@ -50,6 +50,8 @@ export { isExternalUserMessage } from '@/claude/utils/transcriptEntry'
 // hub's scrollback ring). The tail always holds the latest full-screen redraw.
 const AGENT_TERMINAL_LOCAL_BUFFER_BYTES = 256 * 1024
 
+export const MAX_NATIVE_RECONCILE_BATCH = 2_000
+
 /**
  * Dedup filter for messages arriving on the realtime socket and via reconnect
  * backfill.  Keyed by message id (with a bounded LRU) and falls back to the
@@ -1821,7 +1823,8 @@ if (isReconnect) {
     async reconcileNativeSteps(
         nativeId: string,
         steps: ReadonlyArray<{ anchor: string; fingerprint: string }>,
-        timeoutMs: number = 5_000
+        timeoutMs: number = 5_000,
+        batchSize: number = MAX_NATIVE_RECONCILE_BATCH
     ): Promise<
         | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
         | { ok: true; status: 'pending_flush'; confirmedCount: number }
@@ -1841,15 +1844,58 @@ if (isReconnect) {
         if (!nativeId || this.state !== 'active' || !this.socket.connected) {
             return { ok: false }
         }
-        try {
-            return await this.socket.timeout(timeoutMs).emitWithAck('session-reconcile-native-steps', {
-                sid: this.sessionId,
-                nativeId,
-                steps: [...steps]
-            })
-        } catch {
-            return { ok: false }
+        const normalizedBatch = Number.isFinite(batchSize) ? Math.floor(batchSize) : MAX_NATIVE_RECONCILE_BATCH
+        const effectiveBatchSize = Math.max(1, Math.min(normalizedBatch, MAX_NATIVE_RECONCILE_BATCH))
+        if (steps.length <= effectiveBatchSize) {
+            try {
+                const response = await this.socket.timeout(timeoutMs).emitWithAck('session-reconcile-native-steps', {
+                    sid: this.sessionId,
+                    nativeId,
+                    steps: [...steps]
+                })
+                if (!response?.ok || response.status === 'continue') {
+                    return { ok: false }
+                }
+                return response
+            } catch {
+                return { ok: false }
+            }
         }
+        for (let offset = 0; offset < steps.length; offset += effectiveBatchSize) {
+            if (this.state !== 'active' || !this.socket.connected) {
+                return { ok: false }
+            }
+            const chunk = steps.slice(offset, offset + effectiveBatchSize)
+            const isFinalBatch = offset + chunk.length >= steps.length
+            try {
+                const response = await this.socket.timeout(timeoutMs).emitWithAck('session-reconcile-native-steps', {
+                    sid: this.sessionId,
+                    nativeId,
+                    offset,
+                    totalSteps: steps.length,
+                    steps: [...chunk]
+                })
+                if (!response?.ok) {
+                    return { ok: false }
+                }
+                if (response.status === 'diverged') {
+                    return response
+                }
+                if (!isFinalBatch) {
+                    if (response.status !== 'continue' || response.nextOffset !== offset + chunk.length) {
+                        return { ok: false }
+                    }
+                    continue
+                }
+                if (response.status === 'continue') {
+                    return { ok: false }
+                }
+                return response
+            } catch {
+                return { ok: false }
+            }
+        }
+        return { ok: false }
     }
 
     /** Backfills durable native messages and ledger fingerprints atomically after reopen reconciliation. */

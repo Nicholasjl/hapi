@@ -500,7 +500,7 @@ export function matchPendingDeliveriesAgainstTranscript(
     }
 
     if (hasUnmatchedCorroborated) {
-        if (tailMessages.length === 0) {
+        if (dIdx === tailMessages.length) {
             return {
                 status: 'pending_flush',
                 message: 'Antigravity has not finished writing uncommitted live messages to disk yet; retry shortly.'

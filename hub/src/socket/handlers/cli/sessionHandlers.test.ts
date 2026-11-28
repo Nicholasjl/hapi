@@ -1569,4 +1569,109 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         expect(acks.slice(4)).toEqual([{ ok: false }, { ok: false }])
         store.close()
     })
+
+    it('validates sessions with more than 10,000 entries in ordered batches before allowing backfill', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-large-reconcile',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-large' },
+            null,
+            'default'
+        )
+        const totalRecorded = 10_005
+        const steps: Array<{ anchor: string; fingerprint: string }> = []
+        const sharedUserContent = userContent('repeated prompt')
+        const sharedUserFingerprint = computeLocalTranscriptFingerprint(sharedUserContent)
+
+        store.runInTransaction(() => {
+            const toRecord: Array<{ anchor: string; fingerprint: string; messageId: string }> = []
+            for (let i = 0; i < totalRecorded; i += 1) {
+                const anchor = `step:${i}:0`
+                const msg = store.messages.addImportedMessage(
+                    session.id,
+                    sharedUserContent,
+                    `agy:native-large:${anchor}`,
+                    100 + i
+                ).message
+                toRecord.push({ anchor, fingerprint: sharedUserFingerprint, messageId: msg.id })
+                steps.push({ anchor, fingerprint: sharedUserFingerprint })
+            }
+            store.nativeSteps.recordSteps(session.id, 'native-large', toRecord)
+        })
+        for (let i = totalRecorded; i < totalRecorded + 2; i += 1) {
+            steps.push({ anchor: `step:${i}:0`, fingerprint: sharedUserFingerprint })
+        }
+
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session }),
+            emitAccessError() {}
+        })
+
+        // Single oversized payload exceeding per-request cap fails validation.
+        let singleShotAck: unknown
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-large',
+            steps: steps.slice(0, 10_001)
+        }, (resp) => { singleShotAck = resp })
+        expect(singleShotAck).toEqual({ ok: false })
+
+        // Starting mid-stream without offset=0 fails closed.
+        let skippedAck: unknown
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-large',
+            offset: 2_000,
+            totalSteps: steps.length,
+            steps: steps.slice(2_000, 4_000)
+        }, (resp) => { skippedAck = resp })
+        expect(skippedAck).toEqual({ ok: false })
+
+        // Batch sequence with a tampered fingerprint near the end returns diverged before allowing backfill.
+        const batchSize = 2_000
+        const tamperedSteps = steps.map((entry, idx) => (
+            idx === 10_002 ? { ...entry, fingerprint: hash('f') } : entry
+        ))
+        const tamperedAcks: unknown[] = []
+        for (let offset = 0; offset < tamperedSteps.length; offset += batchSize) {
+            socket.trigger('session-reconcile-native-steps', {
+                sid: session.id,
+                nativeId: 'native-large',
+                offset,
+                totalSteps: tamperedSteps.length,
+                steps: tamperedSteps.slice(offset, offset + batchSize)
+            }, (resp) => tamperedAcks.push(resp))
+        }
+        expect(tamperedAcks.slice(0, 5)).toEqual([
+            { ok: true, status: 'continue', nextOffset: 2_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 4_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 6_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 8_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 10_000, confirmedCount: totalRecorded }
+        ])
+        expect(tamperedAcks[5]).toEqual({ ok: true, status: 'diverged' })
+
+        // Valid full sequence across 6 batches returns needs_backfill on the final batch.
+        const validAcks: unknown[] = []
+        for (let offset = 0; offset < steps.length; offset += batchSize) {
+            socket.trigger('session-reconcile-native-steps', {
+                sid: session.id,
+                nativeId: 'native-large',
+                offset,
+                totalSteps: steps.length,
+                steps: steps.slice(offset, offset + batchSize)
+            }, (resp) => validAcks.push(resp))
+        }
+        expect(validAcks).toEqual([
+            { ok: true, status: 'continue', nextOffset: 2_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 4_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 6_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 8_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'continue', nextOffset: 10_000, confirmedCount: totalRecorded },
+            { ok: true, status: 'needs_backfill', fromIndex: totalRecorded }
+        ])
+        store.close()
+    })
 })

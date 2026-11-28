@@ -3799,4 +3799,146 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             rmSync(brainDir, { recursive: true, force: true });
         }
     });
+
+    it('keeps reopen retryable when native suffix ends with user prompt before corroborated reply flushes, then recovers and diverges on conflict', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-partial-reopen-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            const s0 = JSON.stringify({
+                step_index: 0,
+                type: 'USER_INPUT',
+                source: 'USER_EXPLICIT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\ninitial\n</USER_REQUEST>'
+            });
+            const s1 = JSON.stringify({
+                step_index: 1,
+                type: 'USER_INPUT',
+                source: 'USER_EXPLICIT',
+                status: 'DONE',
+                content: '<USER_REQUEST>\npartial prompt\n</USER_REQUEST>'
+            });
+            writeFileSync(stepsPath, [s0, s1].join('\n') + '\n');
+
+            // 1. Prompt persisted on disk, corroborated reply still flushing -> commits user step, returns retryable (NOT diverged).
+            const partial = makeSession();
+            partial.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            partial.client.reconcileNativeSteps.mockResolvedValue({
+                ok: true,
+                status: 'needs_reconcile',
+                fromIndex: 1,
+                pendingDeliveries: [
+                    { kind: 'user', localIds: ['u-part'], texts: ['partial prompt'] },
+                    { kind: 'agent', localId: 'agy-live:part-r', data: { type: 'message', message: 'partial reply' } }
+                ]
+            });
+            partial.client.commitNativeSteps.mockResolvedValue({ ok: true, confirmedCount: 2, inserted: 0, updated: 0 });
+            partial.queue.close();
+            await expect(launch(partial.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toMatchObject({ name: 'AgyNativeReconcileError', kind: 'retryable' });
+            expect(partial.client.commitNativeSteps).toHaveBeenCalledTimes(1);
+            expect(partial.client.emitSessionReady).not.toHaveBeenCalled();
+
+            // 2. Once reply finishes flushing to disk, reopen commits the reply and becomes ready.
+            const s2 = JSON.stringify({
+                step_index: 2,
+                type: 'PLANNER_RESPONSE',
+                source: 'MODEL',
+                status: 'DONE',
+                content: 'partial reply'
+            });
+            writeFileSync(stepsPath, [s0, s1, s2].join('\n') + '\n');
+            const recovered = makeSession();
+            recovered.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            recovered.client.reconcileNativeSteps.mockResolvedValue({
+                ok: true,
+                status: 'needs_reconcile',
+                fromIndex: 2,
+                pendingDeliveries: [
+                    { kind: 'agent', localId: 'agy-live:part-r', data: { type: 'message', message: 'partial reply' } }
+                ]
+            });
+            recovered.client.commitNativeSteps.mockResolvedValue({ ok: true, confirmedCount: 3, inserted: 0, updated: 0 });
+            const { run } = launch(recovered.session, [new FakeAgyBackend()], { brainDir });
+            await vi.waitFor(() => expect(recovered.client.emitSessionReady).toHaveBeenCalledOnce());
+            expect(recovered.client.commitNativeSteps).toHaveBeenCalledTimes(1);
+            recovered.queue.close();
+            await run;
+
+            // 3. Conflicting reply on disk still fails closed as diverged without partial commit.
+            const s2Conflict = JSON.stringify({
+                step_index: 2,
+                type: 'PLANNER_RESPONSE',
+                source: 'MODEL',
+                status: 'DONE',
+                content: 'conflicting reply'
+            });
+            writeFileSync(stepsPath, [s0, s1, s2Conflict].join('\n') + '\n');
+            const diverged = makeSession();
+            diverged.client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            diverged.client.reconcileNativeSteps.mockResolvedValue({
+                ok: true,
+                status: 'needs_reconcile',
+                fromIndex: 1,
+                pendingDeliveries: [
+                    { kind: 'user', localIds: ['u-part'], texts: ['partial prompt'] },
+                    { kind: 'agent', localId: 'agy-live:part-r', data: { type: 'message', message: 'partial reply' } }
+                ]
+            });
+            diverged.queue.close();
+            await expect(launch(diverged.session, [new FakeAgyBackend()], { brainDir }).run)
+                .rejects.toMatchObject({ name: 'AgyNativeReconcileError', kind: 'diverged' });
+            expect(diverged.client.commitNativeSteps).not.toHaveBeenCalled();
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
+
+    it('reads transcript under AGY_APP_DATA_DIR when reopening an override-imported session without opts.brainDir', async () => {
+        const previousAppDataDir = process.env.AGY_APP_DATA_DIR;
+        const overrideRoot = mkdtempSync(join(tmpdir(), 'hapi-agy-override-dir-'));
+        try {
+            const logsDir = join(overrideRoot, 'brain', 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            writeFileSync(join(logsDir, 'transcript.jsonl'), [
+                JSON.stringify({
+                    step_index: 0,
+                    type: 'USER_INPUT',
+                    source: 'USER_EXPLICIT',
+                    status: 'DONE',
+                    content: '<USER_REQUEST>\noverride start\n</USER_REQUEST>'
+                }),
+                JSON.stringify({
+                    step_index: 1,
+                    type: 'PLANNER_RESPONSE',
+                    source: 'MODEL',
+                    status: 'DONE',
+                    content: 'override answer'
+                })
+            ].join('\n') + '\n');
+
+            process.env.AGY_APP_DATA_DIR = overrideRoot;
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+
+            const { run } = launch(session, [new FakeAgyBackend()]);
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+            expect(client.reconcileNativeSteps).toHaveBeenCalledWith(
+                'agy-conv-new',
+                [
+                    { anchor: 'step:0:0', fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) },
+                    { anchor: 'step:1:text', fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) }
+                ]
+            );
+
+            queue.close();
+            await run;
+        } finally {
+            if (previousAppDataDir === undefined) delete process.env.AGY_APP_DATA_DIR;
+            else process.env.AGY_APP_DATA_DIR = previousAppDataDir;
+            rmSync(overrideRoot, { recursive: true, force: true });
+        }
+    });
 });

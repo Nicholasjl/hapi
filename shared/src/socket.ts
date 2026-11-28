@@ -331,10 +331,13 @@ export interface ClientToServerEvents {
         data: {
             sid: string
             nativeId: string
+            offset?: number
+            totalSteps?: number
             steps: Array<{ anchor: string; fingerprint: string }>
         },
         callback?: (
             response:
+                | { ok: true; status: 'continue'; nextOffset: number; confirmedCount: number }
                 | { ok: true; status: 'up_to_date'; confirmedCount: number; unresolvedLocalIds?: string[] }
                 | { ok: true; status: 'pending_flush'; confirmedCount: number }
                 | { ok: true; status: 'needs_backfill'; fromIndex: number }

@@ -1383,6 +1383,53 @@ describe('generic local session routes', () => {
             body: JSON.stringify({ sessionIds: ['agy-e2e'], cwd: '/work' })
         })).json() as { results: Array<{ hapiSessionId?: string; error?: { code: string } }> }
         expect(divRes.results[0]?.error?.code).toBe('transcript_diverged')
+
+        // 5. Partial turn flush on re-import (prompt persisted on disk, reply still flushing) returns pending_native_flush,
+        //    and recovers cleanly once the reply lands on disk.
+        const p0 = nativeUser('agy-partial', 'step:0:0', 'boot', 100)
+        const p1 = nativeAgent('agy-partial', 'step:1:text', 'booted', 101)
+        const partialTranscript = {
+            flavor: 'agy' as const,
+            id: 'agy-partial',
+            title: 'Partial Flush',
+            lastUserMessage: 'boot',
+            cwd: '/work',
+            file: '/brain/agy-partial/transcript.jsonl',
+            modifiedAt: 101,
+            messages: [p0, p1]
+        }
+        agySession = partialTranscript
+        const partialInitRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string }> }
+        const partialHapiId = partialInitRes.results[0]!.hapiSessionId!
+        expect(partialInitRes.results[0]?.action).toBe('created')
+
+        store.messages.addMessage(partialHapiId, { role: 'user', content: { type: 'text', text: 'partial prompt' }, meta: { sentFrom: 'web' } }, 'partial-u-1', null, 110)
+        handlers.get('messages-consumed')!({ sid: partialHapiId, localIds: ['partial-u-1'], nativeId: 'agy-partial' })
+        handlers.get('message')!({
+            sid: partialHapiId,
+            localId: 'agy-live:partial-r-1',
+            createdAt: 111,
+            message: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'partial live reply' } } }
+        })
+
+        const p2User = nativeUser('agy-partial', 'step:2:0', 'partial prompt', 110)
+        agySession = { ...partialTranscript, messages: [p0, p1, p2User] }
+        const partialWaitingRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; error?: { code: string } }> }
+        expect(partialWaitingRes.results[0]?.error?.code).toBe('pending_native_flush')
+
+        const p3Reply = nativeAgent('agy-partial', 'step:3:text', 'partial live reply', 111)
+        agySession = { ...partialTranscript, messages: [p0, p1, p2User, p3Reply] }
+        const partialDoneRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(partialDoneRes.results[0]).toMatchObject({ hapiSessionId: partialHapiId, action: 'unchanged', appended: 0 })
     })
 
 })
