@@ -902,6 +902,135 @@ describe('generic local session routes', () => {
         expect(store.messages.getAllMessages(hapiId)).toHaveLength(countAfterFirstSync)
     })
 
+    it('preserves /swarm board and pre-dispatch restored prompts across Antigravity re-imports using runner provenance', async () => {
+        const store = new Store(':memory:')
+        stores.push(store)
+        const nativeUser = (id: string, text: string, createdAt = 10) => ({
+            id: `agy:agy-prov:${id}`,
+            createdAt,
+            content: { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli' } } as const,
+            anchor: id
+        })
+        const nativeAgent = (id: string, message: string, createdAt = 10) => ({
+            id: `agy:agy-prov:${id}`,
+            createdAt,
+            content: { role: 'agent', content: { type: 'codex', data: { type: 'message', message } }, meta: { sentFrom: 'cli' } } as const,
+            anchor: id
+        })
+
+        let agySession = {
+            flavor: 'agy' as const,
+            id: 'agy-prov',
+            title: 'Provenance re-import',
+            lastUserMessage: 'initial prompt',
+            cwd: '/work',
+            file: '/tmp/.gemini/antigravity-cli/brain/agy-prov/.system_generated/logs/transcript.jsonl',
+            modifiedAt: 10,
+            messages: [
+                nativeUser('step:0:0', 'initial prompt', 10),
+                nativeAgent('step:1:0', 'initial answer', 11)
+            ]
+        }
+
+        const engine = {
+            getOnlineMachinesByNamespace: () => [machine()],
+            listLocalSessionsForMachine: async () => ({ success: true, sessions: [agySession] }),
+            recordSessionActivity: () => {},
+            handleRealtimeEvent: () => {},
+            applySessionConfig: async () => {}
+        } as unknown as SyncEngine
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createLocalSessionRoutes({
+            store,
+            getSyncEngine: () => engine,
+            sources: [AGY_LOCAL_SESSION_SOURCE]
+        }))
+
+        const created = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-prov'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string }> }
+        const hapiId = created.results[0]!.hapiSessionId!
+
+        // HAPI-only /swarm board + pre-dispatch restored prompt + one real dispatched ACP turn.
+        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: '/swarm board' }, meta: { sentFrom: 'web' } }, 'board-1', null, 20)
+        store.messages.markMessagesInvoked(hapiId, ['board-1'], 20)
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: '### Swarm Board', hapiOnly: true } }
+        }, undefined, null, 21)
+        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'failed pre-dispatch' }, meta: { sentFrom: 'web' } }, 'restore-1', null, 22)
+        store.messages.markMessagesInvoked(hapiId, ['restore-1'], 22)
+        store.messages.addMessage(hapiId, { role: 'user', content: { type: 'text', text: 'real dispatched turn' }, meta: { sentFrom: 'web' } }, 'real-1', null, 30)
+        store.messages.markMessagesInvoked(hapiId, ['real-1'], 30)
+        store.messages.addMessage(hapiId, {
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: 'real reply' } }
+        }, undefined, null, 35)
+
+        const sessionRow = store.sessions.getSessionByNamespace(hapiId, 'default')!
+        store.sessions.updateSessionMetadata(
+            hapiId,
+            {
+                ...(sessionRow.metadata as object),
+                agyNativeTurns: [{
+                    acpSessionId: 'agy-prov',
+                    localIds: ['real-1'],
+                    promptText: 'real dispatched turn',
+                    userStepIndex: 2,
+                    endStepIndex: 3,
+                    kind: 'prompt'
+                }]
+            },
+            sessionRow.metadataVersion,
+            'default'
+        )
+
+        const nativeLivePrefix = [
+            nativeUser('step:2:0', 'real dispatched turn', 30),
+            nativeAgent('step:3:0', 'real reply', 35)
+        ]
+        const nativeTail = [
+            nativeUser('step:4:0', 'continued in cli', 50),
+            nativeAgent('step:5:0', 'cli response', 55)
+        ]
+        const initial = agySession.messages
+        agySession = { ...agySession, messages: [...initial, ...nativeLivePrefix, ...nativeTail] }
+
+        const sync = async () => (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-prov'], cwd: '/work' })
+        })).json() as Promise<{ results: Array<{ hapiSessionId?: string; action?: string; appended?: number; error?: { code: string } }> }>
+
+        const first = await sync()
+        expect(first.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'updated', appended: 2 })
+        const msgsAfterFirst = store.messages.getAllMessages(hapiId)
+        expect(msgsAfterFirst.filter((m) => m.localId === 'agy:agy-prov:step:4:0')).toHaveLength(1)
+        expect(msgsAfterFirst.some((m) => m.localId === 'board-1')).toBe(true)
+        expect(msgsAfterFirst.some((m) => m.localId === 'restore-1')).toBe(true)
+
+        // Second re-import must be idempotent even after native tail pins sit after /swarm board & restore rows.
+        const second = await sync()
+        expect(second.results[0]).toMatchObject({ hapiSessionId: hapiId, action: 'unchanged', appended: 0 })
+        expect(store.messages.getAllMessages(hapiId)).toHaveLength(msgsAfterFirst.length)
+
+        // Genuine edit to the dispatched prompt text still diverges.
+        agySession = {
+            ...agySession,
+            messages: [
+                ...initial,
+                nativeUser('step:2:0', 'tampered dispatched turn', 30),
+                nativeAgent('step:3:0', 'real reply', 35),
+                ...nativeTail
+            ]
+        }
+        expect((await sync()).results[0]?.error?.code).toBe('transcript_diverged')
+    })
+
 })
 
 describe('fetchLocalTranscripts', () => {

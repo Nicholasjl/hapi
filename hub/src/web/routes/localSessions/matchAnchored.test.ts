@@ -439,4 +439,87 @@ describe('anchored match: live Antigravity delivered-turn boundaries', () => {
             liveUserBatchMatches: agyMatch!.liveUserBatchMatches
         }).status).toBe('transcript_diverged')
     })
+
+    it('reconciles using native turn provenance while skipping /swarm board and pre-dispatch restored prompts', () => {
+        const swarmUser = agyStoredUser(2, 'board-1', '/swarm board', { invokedAt: 15, createdAt: 15 })
+        const swarmReply: StoredMessage = {
+            id: 'stored-board-reply',
+            sessionId: 'hapi-agy',
+            content: {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: '### Swarm Board', hapiOnly: true } },
+                meta: { sentFrom: 'cli' }
+            },
+            createdAt: 16,
+            seq: 3,
+            localId: null,
+            invokedAt: 16,
+            scheduledAt: null
+        }
+        const restoredUser = agyStoredUser(4, 'restored-1', 'failed before dispatch', { invokedAt: 18, createdAt: 17 })
+        const realUserA = agyStoredUser(5, 'real-1', 'first batch', { invokedAt: 25, createdAt: 20 })
+        const realUserB = agyStoredUser(6, 'real-2', 'second batch', { invokedAt: 25, createdAt: 21 })
+        const realReply = agyStoredAgent(7, 'real answer', 30)
+
+        const stored: StoredMessage[] = [
+            agyStoredUser(1, `${AGY_PREFIX}step:0:0`, 'imported', { invokedAt: 10, createdAt: 10 }),
+            swarmUser,
+            swarmReply,
+            restoredUser,
+            realUserA,
+            realUserB,
+            realReply
+        ]
+        const provenance = [{
+            localIds: ['real-1', 'real-2'],
+            promptText: 'first batch\nsecond batch',
+            userStepIndex: 2,
+            endStepIndex: 3
+        }]
+
+        const ok = matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([
+                agyNativeUser('step:0:0', 'imported'),
+                agyNativeUser('step:2:0', 'first batch\nsecond batch'),
+                agyNativeAgent('step:3:0', 'real answer'),
+                agyNativeUser('step:4:0', 'native tail')
+            ]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            liveCompareKey: agyMatch!.liveCompareKey,
+            liveNativeTurns: provenance
+        })
+        expect(ok).toEqual({
+            status: 'ok',
+            delta: [agyNativeUser('step:4:0', 'native tail')]
+        })
+
+        // Shifted userStepIndex or edited native prompt still diverges.
+        expect(matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([
+                agyNativeUser('step:0:0', 'imported'),
+                agyNativeUser('step:99:0', 'first batch\nsecond batch'),
+                agyNativeAgent('step:100:0', 'real answer')
+            ]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            liveCompareKey: agyMatch!.liveCompareKey,
+            liveNativeTurns: provenance
+        }).status).toBe('transcript_diverged')
+
+        expect(matchAnchored({
+            storedMessages: stored,
+            transcript: agyTranscript([
+                agyNativeUser('step:0:0', 'imported'),
+                agyNativeUser('step:2:0', 'edited batch prompt'),
+                agyNativeAgent('step:3:0', 'real answer')
+            ]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            liveCompareKey: agyMatch!.liveCompareKey,
+            liveNativeTurns: provenance
+        }).status).toBe('transcript_diverged')
+    })
 })

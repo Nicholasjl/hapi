@@ -44,13 +44,15 @@ export {
     AttachedJobSchema,
     AttachedJobUpsertSchema,
     AttachedJobPatchSchema,
-    AttachedJobStatusSchema
+    AttachedJobStatusSchema,
+    AgyNativeTurnProvenanceSchema
 } from './schemas'
 export type {
     AttachedJob,
     AttachedJobUpsert,
     AttachedJobPatch,
-    AttachedJobStatus
+    AttachedJobStatus,
+    AgyNativeTurnProvenance
 } from './schemas'
 export type * from './types'
 

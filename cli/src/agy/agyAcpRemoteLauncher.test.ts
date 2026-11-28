@@ -2986,4 +2986,108 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             await cleanupUploadDir(client.sessionId);
         }
     });
+
+    it('tags /swarm board replies hapiOnly without recording them or pre-dispatch restores in agyNativeTurns, while recording real dispatched turns with step provenance', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-provenance-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+            writeFileSync(stepsPath, '');
+
+            const { session, queue, client } = makeSession();
+            let currentMetadata: Record<string, unknown> = {
+                path: '/tmp/agy-project',
+                host: 'test',
+                agyImportedAt: 100
+            };
+            const agyNativeTurnHistory: unknown[] = [];
+            client.getMetadata.mockImplementation(() => currentMetadata as never);
+            client.updateMetadata.mockImplementation((updater: (m: Record<string, unknown>) => Record<string, unknown>) => {
+                currentMetadata = updater(currentMetadata);
+                agyNativeTurnHistory.push(structuredClone(currentMetadata.agyNativeTurns));
+            });
+
+            const backend = new FakeAgyBackend();
+            backend.preSendDelayMs = 80;
+            backend.promptScripts.push(async (onUpdate) => {
+                onUpdate({ type: 'turn_complete', stopReason: 'cancelled' });
+            });
+            backend.promptScripts.push(async (onUpdate) => {
+                onUpdate({ type: 'turn_complete', stopReason: 'cancelled' });
+            });
+            backend.promptScripts.push(async (onUpdate) => {
+                writeFileSync(stepsPath, [
+                    JSON.stringify({
+                        step_index: 5,
+                        type: 'USER_INPUT',
+                        source: 'USER_EXPLICIT',
+                        content: '<USER_REQUEST>\nfirst batch line\nsecond batch line\n</USER_REQUEST>'
+                    }),
+                    JSON.stringify({
+                        step_index: 6,
+                        type: 'PLANNER_RESPONSE',
+                        source: 'MODEL',
+                        content: 'done batch'
+                    })
+                ].join('\n') + '\n');
+                onUpdate({ type: 'text', text: 'done batch' });
+                onUpdate({ type: 'turn_complete', stopReason: 'end_turn' });
+            });
+
+            const { run } = launch(session, [backend], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+            expect(currentMetadata.agyNativeTurns).toEqual([]);
+
+            // 1. /swarm board must emit hapiOnly agent reply and leave agyNativeTurns empty.
+            queue.pushIsolated('/swarm board', REVIEW, 'board-1');
+            await vi.waitFor(() => expect(client.emitMessagesConsumed).toHaveBeenCalledWith(['board-1']));
+            expect(client.sendAgentMessage).toHaveBeenCalledWith(expect.objectContaining({
+                type: 'message',
+                hapiOnly: true
+            }));
+            expect(currentMetadata.agyNativeTurns).toEqual([]);
+
+            // 2. Pre-dispatch abort restores to composer without recording provenance.
+            const metadataUpdatesBeforeAbort = client.updateMetadata.mock.calls.length;
+            queue.push('restored turn', REVIEW, 'restored-1');
+            await vi.waitFor(() => expect(backend.setModeCalls).toHaveLength(1));
+            await client.rpcHandlerManager.handlers.get(RPC_METHODS.Abort)!();
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'abort-restore',
+                text: 'restored turn'
+            }));
+            await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(2));
+            expect(agyNativeTurnHistory.slice(metadataUpdatesBeforeAbort).every((turns) => Array.isArray(turns) && turns.length === 0)).toBe(true);
+            expect(currentMetadata.agyNativeTurns).toEqual([]);
+
+            // 3. Cancelled turn before output restores to composer and reverts any pending provenance.
+            backend.preSendDelayMs = 0;
+            queue.push('cancelled turn', REVIEW, 'cancelled-1');
+            await vi.waitFor(() => expect(client.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'abort-restore',
+                text: 'cancelled turn'
+            }));
+            await vi.waitFor(() => expect(sessionEvents(client).filter((e) => (e as { type?: string }).type === 'ready')).toHaveLength(3));
+            expect(currentMetadata.agyNativeTurns).toEqual([]);
+
+            // 4. Real batched prompt records ordered localIds, promptText, and confirmed transcript step indices.
+            queue.push('first batch line', REVIEW, 'real-1');
+            queue.push('second batch line', REVIEW, 'real-2');
+            await vi.waitFor(() => expect(backend.prompts).toHaveLength(3));
+            await vi.waitFor(() => expect(currentMetadata.agyNativeTurns).toEqual([{
+                acpSessionId: 'agy-conv-new',
+                localIds: ['real-1', 'real-2'],
+                promptText: 'first batch line\nsecond batch line',
+                userStepIndex: 5,
+                endStepIndex: 6,
+                kind: 'prompt'
+            }]));
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
+        }
+    });
 });

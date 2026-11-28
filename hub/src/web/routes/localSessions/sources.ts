@@ -26,6 +26,7 @@ import type { SyncEngine } from '../../../sync/syncEngine'
 import type { StoredMessage } from '../../../store'
 import { truncateOversizedMessageContent } from '../../../store/contentCodec'
 import { normalizeComparableText, stableSerializeContent } from './compare'
+import type { LiveNativeTurnRecord } from './matchAnchored'
 
 /**
  * Declarative hub-side source descriptors. Sources only describe
@@ -57,6 +58,7 @@ export type HubLocalSessionSource = {
         canonicalContent?: (content: unknown) => unknown
         liveCompareKey?: (content: unknown, callIds?: Map<string, number>) => string | null
         liveUserBatchMatches?: (batch: StoredMessage[], nativeContent: unknown) => boolean
+        liveNativeTurns?: (metadata: Record<string, unknown>, transcriptId: string) => LiveNativeTurnRecord[] | undefined
     }
         | { strategy: 'contentPrefix'; compareKey?: (content: unknown) => string | null }
     /** Lifecycle stamped on create. */
@@ -285,6 +287,7 @@ function agyLiveCompareKey(content: unknown, callIds?: Map<string, number>): str
         || data.type === 'error'
         || data.live === true
         || data.streamSnapshot === true
+        || data.hapiOnly === true
     ) {
         return null
     }
@@ -434,7 +437,25 @@ export const AGY_LOCAL_SESSION_SOURCE: HubLocalSessionSource = {
     match: {
         strategy: 'anchored',
         liveCompareKey: agyLiveCompareKey,
-        liveUserBatchMatches: agyLiveUserBatchMatches
+        liveUserBatchMatches: agyLiveUserBatchMatches,
+        liveNativeTurns: (metadata, transcriptId) => {
+            if (!Array.isArray(metadata.agyNativeTurns)) return undefined
+            return metadata.agyNativeTurns
+                .filter(
+                    (entry): entry is LiveNativeTurnRecord & { acpSessionId: string } =>
+                        entry !== null
+                        && typeof entry === 'object'
+                        && (entry as { acpSessionId?: unknown }).acpSessionId === transcriptId
+                        && Array.isArray((entry as { localIds?: unknown }).localIds)
+                        && typeof (entry as { promptText?: unknown }).promptText === 'string'
+                )
+                .map((entry) => ({
+                    localIds: entry.localIds,
+                    promptText: entry.promptText,
+                    userStepIndex: entry.userStepIndex ?? null,
+                    endStepIndex: entry.endStepIndex ?? null
+                }))
+        }
     },
     lifecycleOnCreate: 'archived',
     requireWorkingDirectory: true,

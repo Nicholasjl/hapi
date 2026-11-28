@@ -378,6 +378,9 @@ export function runLocalImportSync(options: {
                     canonicalContent: source.match.canonicalContent,
                     liveCompareKey: source.match.liveCompareKey,
                     liveUserBatchMatches: source.match.liveUserBatchMatches,
+                    liveNativeTurns: target && source.match.liveNativeTurns
+                        ? source.match.liveNativeTurns(storedMetadata(target), transcript.id)
+                        : undefined,
                     cursor: target && cursorKey
                         ? (typeof storedMetadata(target)[cursorKey] === 'string' ? storedMetadata(target)[cursorKey] as string : null)
                         : null

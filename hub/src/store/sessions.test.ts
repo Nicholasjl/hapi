@@ -1726,3 +1726,48 @@ describe('updateSessionAgentState: updated_at (#1855)', () => {
         expect(update({}, 3).result).toBe('version-mismatch')
     })
 })
+
+describe('updateSessionMetadata: Antigravity import & native provenance preservation', () => {
+    it('preserves agyImportedAt and agyNativeTurns across sparse CLI metadata updates', () => {
+        const store = makeStore()
+        const turns = [{
+            acpSessionId: 'agy-native-1',
+            localIds: ['local-1'],
+            promptText: 'check build',
+            userStepIndex: 2,
+            endStepIndex: 4,
+            kind: 'prompt' as const
+        }]
+        const session = store.sessions.getOrCreateSession(
+            'agy-sparse-meta',
+            {
+                path: '/tmp/p',
+                host: 'h',
+                flavor: 'agy',
+                agySessionId: 'agy-native-1',
+                agyImportedAt: 1700,
+                agyNativeTurns: turns
+            },
+            null,
+            'default'
+        )
+
+        const sparseUpdate = store.sessions.updateSessionMetadata(
+            session.id,
+            {
+                path: '/tmp/p',
+                host: 'h',
+                flavor: 'agy',
+                agySessionId: 'agy-native-1',
+                summary: { text: 'Updated title', updatedAt: 2000 }
+            },
+            session.metadataVersion,
+            'default'
+        )
+        expect(sparseUpdate.result).toBe('success')
+        const refreshed = store.sessions.getSession(session.id)
+        expect((refreshed?.metadata as { agyImportedAt?: number; agyNativeTurns?: unknown })?.agyImportedAt).toBe(1700)
+        expect((refreshed?.metadata as { agyImportedAt?: number; agyNativeTurns?: unknown })?.agyNativeTurns).toEqual(turns)
+        store.close()
+    })
+})
