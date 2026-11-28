@@ -1674,4 +1674,248 @@ describe('session-reconcile-native-steps and session-backfill-native-messages ha
         ])
         store.close()
     })
+
+    it('reorders confirmed steers to echo order, keeps pre-echo steers after earlier results, and commits placeholder/whitespace/>64KB updates', () => {
+        const { AGY_BACKGROUND_COMMAND_RESULT } = require('@hapi/protocol/localTranscript') as typeof import('@hapi/protocol/localTranscript')
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession(
+            'agy-edge-handlers',
+            { path: '/work', host: 'h1', agyImportedAt: 100, agySessionId: 'native-edge' },
+            null,
+            'default'
+        )
+        const c0 = userContent('seed prompt')
+        const m0 = store.messages.addImportedMessage(session.id, c0, 'agy:native-edge:step:0:0', 10).message
+        store.nativeSteps.recordSteps(session.id, 'native-edge', [
+            { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0), messageId: m0.id }
+        ])
+
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session }),
+            emitAccessError() {}
+        })
+
+        // 1. Steer dispatched before an earlier tool result arrives -> while unconfirmed, tool result precedes uncertain steer;
+        //    once echoed via messages-consumed, steer moves to native echo position; duplicate replay does not reorder past later output.
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'steered note' }, meta: { sentFrom: 'web' } }, 'steer-1', null, 20)
+        socket.trigger('messages-steer-state', {
+            sid: session.id,
+            localIds: ['steer-1'],
+            state: 'dispatching',
+            nativeId: 'native-edge'
+        }, () => {})
+
+        const toolResContent = {
+            role: 'agent',
+            content: {
+                type: AGENT_MESSAGE_PAYLOAD_TYPE,
+                data: { type: 'tool-call-result', callId: 'live-bg-call', output: AGY_BACKGROUND_COMMAND_RESULT, is_error: false }
+            }
+        }
+        socket.trigger('message', {
+            sid: session.id,
+            localId: 'agy-live:tool-res-1',
+            createdAt: 21,
+            message: toolResContent
+        })
+
+        let preEchoReconcile: unknown
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0) },
+                { anchor: 'step:1:0', fingerprint: computeLocalTranscriptFingerprint(toolResContent) }
+            ]
+        }, (resp) => { preEchoReconcile = resp })
+        expect(preEchoReconcile).toMatchObject({
+            ok: true,
+            status: 'needs_reconcile',
+            fromIndex: 1,
+            pendingDeliveries: [
+                { kind: 'agent', localId: 'agy-live:tool-res-1' },
+                { kind: 'user', localIds: ['steer-1'], uncertain: true }
+            ]
+        })
+
+        // Echo arrives after tool-res-1 -> moves steer-1 to native echo order; then later agent reply arrives;
+        // duplicate messages-consumed does NOT move steer-1 behind after-steer.
+        socket.trigger('messages-consumed', {
+            sid: session.id,
+            localIds: ['steer-1'],
+            steered: true,
+            nativeId: 'native-edge'
+        })
+        const afterSteerContent = agentContent('after steer reply')
+        socket.trigger('message', {
+            sid: session.id,
+            localId: 'agy-live:after-steer',
+            createdAt: 23,
+            message: afterSteerContent
+        })
+        socket.trigger('messages-consumed', {
+            sid: session.id,
+            localIds: ['steer-1'],
+            steered: true,
+            nativeId: 'native-edge'
+        })
+        expect(store.nativeSteps.getPendingDeliveries(session.id, 'native-edge').map((d) => d.localIds[0])).toEqual([
+            'agy-live:tool-res-1',
+            'steer-1',
+            'agy-live:after-steer'
+        ])
+
+        let postEchoReconcile: unknown
+        socket.trigger('session-reconcile-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            steps: [
+                { anchor: 'step:0:0', fingerprint: computeLocalTranscriptFingerprint(c0) },
+                { anchor: 'step:1:0', fingerprint: computeLocalTranscriptFingerprint(toolResContent) }
+            ]
+        }, (resp) => { postEchoReconcile = resp })
+        expect(postEchoReconcile).toMatchObject({
+            ok: true,
+            status: 'needs_reconcile',
+            fromIndex: 1,
+            pendingDeliveries: [
+                { kind: 'agent', localId: 'agy-live:tool-res-1' },
+                { kind: 'user', localIds: ['steer-1'], uncertain: false },
+                { kind: 'agent', localId: 'agy-live:after-steer' }
+            ]
+        })
+
+        // 2. Commit handler recognizes serialized AGY_BACKGROUND_COMMAND_RESULT placeholder and updates it with completed output.
+        const completedBgContent = {
+            role: 'agent',
+            content: {
+                type: AGENT_MESSAGE_PAYLOAD_TYPE,
+                data: { type: 'tool-call-result', callId: 'native-bg-call', output: { output: 'Command exited with code 0.\ndone', exit_code: 0 }, is_error: false }
+            },
+            meta: { sentFrom: 'cli' }
+        }
+        let bgCommitAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 1,
+            entries: [{
+                kind: 'reconcile_update',
+                anchor: 'step:1:0',
+                fingerprint: computeLocalTranscriptFingerprint(completedBgContent),
+                targetLocalId: 'agy-live:tool-res-1',
+                localId: 'agy:native-edge:step:1:0',
+                content: completedBgContent,
+                createdAt: 21
+            }]
+        }, (resp) => { bgCommitAck = resp })
+        expect(bgCommitAck).toEqual({ ok: true, confirmedCount: 2, inserted: 0, updated: 1 })
+        const updatedBg = store.messages.getAllMessages(session.id).find((m) => m.localId === 'agy-live:tool-res-1')
+        expect(updatedBg?.content).toMatchObject({
+            role: 'agent',
+            content: { data: { callId: 'live-bg-call', output: { output: 'Command exited with code 0.\ndone', exit_code: 0 } } }
+        })
+
+        // 3. Commit handler matches single and batched prompts with surrounding whitespace, while preserving internal whitespace.
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: '  hello   world  ' }, meta: { sentFrom: 'web' } }, 'ws-single', null, 30)
+        const internalMismatchContent = userContent('hello world')
+        let mismatchAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 2,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:2:0',
+                fingerprint: computeLocalTranscriptFingerprint(internalMismatchContent),
+                targetLocalIds: ['ws-single'],
+                content: internalMismatchContent,
+                createdAt: 30
+            }]
+        }, (resp) => { mismatchAck = resp })
+        expect(mismatchAck).toEqual({ ok: false, reason: 'content_mismatch' })
+
+        const trimmedSingleContent = userContent('hello   world')
+        let singleWsAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 2,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:2:0',
+                fingerprint: computeLocalTranscriptFingerprint(trimmedSingleContent),
+                targetLocalIds: ['ws-single'],
+                content: trimmedSingleContent,
+                createdAt: 30
+            }]
+        }, (resp) => { singleWsAck = resp })
+        expect(singleWsAck).toEqual({ ok: true, confirmedCount: 3, inserted: 0, updated: 0 })
+
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: '  first  ' }, meta: { sentFrom: 'web' } }, 'ws-b1', null, 31)
+        store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: '  second  ' }, meta: { sentFrom: 'web' } }, 'ws-b2', null, 32)
+        const trimmedBatchContent = userContent('first  \n  second')
+        let batchWsAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 3,
+            entries: [{
+                kind: 'link',
+                anchor: 'step:3:0',
+                fingerprint: computeLocalTranscriptFingerprint(trimmedBatchContent),
+                targetLocalIds: ['ws-b1', 'ws-b2'],
+                content: trimmedBatchContent,
+                createdAt: 32
+            }]
+        }, (resp) => { batchWsAck = resp })
+        expect(batchWsAck).toEqual({ ok: true, confirmedCount: 4, inserted: 0, updated: 0 })
+
+        // 4. Commit handler upgrades a >64KB Hub-truncated live reply with the completed >64KB native reply, and rejects altered tails.
+        const longPrefix = `${'L'.repeat(70_000)}-TAIL-MARK`
+        const longComplete = `${longPrefix}\n${'M'.repeat(10_000)}`
+        const longWrongTail = `${'L'.repeat(69_999)}X-TAIL-MARK\n${'M'.repeat(10_000)}`
+        socket.trigger('message', {
+            sid: session.id,
+            localId: 'agy-live:long-reply',
+            createdAt: 40,
+            message: agentContent(longPrefix)
+        })
+        let wrongTailAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 4,
+            entries: [{
+                kind: 'reconcile_update',
+                anchor: 'step:4:text',
+                fingerprint: computeLocalTranscriptFingerprint(agentContent(longWrongTail)),
+                targetLocalId: 'agy-live:long-reply',
+                localId: 'agy:native-edge:step:4:text',
+                content: agentContent(longWrongTail),
+                createdAt: 40
+            }]
+        }, (resp) => { wrongTailAck = resp })
+        expect(wrongTailAck).toEqual({ ok: false, reason: 'content_mismatch' })
+
+        let longCommitAck: unknown
+        socket.trigger('session-commit-native-steps', {
+            sid: session.id,
+            nativeId: 'native-edge',
+            expectedOffset: 4,
+            entries: [{
+                kind: 'reconcile_update',
+                anchor: 'step:4:text',
+                fingerprint: computeLocalTranscriptFingerprint(agentContent(longComplete)),
+                targetLocalId: 'agy-live:long-reply',
+                localId: 'agy:native-edge:step:4:text',
+                content: agentContent(longComplete),
+                createdAt: 40
+            }]
+        }, (resp) => { longCommitAck = resp })
+        expect(longCommitAck).toEqual({ ok: true, confirmedCount: 5, inserted: 0, updated: 1 })
+        store.close()
+    })
 })

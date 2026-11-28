@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { Hono } from 'hono'
-import type { LocalTranscript, LocalTranscriptSummary } from '@hapi/protocol/localTranscript'
+import { AGY_BACKGROUND_COMMAND_RESULT, type LocalTranscript, type LocalTranscriptSummary } from '@hapi/protocol/localTranscript'
 import type { Machine, SyncEngine } from '../../../sync/syncEngine'
 import type { WebAppEnv } from '../../middleware/auth'
 import { Store } from '../../../store'
@@ -1008,11 +1008,11 @@ describe('generic local session routes', () => {
             content: { type: 'codex', data: { type: 'message', message: 'real reply' } }
         }, undefined, null, 35)
 
-        // Meanwhile native step:4:0 retains AGY_BACKGROUND_COMMAND_RESULT ('Command moved to background.').
+        // Meanwhile native step:4:0 retains AGY_BACKGROUND_COMMAND_RESULT.
         const nativeLivePrefix = [
             nativeUser('step:2:0', 'real dispatched turn', 30),
             nativeAgent('step:3:call:0', { type: 'tool-call', name: 'Bash', callId: 'agy-wakeup-agy-prov-3-0', input: { command: 'sleep 2' } }, 31),
-            nativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-agy-prov-3-0', output: 'Command moved to background.', is_error: false }, 32),
+            nativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-agy-prov-3-0', output: AGY_BACKGROUND_COMMAND_RESULT, is_error: false }, 32),
             nativeAgent('step:5:text', { type: 'message', message: 'real reply' }, 35)
         ]
         const provLinkedIds = [pReal.id, pTc.id, pTr.id, pMsg.id]
@@ -1153,7 +1153,16 @@ describe('generic local session routes', () => {
             anchor: id
         })
 
-        let agySession = {
+        let agySession: {
+            flavor: 'agy'
+            id: string
+            title: string
+            lastUserMessage: string
+            cwd: string
+            file: string
+            modifiedAt: number
+            messages: Array<{ id: string; createdAt: number; content: Record<string, unknown>; anchor: string }>
+        } = {
             flavor: 'agy' as const,
             id: 'agy-e2e',
             title: 'E2E reconcile session',
@@ -1430,6 +1439,55 @@ describe('generic local session routes', () => {
             body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
         })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
         expect(partialDoneRes.results[0]).toMatchObject({ hapiSessionId: partialHapiId, action: 'unchanged', appended: 0 })
+
+        // 6. Steer dispatched before an earlier background command result -> echoed later -> crash;
+        //    re-import reconciles tool result first (upgrading serialized placeholder), then steer, plus a >64KB live reply.
+        store.messages.addMessage(partialHapiId, { role: 'user', content: { type: 'text', text: '  steered   prompt  ' }, meta: { sentFrom: 'web' } }, 'steer-e2e', null, 120)
+        handlers.get('messages-steer-state')!({ sid: partialHapiId, localIds: ['steer-e2e'], state: 'dispatching', nativeId: 'agy-partial' }, () => {})
+        handlers.get('message')!({
+            sid: partialHapiId,
+            localId: 'agy-live:bg-e2e',
+            createdAt: 121,
+            message: {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'tool-call-result', callId: 'live-bg-e2e', output: AGY_BACKGROUND_COMMAND_RESULT, is_error: false } }
+            }
+        })
+        handlers.get('messages-consumed')!({ sid: partialHapiId, localIds: ['steer-e2e'], steered: true, nativeId: 'agy-partial' })
+        const longLiveText = `${'X'.repeat(70_000)}-CUT`
+        const longFinalText = `${longLiveText}\n${'Y'.repeat(10_000)}`
+        handlers.get('message')!({
+            sid: partialHapiId,
+            localId: 'agy-live:long-e2e',
+            createdAt: 122,
+            message: { role: 'agent', content: { type: 'codex', data: { type: 'message', message: longLiveText } } }
+        })
+
+        const p4BgDone = {
+            id: 'agy:agy-partial:step:4:0',
+            createdAt: 121,
+            content: {
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'tool-call-result', callId: 'native-bg-e2e', output: { output: 'Command exited with code 0.\nfinished', exit_code: 0 }, is_error: false } },
+                meta: { sentFrom: 'cli' }
+            } as const,
+            anchor: 'step:4:0'
+        }
+        const p5SteerUser = nativeUser('agy-partial', 'step:5:0', 'steered   prompt', 120)
+        const p6LongFinal = nativeAgent('agy-partial', 'step:6:text', longFinalText, 122)
+        agySession = { ...partialTranscript, messages: [p0, p1, p2User, p3Reply, p4BgDone, p5SteerUser, p6LongFinal] }
+
+        const e2eRecoverRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(e2eRecoverRes.results[0]).toMatchObject({ hapiSessionId: partialHapiId, action: 'updated', appended: 0 })
+        expect(store.nativeSteps.getPendingDeliveries(partialHapiId, 'agy-partial')).toEqual([])
+        const repeatRecoverRes = await (await app.request('/api/agy/import-sessions', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds: ['agy-partial'], cwd: '/work' })
+        })).json() as { results: Array<{ hapiSessionId?: string; action?: string; appended?: number }> }
+        expect(repeatRecoverRes.results[0]).toMatchObject({ hapiSessionId: partialHapiId, action: 'unchanged', appended: 0 })
     })
 
 })

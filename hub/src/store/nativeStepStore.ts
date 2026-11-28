@@ -119,10 +119,17 @@ export class NativeStepStore {
         sessionId: string,
         nativeId: string,
         delivery: { kind: 'user' | 'agent'; messageId: string; localIds: string[] },
-        createdAt: number = Date.now()
+        createdAt: number = Date.now(),
+        options?: { moveToTail?: boolean }
     ): boolean {
         if (!nativeId || !delivery.messageId || delivery.localIds.length === 0) return false
         return this.db.transaction(() => {
+            if (options?.moveToTail) {
+                this.db.prepare(`
+                    DELETE FROM session_native_deliveries
+                    WHERE session_id = ? AND native_id = ? AND kind = ? AND message_id = ?
+                `).run(sessionId, nativeId, delivery.kind, delivery.messageId)
+            }
             const maxRow = this.db.prepare(
                 'SELECT COALESCE(MAX(delivery_seq), 0) AS max_seq FROM session_native_deliveries WHERE session_id = ? AND native_id = ?'
             ).get(sessionId, nativeId) as { max_seq: number } | null

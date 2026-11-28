@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
+import { AGY_BACKGROUND_COMMAND_RESULT, truncateOversizedMessageContent } from '@hapi/protocol/localTranscript';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import type { ApiSessionClient } from '@/api/apiSession';
@@ -3939,6 +3940,101 @@ describe('AgyAcpRemoteLauncher HAPI MCP bridge, systemPrompt.append, safe auto-a
             if (previousAppDataDir === undefined) delete process.env.AGY_APP_DATA_DIR;
             else process.env.AGY_APP_DATA_DIR = previousAppDataDir;
             rmSync(overrideRoot, { recursive: true, force: true });
+        }
+    });
+
+    it('reconciles serialized background command placeholders and >64KB Hub-truncated live replies on reopen', async () => {
+        const brainDir = mkdtempSync(join(tmpdir(), 'hapi-agy-bg-long-reopen-'));
+        try {
+            const logsDir = join(brainDir, 'agy-conv-new', '.system_generated', 'logs');
+            mkdirSync(logsDir, { recursive: true });
+            const stepsPath = join(logsDir, 'transcript.jsonl');
+
+            const longPrefix = `${'B'.repeat(70_000)}-END`;
+            const longComplete = `${longPrefix}\n${'C'.repeat(10_000)}`;
+            writeFileSync(stepsPath, [
+                JSON.stringify({
+                    step_index: 0,
+                    type: 'USER_INPUT',
+                    source: 'USER_EXPLICIT',
+                    status: 'DONE',
+                    content: '<USER_REQUEST>\nrun bg task\n</USER_REQUEST>'
+                }),
+                JSON.stringify({
+                    step_index: 1,
+                    type: 'PLANNER_RESPONSE',
+                    source: 'MODEL',
+                    status: 'DONE',
+                    content: 'running cmd',
+                    tool_calls: [{ name: 'run_command', args: { CommandLine: JSON.stringify('echo hi') } }]
+                }),
+                JSON.stringify({
+                    step_index: 2,
+                    type: 'RUN_COMMAND',
+                    source: 'MODEL',
+                    status: 'DONE',
+                    content: 'Command exited with code 0.\n\nCommand output:\nhi'
+                }),
+                JSON.stringify({
+                    step_index: 3,
+                    type: 'PLANNER_RESPONSE',
+                    source: 'MODEL',
+                    status: 'DONE',
+                    content: longComplete
+                })
+            ].join('\n') + '\n');
+
+            const { session, queue, client } = makeSession();
+            client.getMetadata.mockReturnValue({ path: '/tmp/agy-project', host: 'test', agyImportedAt: 100 } as never);
+            const truncatedReplyData = (truncateOversizedMessageContent({
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: longPrefix } }
+            }) as { content: { data: Record<string, unknown> } }).content.data;
+
+            // Serialized clone ensures reference !== AGY_BACKGROUND_COMMAND_RESULT.
+            const serializedPlaceholder = JSON.parse(JSON.stringify(AGY_BACKGROUND_COMMAND_RESULT));
+            client.reconcileNativeSteps.mockResolvedValue({
+                ok: true,
+                status: 'needs_reconcile',
+                fromIndex: 3,
+                pendingDeliveries: [
+                    {
+                        kind: 'agent',
+                        localId: 'agy-live:bg-1',
+                        data: { type: 'tool-call-result', callId: 'live-bg-call', output: serializedPlaceholder, is_error: false }
+                    },
+                    {
+                        kind: 'agent',
+                        localId: 'agy-live:long-1',
+                        data: truncatedReplyData
+                    }
+                ]
+            });
+            client.commitNativeSteps.mockResolvedValue({ ok: true, confirmedCount: 5, inserted: 0, updated: 2 });
+
+            const { run } = launch(session, [new FakeAgyBackend()], { brainDir });
+            await vi.waitFor(() => expect(client.emitSessionReady).toHaveBeenCalledOnce());
+            expect(client.commitNativeSteps).toHaveBeenCalledWith(
+                'agy-conv-new',
+                3,
+                [
+                    expect.objectContaining({
+                        kind: 'reconcile_update',
+                        anchor: 'step:2:0',
+                        targetLocalId: 'agy-live:bg-1'
+                    }),
+                    expect.objectContaining({
+                        kind: 'reconcile_update',
+                        anchor: 'step:3:text',
+                        targetLocalId: 'agy-live:long-1'
+                    })
+                ]
+            );
+
+            queue.close();
+            await run;
+        } finally {
+            rmSync(brainDir, { recursive: true, force: true });
         }
     });
 });

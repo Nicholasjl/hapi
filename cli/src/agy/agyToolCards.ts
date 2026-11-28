@@ -1,3 +1,4 @@
+import { AGY_BACKGROUND_COMMAND_RESULT } from '@hapi/protocol/localTranscript';
 import type { AgentMessage } from '@/agent/types';
 
 type ToolCall = Extract<AgentMessage, { type: 'tool_call' }>;
@@ -12,10 +13,7 @@ type ToolResult = Extract<AgentMessage, { type: 'tool_result' }>;
  * replace_file_content / write_to_file).
  */
 
-/** Shown for a command agy moved to the background until its real result arrives. */
-export const AGY_BACKGROUND_COMMAND_RESULT = {
-    stdout: 'Running in the background. The result appears when agy reports it.'
-} as const;
+export { AGY_BACKGROUND_COMMAND_RESULT };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === 'object' && !Array.isArray(value)

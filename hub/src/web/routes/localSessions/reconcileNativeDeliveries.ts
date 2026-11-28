@@ -2,11 +2,17 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
-import { canonicalizeLocalTranscriptContent, type LocalTranscriptMessage } from '@hapi/protocol/localTranscript'
+import {
+    AGY_BACKGROUND_COMMAND_RESULT,
+    canonicalizeLocalTranscriptContent,
+    isAgyBackgroundCommandPlaceholderOutput,
+    isOversizedTruncatedPrefixMatch,
+    type LocalTranscriptMessage
+} from '@hapi/protocol/localTranscript'
 import type { StoredMessage, StoredPendingNativeDelivery } from '../../../store'
 import { truncateOversizedMessageContent } from '../../../store/contentCodec'
 
-export const AGY_BACKGROUND_COMMAND_RESULT = 'Command moved to background.'
+export { AGY_BACKGROUND_COMMAND_RESULT }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -54,30 +60,91 @@ export function buildUserCandidateTexts(rows: StoredMessage[]): string[] {
 
 export function userRowsMatchNativeText(rows: StoredMessage[], nativeText: string): boolean {
     if (rows.length === 0) return false
-    const matchesFrom = (idx: number, rest: string): boolean => {
-        if (idx === rows.length) return rest.length === 0
-        const candidates = rowUserTextCandidates(rows[idx]!)
+    const allCandidates: string[][] = []
+    for (const row of rows) {
+        const candidates = rowUserTextCandidates(row)
         if (!candidates) return false
-        for (const candidate of candidates) {
+        allCandidates.push(candidates)
+    }
+
+    const matchesExact = (idx: number, rest: string): boolean => {
+        if (idx === rows.length) return rest.length === 0
+        for (const candidate of allCandidates[idx]!) {
             if (!rest.startsWith(candidate)) continue
             const after = rest.slice(candidate.length)
             if (idx === rows.length - 1) {
                 if (after.length === 0) return true
             } else if (after.startsWith('\n')) {
-                if (matchesFrom(idx + 1, after.slice(1))) return true
+                if (matchesExact(idx + 1, after.slice(1))) return true
             }
         }
         return false
     }
-    return matchesFrom(0, nativeText) || matchesFrom(0, nativeText.trim())
+    if (matchesExact(0, nativeText)) {
+        return true
+    }
+
+    const trimmedNative = nativeText.trim()
+    if (!trimmedNative) {
+        return false
+    }
+
+    const canBeWhitespaceFrom = new Array<boolean>(rows.length + 1)
+    canBeWhitespaceFrom[rows.length] = true
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+        canBeWhitespaceFrom[i] = Boolean(canBeWhitespaceFrom[i + 1]) && allCandidates[i]!.some((c) => c.trim().length === 0)
+    }
+
+    const failedStates = new Set<string>()
+    const matchTrimmed = (idx: number, rest: string, emittedAny: boolean): boolean => {
+        if (idx === rows.length) {
+            return emittedAny && rest.length === 0
+        }
+        const key = `${idx}:${rest.length}:${emittedAny ? 1 : 0}`
+        if (failedStates.has(key)) {
+            return false
+        }
+        for (const candidate of allCandidates[idx]!) {
+            const segment = emittedAny ? `\n${candidate}` : candidate
+            if (!emittedAny) {
+                if (segment.trim().length === 0) {
+                    if (matchTrimmed(idx + 1, rest, false)) return true
+                    continue
+                }
+                const trimmedStart = segment.trimStart()
+                if (rest.startsWith(trimmedStart) && matchTrimmed(idx + 1, rest.slice(trimmedStart.length), true)) {
+                    return true
+                }
+                const trimmedBoth = trimmedStart.trimEnd()
+                if (rest === trimmedBoth && canBeWhitespaceFrom[idx + 1]) {
+                    return true
+                }
+            } else {
+                if (rest.startsWith(segment) && matchTrimmed(idx + 1, rest.slice(segment.length), true)) {
+                    return true
+                }
+                const trimmedEnd = segment.trimEnd()
+                if (rest === trimmedEnd && canBeWhitespaceFrom[idx + 1]) {
+                    return true
+                }
+            }
+        }
+        failedStates.add(key)
+        return false
+    }
+
+    return matchTrimmed(0, trimmedNative, false)
 }
 
-export function unwrapAgentPayload(content: unknown): Record<string, unknown> | null {
-    const canonical = truncateOversizedMessageContent(content)
-    const record = unwrapRoleWrappedRecordEnvelope(canonical)
+function unwrapRawAgentPayload(content: unknown): Record<string, unknown> | null {
+    const record = unwrapRoleWrappedRecordEnvelope(content)
     if (!record || record.role !== 'agent' || !isPlainRecord(record.content)) return null
     if (record.content.type !== AGENT_MESSAGE_PAYLOAD_TYPE || !isPlainRecord(record.content.data)) return null
     return record.content.data
+}
+
+export function unwrapAgentPayload(content: unknown): Record<string, unknown> | null {
+    return unwrapRawAgentPayload(truncateOversizedMessageContent(content))
 }
 
 export function storedHapiMessagesMatchNativeContent(rows: StoredMessage[], nativeContent: unknown): boolean {
@@ -130,13 +197,16 @@ export function isPrefixOrRefinedText(liveText: unknown, diskText: unknown): boo
     if (diskText.startsWith(liveText) || diskTrimmed.startsWith(liveTrimmed)) {
         return true
     }
+    if (isOversizedTruncatedPrefixMatch(liveText, diskText)) {
+        return true
+    }
     const unclipped = liveTrimmed.replace(/(?:\.\.\.|…)+$/, '').trimEnd()
     return unclipped.length > 0 && diskTrimmed.startsWith(unclipped)
 }
 
 export function isCompatibleNativeUpdate(existingContent: unknown, nativeContent: unknown): boolean {
-    const storedData = unwrapAgentPayload(existingContent)
-    const nativeData = unwrapAgentPayload(nativeContent)
+    const storedData = unwrapRawAgentPayload(existingContent)
+    const nativeData = unwrapRawAgentPayload(nativeContent)
     if (!storedData || !nativeData || storedData.type !== nativeData.type) {
         return false
     }
@@ -147,7 +217,7 @@ export function isCompatibleNativeUpdate(existingContent: unknown, nativeContent
         case 'tool-call':
             return storedData.name === nativeData.name
         case 'tool-call-result': {
-            if (storedData.output === AGY_BACKGROUND_COMMAND_RESULT) {
+            if (isAgyBackgroundCommandPlaceholderOutput(storedData.output)) {
                 return true
             }
             if (typeof storedData.output === 'string' && typeof nativeData.output === 'string') {
@@ -333,7 +403,10 @@ export function collectEffectivePendingDeliveries(
         }
     }
 
-    return result
+    return [
+        ...result.filter((entry) => !entry.uncertain),
+        ...result.filter((entry) => entry.uncertain)
+    ]
 }
 
 export type SerializedPendingNativeDelivery =

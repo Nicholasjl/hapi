@@ -349,6 +349,82 @@ export function truncateOversizedMessageContent(content: unknown): unknown {
     return truncateOversizedDeep(content)
 }
 
+const TRUNCATE_MARKER_RE = /^\n…\[hapi: truncated (\d+) chars\]…\n/
+
+/**
+ * Checks whether `storedText` (already head+tail truncated at `TRUNCATE_STRING_LIMIT`)
+ * was a prefix of `rawDiskText` before Hub truncation replaced its middle.
+ */
+export function isOversizedTruncatedPrefixMatch(storedText: string, rawDiskText: string): boolean {
+    if (storedText.length <= TRUNCATE_HEAD + TRUNCATE_TAIL) {
+        return false
+    }
+    const head = storedText.slice(0, TRUNCATE_HEAD)
+    const rest = storedText.slice(TRUNCATE_HEAD)
+    const match = TRUNCATE_MARKER_RE.exec(rest)
+    if (!match) {
+        return false
+    }
+    const removed = Number(match[1])
+    if (!Number.isSafeInteger(removed) || removed <= TRUNCATE_STRING_LIMIT - TRUNCATE_HEAD - TRUNCATE_TAIL) {
+        return false
+    }
+    const tail = rest.slice(match[0].length)
+    if (tail.length !== TRUNCATE_TAIL) {
+        return false
+    }
+    const originalLength = TRUNCATE_HEAD + removed + TRUNCATE_TAIL
+    if (!Number.isSafeInteger(originalLength)) {
+        return false
+    }
+    if (
+        rawDiskText.length >= originalLength
+        && rawDiskText.slice(0, TRUNCATE_HEAD) === head
+        && rawDiskText.slice(originalLength - TRUNCATE_TAIL, originalLength) === tail
+    ) {
+        return true
+    }
+
+    const headStart = head.trimStart()
+    const leadDelta = head.length - headStart.length
+    const diskStart = rawDiskText.trimStart()
+    const shiftedEnd = originalLength - leadDelta
+    if (
+        !headStart
+        || shiftedEnd <= TRUNCATE_TAIL
+        || diskStart.length < shiftedEnd - TRUNCATE_TAIL
+        || !diskStart.startsWith(headStart)
+    ) {
+        return false
+    }
+    if (
+        diskStart.length >= shiftedEnd
+        && diskStart.slice(shiftedEnd - TRUNCATE_TAIL, shiftedEnd) === tail
+    ) {
+        return true
+    }
+    const tailTrimmed = tail.trimEnd()
+    return (
+        tailTrimmed.length > 0
+        && diskStart.length >= shiftedEnd - TRUNCATE_TAIL + tailTrimmed.length
+        && diskStart.slice(shiftedEnd - TRUNCATE_TAIL, shiftedEnd - TRUNCATE_TAIL + tailTrimmed.length) === tailTrimmed
+    )
+}
+
+/** Shown for a command agy moved to the background until its real result arrives. */
+export const AGY_BACKGROUND_COMMAND_RESULT = {
+    stdout: 'Running in the background. The result appears when agy reports it.'
+} as const
+
+export function isAgyBackgroundCommandPlaceholderOutput(output: unknown): boolean {
+    if (typeof output !== 'object' || output === null || Array.isArray(output)) {
+        return false
+    }
+    const record = output as Record<string, unknown>
+    const keys = Object.keys(record).filter((key) => record[key] !== undefined)
+    return keys.length === 1 && record.stdout === AGY_BACKGROUND_COMMAND_RESULT.stdout
+}
+
 export function agyToTranscript(session: AgyLocalSessionWithMessages): LocalTranscript {
     return {
         ...agyToTranscriptSummary(session),

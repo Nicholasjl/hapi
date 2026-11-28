@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import type { LocalTranscript, LocalTranscriptMessage } from '@hapi/protocol/localTranscript'
+import { AGY_BACKGROUND_COMMAND_RESULT, type LocalTranscript, type LocalTranscriptMessage } from '@hapi/protocol/localTranscript'
 import { TRUNCATE_STRING_LIMIT, truncateOversizedMessageContent } from '../../../store/contentCodec'
 import type { StoredMessage } from '../../../store'
 import { computeLocalTranscriptFingerprint, matchAnchored } from './matchAnchored'
@@ -262,7 +262,7 @@ describe('anchored match: Antigravity native step ledger', () => {
         const initialAgent = agyNativeAgent('step:1:text', { type: 'message', message: 'initial reply' })
         const liveBatchUser = agyNativeUser('step:2:0', 'first batch\nsecond batch')
         const liveCmdCall = agyNativeAgent('step:3:call:0', { type: 'tool-call', name: 'Bash', callId: 'agy-wakeup-ses-1-3-0', input: { command: 'sleep 2' } })
-        const liveCmdBgResult = agyNativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-ses-1-3-0', output: 'Command moved to background.', is_error: false })
+        const liveCmdBgResult = agyNativeAgent('step:4:0', { type: 'tool-call-result', callId: 'agy-wakeup-ses-1-3-0', output: AGY_BACKGROUND_COMMAND_RESULT, is_error: false })
         const liveFinalText = agyNativeAgent('step:5:text', { type: 'message', message: 'real answer' })
         const tailNative = [
             agyNativeUser('step:6:0', 'continued in native cli'),
@@ -553,5 +553,64 @@ describe('anchored match: Antigravity native step ledger', () => {
                 { deliverySeq: 2, kind: 'agent', messageId: pendingAgent.id, localIds: ['agy-live:r-1'] }
             ]
         }).status).toBe('transcript_diverged')
+
+        // Serialized AGY_BACKGROUND_COMMAND_RESULT placeholder, surrounding-whitespace prompt, and >64KB live reply reconcile cleanly,
+        // and uncertain pre-echo steers follow corroborated deliveries in native order.
+        const wsUser = agyStoredUser(3, 'u-ws', '  spaced   prompt  ', 12)
+        const bgLiveResult = agyStoredAgent(4, {
+            type: 'tool-call-result',
+            callId: 'live-bg-call',
+            output: JSON.parse(JSON.stringify(AGY_BACKGROUND_COMMAND_RESULT)),
+            is_error: false
+        }, 13, 'agy-live:bg-1')
+        const longPrefixText = `${'Q'.repeat(70_000)}-SUFFIX`
+        const longCompletedText = `${longPrefixText}\n${'R'.repeat(10_000)}`
+        const truncatedLongReply = agyStoredAgent(
+            5,
+            (truncateOversizedMessageContent({
+                role: 'agent',
+                content: { type: 'codex', data: { type: 'message', message: longPrefixText } }
+            }) as { content: { data: Record<string, unknown> } }).content.data,
+            14,
+            'agy-live:long-1'
+        )
+        const uncertainSteer = {
+            ...agyStoredUser(2.5, 'u-uncertain-steer', 'early steer dropped', 12),
+            invokedAt: null,
+            deliveryState: 'indeterminate' as const,
+            deliveryPending: true as const
+        }
+        const diskWsUser = agyNativeUser('step:2:0', 'spaced   prompt')
+        const diskBgCompleted = agyNativeAgent('step:3:0', {
+            type: 'tool-call-result',
+            callId: 'agy-wakeup-ses-1-3-0',
+            output: { output: 'Command exited with code 0.\nok', exit_code: 0 },
+            is_error: false
+        })
+        const diskLongCompleted = agyNativeAgent('step:4:text', { type: 'message', message: longCompletedText })
+        const diskAfterSteer = agyNativeUser('step:5:0', 'early steer dropped')
+
+        const combinedRecovery = matchAnchored({
+            storedMessages: [stored0, stored1, uncertainSteer, wsUser, bgLiveResult, truncatedLongReply],
+            transcript: agyTranscript([s0, s1, diskWsUser, diskBgCompleted, diskLongCompleted, diskAfterSteer]),
+            importPrefix: AGY_PREFIX,
+            cursor: null,
+            recordedNativeSteps: linkedLedger,
+            pendingNativeDeliveries: [
+                { deliverySeq: 1, kind: 'user', messageId: uncertainSteer.id, localIds: ['u-uncertain-steer'] },
+                { deliverySeq: 2, kind: 'user', messageId: wsUser.id, localIds: ['u-ws'] },
+                { deliverySeq: 3, kind: 'agent', messageId: bgLiveResult.id, localIds: ['agy-live:bg-1'] },
+                { deliverySeq: 4, kind: 'agent', messageId: truncatedLongReply.id, localIds: ['agy-live:long-1'] }
+            ]
+        })
+        expect(combinedRecovery).toMatchObject({
+            status: 'ok',
+            delta: [],
+            corroboratedUserLocalIds: ['u-uncertain-steer'],
+            reconciledUpdates: [
+                { messageId: bgLiveResult.id, anchor: 'step:3:0' },
+                { messageId: truncatedLongReply.id, anchor: 'step:4:text', nextContent: diskLongCompleted.content }
+            ]
+        })
     })
 })

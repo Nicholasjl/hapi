@@ -5,6 +5,7 @@ import type { RawJSONLines } from '@/claude/types';
 import { statSync, watch, type BigIntStats, type FSWatcher } from 'node:fs';
 import { RPC_METHODS, splitAgyModelSelection } from '@hapi/protocol';
 import type { AgyImportedMessage } from '@hapi/protocol/apiTypes';
+import { isAgyBackgroundCommandPlaceholderOutput, isOversizedTruncatedPrefixMatch } from '@hapi/protocol/localTranscript';
 import {
     collectSettledAgyNativeMessagesPrefix,
     collectSettledAgyTranscriptForReconcile,
@@ -292,7 +293,7 @@ function isExactDeliveryMatch(diskMessage: AgyImportedMessage, delivery: Pending
             const trimmedDelivery = text.trim();
             return Boolean(trimmedDelivery)
                 && trimmedDisk.startsWith('@')
-                && trimmedDisk.endsWith(`\n\n${trimmedDelivery}`);
+                && (trimmedDisk.endsWith(`\n\n${trimmedDelivery}`) || trimmedDisk.endsWith(`\n\n${text.trimEnd()}`));
         });
     }
     const diskData = extractAgentPayloadData(diskMessage.content);
@@ -322,6 +323,9 @@ function isPrefixOrRefinedText(liveText: unknown, diskText: unknown): boolean {
     if (diskText.startsWith(liveText) || diskTrimmed.startsWith(liveTrimmed)) {
         return true;
     }
+    if (isOversizedTruncatedPrefixMatch(liveText, diskText)) {
+        return true;
+    }
     const unclipped = liveTrimmed.replace(/(?:\.\.\.|…)+$/, '').trimEnd();
     return unclipped.length > 0 && diskTrimmed.startsWith(unclipped);
 }
@@ -341,7 +345,7 @@ function isCompatibleUpdateMatch(diskMessage: AgyImportedMessage, delivery: Pend
         case 'tool-call':
             return delivery.data.name === diskData.name;
         case 'tool-call-result': {
-            if (delivery.data.output === AGY_BACKGROUND_COMMAND_RESULT) {
+            if (isAgyBackgroundCommandPlaceholderOutput(delivery.data.output)) {
                 return true;
             }
             if (typeof delivery.data.output === 'string' && typeof diskData.output === 'string') {

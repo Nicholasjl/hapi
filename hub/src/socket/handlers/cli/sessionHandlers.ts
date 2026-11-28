@@ -646,37 +646,49 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         const invokedAt = Date.now()
         let sessionUpdatedAt: number
         try {
-            sessionUpdatedAt = store.recordMessagesConsumed(
-                data.sid,
-                localIds,
-                invokedAt,
-                sessionAccess.value.namespace
-            )
+            const nativeId = typeof data.nativeId === 'string' && data.nativeId.length > 0 ? data.nativeId : null
+            sessionUpdatedAt = store.runInTransaction(() => {
+                let pendingUserDelivery: { messageId: string; localIds: string[]; moveToTail: boolean } | null = null
+                if (nativeId) {
+                    const freshAccess = resolveSessionAccess(data.sid, { fresh: true })
+                    const metadata = freshAccess.ok
+                        ? (freshAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null)
+                        : null
+                    if (metadata?.agyImportedAt != null && metadata.agySessionId === nativeId) {
+                        const idSet = new Set(localIds)
+                        const matchedRows = store.messages.getAllMessages(data.sid)
+                            .filter((m) => m.localId && idSet.has(m.localId))
+                            .sort((a, b) => a.seq - b.seq)
+                        if (matchedRows.length > 0) {
+                            const anchorRow = matchedRows[matchedRows.length - 1]!
+                            pendingUserDelivery = {
+                                messageId: anchorRow.id,
+                                localIds: matchedRows.map((row) => row.localId!),
+                                moveToTail: matchedRows.some((row) => row.invokedAt === null)
+                            }
+                        }
+                    }
+                }
+                const updatedAt = store.recordMessagesConsumed(
+                    data.sid,
+                    localIds,
+                    invokedAt,
+                    sessionAccess.value.namespace
+                )
+                if (nativeId && pendingUserDelivery) {
+                    store.nativeSteps.recordPendingDelivery(
+                        data.sid,
+                        nativeId,
+                        { kind: 'user', messageId: pendingUserDelivery.messageId, localIds: pendingUserDelivery.localIds },
+                        invokedAt,
+                        { moveToTail: pendingUserDelivery.moveToTail }
+                    )
+                }
+                return updatedAt
+            })
         } catch (err) {
             console.error('recordMessagesConsumed failed', err)
             return
-        }
-
-        if (typeof data.nativeId === 'string' && data.nativeId.length > 0) {
-            const freshAccess = resolveSessionAccess(data.sid, { fresh: true })
-            if (freshAccess.ok) {
-                const metadata = freshAccess.value.metadata as { agyImportedAt?: unknown; agySessionId?: unknown } | null
-                if (metadata?.agyImportedAt != null && metadata.agySessionId === data.nativeId) {
-                    const idSet = new Set(localIds)
-                    const matchedRows = store.messages.getAllMessages(data.sid)
-                        .filter((m) => m.localId && idSet.has(m.localId))
-                        .sort((a, b) => a.seq - b.seq)
-                    if (matchedRows.length > 0) {
-                        const anchorRow = matchedRows[matchedRows.length - 1]!
-                        store.nativeSteps.recordPendingDelivery(
-                            data.sid,
-                            data.nativeId,
-                            { kind: 'user', messageId: anchorRow.id, localIds: matchedRows.map((row) => row.localId!) },
-                            invokedAt
-                        )
-                    }
-                }
-            }
         }
 
         try {

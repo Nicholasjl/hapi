@@ -7,12 +7,15 @@ import type {
     PiLocalSessionWithMessages
 } from './apiTypes'
 import {
+    AGY_BACKGROUND_COMMAND_RESULT,
     ListLocalSessionsRpcResponseSchema,
     LocalTranscriptSchema,
     agyToTranscript,
     canonicalizeLocalTranscriptContent,
     claudeToTranscript,
     codexToTranscript,
+    isAgyBackgroundCommandPlaceholderOutput,
+    isOversizedTruncatedPrefixMatch,
     opencodeToTranscript,
     piToTranscript,
     truncateOversizedMessageContent
@@ -286,5 +289,30 @@ describe('local transcript mappers', () => {
 
         const user = { role: 'user', content: { type: 'text', text: oversized } }
         expect(truncateOversizedMessageContent(user)).toBe(user)
+    })
+
+    it('validates structural background command placeholder outputs across JSON serialization', () => {
+        const serializedClone = JSON.parse(JSON.stringify(AGY_BACKGROUND_COMMAND_RESULT)) as unknown
+        expect(isAgyBackgroundCommandPlaceholderOutput(serializedClone)).toBe(true)
+        expect(isAgyBackgroundCommandPlaceholderOutput({ stdout: AGY_BACKGROUND_COMMAND_RESULT.stdout, extra: undefined })).toBe(true)
+        expect(isAgyBackgroundCommandPlaceholderOutput('Command moved to background.')).toBe(false)
+        expect(isAgyBackgroundCommandPlaceholderOutput({ stdout: AGY_BACKGROUND_COMMAND_RESULT.stdout, exit_code: 0 })).toBe(false)
+        expect(isAgyBackgroundCommandPlaceholderOutput({ stdout: 'other' })).toBe(false)
+        expect(isAgyBackgroundCommandPlaceholderOutput(null)).toBe(false)
+    })
+
+    it('matches truncated >64KB live prefixes against extended raw native replies while rejecting altered tails', () => {
+        const partialRaw = `${'P'.repeat(70_000)}-END`
+        const truncatedLive = (truncateOversizedMessageContent({
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: partialRaw } }
+        }) as { content: { data: { message: string } } }).content.data.message
+        const completedRaw = `${partialRaw}\nMore details beyond 80KB ${'Z'.repeat(10_000)}`
+        const alteredTailRaw = `${'P'.repeat(69_999)}X-END\nMore details`
+
+        expect(isOversizedTruncatedPrefixMatch(truncatedLive, completedRaw)).toBe(true)
+        expect(isOversizedTruncatedPrefixMatch(truncatedLive, alteredTailRaw)).toBe(false)
+        expect(isOversizedTruncatedPrefixMatch(truncatedLive, partialRaw.slice(0, -1))).toBe(false)
+        expect(isOversizedTruncatedPrefixMatch('short prefix', completedRaw)).toBe(false)
     })
 })
