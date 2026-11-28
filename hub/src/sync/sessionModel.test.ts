@@ -4635,6 +4635,153 @@ describe('session model', () => {
         }
     })
 
+    it('recovers a persisted pre-spawn Hermes resume attempt on restart when runner returns unknown while inactive, while failing closed when active or quarantined', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+        let restarted: SyncEngine | null = null
+        let activeEngine: SyncEngine | null = null
+
+        try {
+            const session = engine.getOrCreateSession(
+                'hermes-crash-before-spawn',
+                {
+                    path: '/remote/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'hermes',
+                    hermesSessionId: 'hermes-native-crash',
+                    lifecycleState: 'archived',
+                    archivedBy: 'cli',
+                    archiveReason: 'Exited',
+                    lifecycleStateSince: 100
+                },
+                null,
+                'default'
+            )
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            const existing = store.sessions.getSessionByNamespace(session.id, 'default')!
+            store.sessions.updateSessionMetadata(
+                session.id,
+                {
+                    ...(existing.metadata as Record<string, unknown>),
+                    lifecycleState: undefined,
+                    archivedBy: undefined,
+                    archiveReason: undefined,
+                    hermesResumeAttempt: {
+                        state: 'preparing',
+                        machineId: 'machine-1',
+                        startedAt: 200,
+                        archiveSnapshot: {
+                            lifecycleState: 'archived',
+                            archivedBy: 'cli',
+                            archiveReason: 'Exited',
+                            lifecycleStateSince: 100
+                        }
+                    }
+                },
+                existing.metadataVersion,
+                'default'
+            )
+            engine.stop()
+
+            // Quarantined attempts with unknown stop status stay fail-closed.
+            restarted = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+            restarted.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            restarted.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            ;(restarted as any).rpcGateway.stopRunnerSession = async () => 'unknown'
+            let respawnCount = 0
+            ;(restarted as any).rpcGateway.spawnSession = async () => {
+                respawnCount += 1
+                restarted!.handleSessionAlive({ sid: session.id, time: Date.now() })
+                setTimeout(() => restarted!.handleSessionReady({ sid: session.id, time: Date.now() }), 20)
+                return { type: 'success', sessionId: session.id }
+            }
+
+            expect(await restarted.reopenSession(session.id, 'default')).toEqual({
+                type: 'success',
+                sessionId: session.id,
+                resumed: true
+            })
+            expect(respawnCount).toBe(1)
+            expect(restarted.getSessionByNamespace(session.id, 'default')?.metadata?.hermesResumeAttempt).toBeUndefined()
+            restarted.stop()
+            restarted = null
+
+            // Inactive `resuming` state also recovers on `unknown` after restart, whereas an active child or `quarantined` state stays blocked.
+            const afterOk = store.sessions.getSessionByNamespace(session.id, 'default')!
+            store.sessions.updateSessionMetadata(
+                session.id,
+                {
+                    ...(afterOk.metadata as Record<string, unknown>),
+                    hermesResumeAttempt: {
+                        state: 'resuming',
+                        machineId: 'machine-1',
+                        startedAt: 300,
+                        archiveSnapshot: {
+                            lifecycleState: 'archived',
+                            archivedBy: 'cli',
+                            archiveReason: 'Exited',
+                            lifecycleStateSince: 100
+                        }
+                    }
+                },
+                afterOk.metadataVersion,
+                'default'
+            )
+            activeEngine = new SyncEngine(store, {} as never, new RpcRegistry(), { broadcast() {} } as never)
+            activeEngine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            activeEngine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            activeEngine.handleSessionAlive({ sid: session.id, time: Date.now() })
+            ;(activeEngine as any).rpcGateway.stopRunnerSession = async () => 'unknown'
+            expect(await activeEngine.reopenSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Hermes native resume timed out and the child is still active',
+                code: 'resume_failed'
+            })
+
+            activeEngine.handleSessionEnd({ sid: session.id, time: Date.now() })
+            const beforeQuarantine = store.sessions.getSessionByNamespace(session.id, 'default')!
+            store.sessions.updateSessionMetadata(
+                session.id,
+                {
+                    ...(beforeQuarantine.metadata as Record<string, unknown>),
+                    hermesResumeAttempt: {
+                        state: 'quarantined',
+                        machineId: 'machine-1',
+                        startedAt: 400
+                    }
+                },
+                beforeQuarantine.metadataVersion,
+                'default'
+            )
+            ;(activeEngine as any).sessionCache.refreshSession(session.id)
+            expect(await activeEngine.reopenSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Hermes native resume timed out and the child is still active',
+                code: 'resume_failed'
+            })
+        } finally {
+            activeEngine?.stop()
+            restarted?.stop()
+            engine.stop()
+        }
+    })
+
     it('resumeSession fresh-spawns when inactive cursor session has no agent id and no user messages', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(

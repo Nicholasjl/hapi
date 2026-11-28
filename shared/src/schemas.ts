@@ -286,7 +286,7 @@ export const MetadataSchema = z.object({
         }).optional(),
     }).optional(),
     hermesResumeAttempt: z.object({
-        state: z.enum(['resuming', 'quarantined']),
+        state: z.enum(['preparing', 'resuming', 'quarantined']),
         machineId: z.string(),
         startedAt: z.number(),
         archiveSnapshot: z.object({

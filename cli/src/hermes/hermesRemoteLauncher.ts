@@ -78,6 +78,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
     private currentBackendAcpMode: string | null = null
     private activeTurnPermissionMode: HermesPermissionMode | undefined = undefined
     private modelRetryWake: (() => void) | null = null
+    private pendingModelFailure: { requestedModel: string; revision: number | undefined; message: string } | null = null
 
     constructor(
         private readonly session: HermesSession,
@@ -232,7 +233,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         }
 
         const discoveredModel = backend.getSessionModelsMetadata(acpSessionId)?.currentModelId ?? null
-        const initialRevision = this.opts.initialModelRevision
+        const initialRevision = this.opts.initialModelRevision ?? this.opts.getModelPreference?.()?.revision
         this.initialBackendModel = discoveredModel
         this.currentBackendModel = discoveredModel
         this.currentBackendModelRevision = initialRevision
@@ -242,11 +243,21 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 await backend.setModel(acpSessionId, this.opts.model, { flavor: 'hermes' })
                 this.currentBackendModel = this.opts.model
             } catch (err) {
+                const message = err instanceof Error ? err.message : String(err)
                 logger.debug('[hermes-acp] initial setModel failed', err)
-                this.opts.onModelRollback?.(this.currentBackendModel, initialRevision)
+                this.pendingModelFailure = {
+                    requestedModel: this.opts.model,
+                    revision: initialRevision,
+                    message
+                }
+                const notice = `Hermes model switch to ${this.opts.model} failed. Choose a usable model before sending prompts: ${message}`
+                this.session.sendSessionEvent({ type: 'message', message: notice })
+                this.messageBuffer.addMessage(notice, 'status')
             }
         }
-        this.opts.onConfigDiscovered?.(this.currentBackendModel, initialRevision)
+        if (this.pendingModelFailure === null) {
+            this.opts.onConfigDiscovered?.(this.currentBackendModel, initialRevision)
+        }
         if (this.currentBackendModel) {
             this.messageBuffer.addMessage(`[MODEL:${this.currentBackendModel}]`, 'system')
         }
@@ -255,11 +266,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             this.session.client.emitSessionReady()
         }
 
-        this.permissionHandler = new AcpPermissionHandler(
-            this.session.client,
-            backend,
-            () => this.activeTurnPermissionMode ?? (this.session.getPermissionMode() as HermesPermissionMode | undefined)
-        )
+        this.permissionHandler = this.createPermissionHandler(backend)
         this.setupAbortHandlers(this.session.client.rpcHandlerManager, {
             onAbort: () => this.handleAbort(),
             onSwitch: () => this.handleExitFromUi()
@@ -422,6 +429,9 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 }
 
                 consecutiveReconnects = 0
+                this.pendingModelFailure = null
+                modelRetryState.failedSelection = null
+                modelRetryState.delayMs = 1000
                 this.session.queue.commitBatch(batch)
                 this.currentBackendModel = slashModelTarget
                 this.opts.onModelChanged?.(slashModelTarget, batch.mode.modelRevision)
@@ -442,6 +452,34 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
 
             let requestedModel = batch.mode.model
             let effectiveModelRevision = batch.mode.modelRevision
+            let bypassStaleCheck = false
+            if (this.pendingModelFailure !== null) {
+                const livePref = this.opts.getModelPreference?.()
+                const failureRevision = this.pendingModelFailure.revision
+                const prefRevisionChanged = livePref !== undefined
+                    && (failureRevision === undefined
+                        ? livePref.model !== this.pendingModelFailure.requestedModel && livePref.revision > 0
+                        : livePref.revision !== failureRevision)
+                const batchRevisionChanged = effectiveModelRevision !== undefined
+                    && effectiveModelRevision !== failureRevision
+                if (prefRevisionChanged || batchRevisionChanged) {
+                    if (livePref !== undefined && livePref.revision !== effectiveModelRevision) {
+                        requestedModel = livePref.model
+                        effectiveModelRevision = livePref.revision
+                    }
+                    this.pendingModelFailure = null
+                    modelRetryState.failedSelection = null
+                    modelRetryState.delayMs = 1000
+                } else {
+                    requestedModel = this.pendingModelFailure.requestedModel
+                    effectiveModelRevision = failureRevision
+                    bypassStaleCheck = true
+                    modelRetryState.failedSelection = {
+                        requestedModel: this.pendingModelFailure.requestedModel,
+                        revision: failureRevision
+                    }
+                }
+            }
             if (modelRetryState.failedSelection !== null) {
                 if (
                     requestedModel === modelRetryState.failedSelection.requestedModel
@@ -496,7 +534,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 return 'continue'
             }
 
-            const isStaleBatchModel = effectiveModelRevision !== undefined && (
+            const isStaleBatchModel = !bypassStaleCheck && effectiveModelRevision !== undefined && (
                 (this.currentBackendModelRevision !== undefined && effectiveModelRevision < this.currentBackendModelRevision)
                 || (this.slashOverridePickerRevision !== undefined && effectiveModelRevision <= this.slashOverridePickerRevision)
             )
@@ -551,6 +589,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                     this.recordAppliedModelRevision(effectiveModelRevision)
                 }
             }
+            this.pendingModelFailure = null
             modelRetryState.failedSelection = null
             modelRetryState.delayMs = 1000
 
@@ -700,16 +739,37 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 await nextBackend.setModel(acpSessionId, desiredModel, { flavor: 'hermes' })
                 this.currentBackendModel = desiredModel
             } catch (err) {
+                const message = err instanceof Error ? err.message : String(err)
                 logger.debug('[hermes-acp] reconnect setModel failed', err)
-                this.opts.onModelRollback?.(this.currentBackendModel, this.currentBackendModelRevision)
+                this.slashOverridePickerRevision = undefined
+                this.pendingModelFailure = {
+                    requestedModel: desiredModel,
+                    revision: this.currentBackendModelRevision,
+                    message
+                }
+                const notice = `Hermes model restore to ${desiredModel} failed after reconnect. Choose a usable model or cancel queued prompts: ${message}`
+                this.session.sendSessionEvent({ type: 'message', message: notice })
+                this.messageBuffer.addMessage(notice, 'status')
             }
         }
-        this.permissionHandler = new AcpPermissionHandler(
-            this.session.client,
-            nextBackend,
-            () => this.activeTurnPermissionMode ?? (this.session.getPermissionMode() as HermesPermissionMode | undefined)
-        )
+        this.permissionHandler = this.createPermissionHandler(nextBackend)
         return nextBackend
+    }
+
+    private createPermissionHandler(
+        backend: ReturnType<typeof createHermesBackend>
+    ): AcpPermissionHandler {
+        return new AcpPermissionHandler(
+            this.session.client,
+            backend,
+            () => {
+                const mode = this.activeTurnPermissionMode
+                    ?? (this.session.getPermissionMode() as HermesPermissionMode | undefined)
+                // Hermes runs accept_edits natively in safe-yolo; keep any remaining
+                // ACP approval prompts interactive instead of auto-approving them.
+                return mode === 'safe-yolo' ? 'default' : mode
+            }
+        )
     }
 
     protected async cleanup(): Promise<void> {

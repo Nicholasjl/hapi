@@ -5501,7 +5501,7 @@ export class SyncEngine {
             return { type: 'error', message: 'Hermes resume cleanup is incomplete', code: 'resume_failed', rollbackSafe: false }
         }
         if (initialSession.metadata?.hermesResumeAttempt) {
-            const reconciled = await this.reconcilePersistedHermesResumeAttempt(initialSession)
+            const reconciled = await this.reconcilePersistedHermesResumeAttempt(initialSession, { allowUnknownWhenInactive: true })
             if (!reconciled) {
                 return {
                     type: 'error',
@@ -5661,24 +5661,28 @@ export class SyncEngine {
             // replacement process's readiness barrier.
             this.sessionReadyIds.delete(access.sessionId)
         }
+        const hermesArchiveSnapshot = requiresHermesNativeReady
+            ? {
+                lifecycleState: metadata.lifecycleState,
+                lifecycleStateSince: metadata.lifecycleStateSince,
+                archivedBy: metadata.archivedBy,
+                archiveReason: metadata.archiveReason,
+            }
+            : undefined
         if (requiresHermesNativeReady) {
             if (this.hermesResumeInFlightIds.has(access.sessionId)) {
                 return { type: 'error', message: 'Hermes resume is already in progress', code: 'resume_failed' }
             }
             this.hermesResumeInFlightIds.add(access.sessionId)
-            // Persist before spawn so a Hub restart cannot forget an in-place
-            // child whose native load readiness outcome is still unknown.
+            // Persist `preparing` before archive clear so a hub crash before
+            // spawn dispatch can distinguish no-child-started from an unconfirmed
+            // spawned child.
             try {
                 await this.writeHermesResumeAttempt(access.sessionId, namespace, {
-                    state: 'resuming',
+                    state: 'preparing',
                     machineId: targetMachine.id,
                     startedAt: Date.now(),
-                    archiveSnapshot: {
-                        lifecycleState: metadata.lifecycleState,
-                        lifecycleStateSince: metadata.lifecycleStateSince,
-                        archivedBy: metadata.archivedBy,
-                        archiveReason: metadata.archiveReason,
-                    },
+                    archiveSnapshot: hermesArchiveSnapshot,
                 })
             } catch {
                 this.hermesResumeInFlightIds.delete(access.sessionId)
@@ -5701,6 +5705,18 @@ export class SyncEngine {
                 } catch (error) {
                     const message = error instanceof Error ? error.message : 'Failed to clear archive metadata'
                     return { type: 'error', message, code: 'resume_failed' }
+                }
+            }
+            if (requiresHermesNativeReady) {
+                try {
+                    await this.writeHermesResumeAttempt(access.sessionId, namespace, {
+                        state: 'resuming',
+                        machineId: targetMachine.id,
+                        startedAt: Date.now(),
+                        archiveSnapshot: hermesArchiveSnapshot,
+                    })
+                } catch {
+                    return { type: 'error', message: 'Failed to record Hermes resume attempt', code: 'resume_failed' }
                 }
             }
             if (flavor === 'codex' && resumeToken) {
@@ -5750,7 +5766,7 @@ export class SyncEngine {
                 if (requiresHermesNativeReady && spawnResult.childStarted !== false) {
                     const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
                     const stopped = current
-                        ? await this.reconcilePersistedHermesResumeAttempt(current)
+                        ? await this.reconcilePersistedHermesResumeAttempt(current, { allowUnknownWhenInactive: false })
                         : false
                     if (!stopped) {
                         await this.quarantineHermesResume(access.sessionId, namespace, targetMachine.id)
@@ -5812,7 +5828,7 @@ export class SyncEngine {
                 if (requiresHermesNativeReady) {
                     const current = this.sessionCache.getSessionByNamespace(access.sessionId, namespace)
                     const stopped = current
-                        ? await this.reconcilePersistedHermesResumeAttempt(current)
+                        ? await this.reconcilePersistedHermesResumeAttempt(current, { allowUnknownWhenInactive: false })
                         : false
                     if (!stopped) {
                         await this.quarantineHermesResume(access.sessionId, namespace, targetMachine.id)
@@ -6037,10 +6053,11 @@ export class SyncEngine {
             }
             if (requiresHermesNativeReady) {
                 this.hermesResumeInFlightIds.delete(access.sessionId)
+                const attemptState = this.sessionCache.getSession(access.sessionId)?.metadata?.hermesResumeAttempt?.state
                 if (
                     !hermesResumeSucceeded
                     && !this.hermesResumeQuarantinedIds.has(access.sessionId)
-                    && this.sessionCache.getSession(access.sessionId)?.metadata?.hermesResumeAttempt?.state === 'resuming'
+                    && (attemptState === 'preparing' || attemptState === 'resuming')
                 ) {
                     await this.writeHermesResumeAttempt(access.sessionId, namespace, null, true).catch(() => {})
                 }
@@ -6194,7 +6211,7 @@ export class SyncEngine {
             return { type: 'error', message: 'Hermes resume cleanup is incomplete', code: 'resume_failed' }
         }
         if (metadata?.hermesResumeAttempt) {
-            const reconciled = await this.reconcilePersistedHermesResumeAttempt(session)
+            const reconciled = await this.reconcilePersistedHermesResumeAttempt(session, { allowUnknownWhenInactive: true })
             if (!reconciled) {
                 return {
                     type: 'error',
@@ -6653,7 +6670,10 @@ export class SyncEngine {
         }
     }
 
-    private async reconcilePersistedHermesResumeAttempt(session: Session): Promise<boolean> {
+    private async reconcilePersistedHermesResumeAttempt(
+        session: Session,
+        opts?: { allowUnknownWhenInactive?: boolean }
+    ): Promise<boolean> {
         const attempt = session.metadata?.hermesResumeAttempt
         if (!attempt) return true
         if (this.sessionReadyIds.has(session.id)) {
@@ -6682,7 +6702,15 @@ export class SyncEngine {
                 return false
             }
         }
-        if (status === 'still_alive' || status === 'unknown') return false
+        if (status === 'still_alive') return false
+        if (status === 'unknown') {
+            const live = this.sessionCache.getSession(session.id)
+            const canRecoverNoChild = !live?.active && (
+                attempt.state === 'preparing'
+                || (attempt.state === 'resuming' && opts?.allowUnknownWhenInactive === true)
+            )
+            if (!canRecoverNoChild) return false
+        }
         if (status === 'stopped') {
             const inactive = await this.waitForSessionInactive(session.id)
             if (!inactive && !this.sessionReadyIds.has(session.id)) return false

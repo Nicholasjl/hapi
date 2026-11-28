@@ -7,6 +7,7 @@ const harness = vi.hoisted(() => ({
     backend: null as Record<string, ReturnType<typeof vi.fn>> | null,
     newSessionConfig: null as unknown,
     loadSessionError: null as Error | null,
+    rejectModels: null as ((model: string) => boolean) | null,
     prompts: [] as unknown[][],
     modelsMetadata: null as {
         availableModels: Array<{ modelId: string; name?: string; description?: string }>
@@ -59,6 +60,9 @@ vi.mock('./utils/hermesBackend', () => ({
             cancelPrompt: vi.fn(async () => {}),
             getSessionModelsMetadata: vi.fn(() => harness.modelsMetadata),
             setModel: vi.fn(async (sessionId: string, model: string) => {
+                if (harness.rejectModels?.(model)) {
+                    throw new Error(`Model ${model} rejected`)
+                }
                 harness.setModelCalls.push({ sessionId, model })
             }),
             setMode: vi.fn(async (sessionId: string, modeId: string) => {
@@ -158,6 +162,7 @@ describe('HermesRemoteLauncher', () => {
         harness.backend = null
         harness.newSessionConfig = null
         harness.loadSessionError = null
+        harness.rejectModels = null
         harness.prompts = []
         harness.modelsMetadata = null
         harness.setModelCalls = []
@@ -779,5 +784,121 @@ describe('HermesRemoteLauncher', () => {
             await running
         }
         expect(harness.prompts).toHaveLength(1)
+    })
+
+    it('holds prompts after startup setModel rejects opts.model until user selects a usable model', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-init', name: 'Init' },
+                { modelId: 'model-usable', name: 'Usable' }
+            ],
+            currentModelId: 'model-init'
+        }
+        harness.rejectModels = (model) => model === 'bad-launch-model'
+        let pref: { model: string | null | undefined; revision: number } = { model: 'bad-launch-model', revision: 0 }
+        const onConfigDiscovered = vi.fn()
+        const onModelRollback = vi.fn((model: string | null) => {
+            pref = { ...pref, model }
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const launcher = new HermesRemoteLauncher(session as never, {
+            model: 'bad-launch-model',
+            initialModelRevision: 0,
+            getModelPreference: () => pref,
+            onConfigDiscovered,
+            onModelRollback
+        })
+        const running = launcher.launch()
+        try {
+            await vi.waitFor(() => expect(session.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'message',
+                message: expect.stringContaining('Hermes model switch to bad-launch-model failed')
+            }))
+            expect(onConfigDiscovered).not.toHaveBeenCalled()
+            expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true)
+
+            session.queue.push('prompt after failed startup model', {
+                permissionMode: 'default',
+                model: 'bad-launch-model',
+                modelRevision: 0
+            }, 'p-startup-fail')
+            await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-init', 0))
+            expect(harness.prompts).toHaveLength(0)
+
+            pref = { model: 'model-usable', revision: 1 }
+            launcher.notifyModelPreferenceChanged()
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+            expect(harness.setModelCalls).toEqual([{ sessionId: 'hermes-session-1', model: 'model-usable' }])
+            expect(harness.prompts[0]).toEqual([{ type: 'text', text: 'prompt after failed startup model' }])
+        } finally {
+            session.queue.close()
+            await running
+        }
+    })
+
+    it('holds queued prompts when reconnect setModel fails to restore a prior /model choice instead of running on discoveredModel', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-init', name: 'Init' },
+                { modelId: 'model-custom', name: 'Custom' },
+                { modelId: 'model-usable', name: 'Usable' }
+            ],
+            currentModelId: 'model-init'
+        }
+        let pref: { model: string | null | undefined; revision: number } = { model: 'model-init', revision: 0 }
+        const onModelChanged = vi.fn((model: string | null, expectedRev?: number) => {
+            if (expectedRev !== undefined && expectedRev !== pref.revision) return false
+            pref = { ...pref, model }
+            return true
+        })
+        const onModelRollback = vi.fn((model: string | null) => {
+            pref = { ...pref, model }
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const launcher = new HermesRemoteLauncher(session as never, {
+            initialModelRevision: 0,
+            getModelPreference: () => pref,
+            onModelChanged,
+            onModelRollback
+        })
+        const running = launcher.launch()
+        try {
+            await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+
+            // 1. Switch to model-custom via /model at picker revision 0.
+            session.queue.pushIsolated('/model model-custom', { permissionMode: 'default', model: 'model-init', modelRevision: 0 })
+            await vi.waitFor(() => expect(onModelChanged).toHaveBeenCalledWith('model-custom', 0))
+
+            // 2. Simulate closed transport + reconnect failing to restore model-custom.
+            harness.backend!.setMode.mockRejectedValueOnce(new Error('ACP transport is closed'))
+            harness.rejectModels = (model) => model === 'model-custom'
+            session.queue.push('prompt queued with stale picker model', {
+                permissionMode: 'yolo',
+                model: 'model-init',
+                modelRevision: 0
+            }, 'p-reconnect-fail')
+
+            await vi.waitFor(() => expect(session.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'message',
+                message: expect.stringContaining('Hermes model restore to model-custom failed after reconnect')
+            }))
+            await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-init', 0))
+            expect(harness.prompts).toHaveLength(0)
+
+            // 3. Selecting a usable model in the picker unparks the held prompt onto that model.
+            pref = { model: 'model-usable', revision: 1 }
+            launcher.notifyModelPreferenceChanged()
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+            expect(harness.setModelCalls).toEqual([
+                { sessionId: 'hermes-session-1', model: 'model-custom' },
+                { sessionId: 'hermes-session-1', model: 'model-usable' }
+            ])
+            expect(harness.prompts[0]).toEqual([{ type: 'text', text: 'prompt queued with stale picker model' }])
+        } finally {
+            session.queue.close()
+            await running
+        }
     })
 })
