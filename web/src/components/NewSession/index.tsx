@@ -17,6 +17,7 @@ import { getClaudeLaunchModelOptions } from '@/components/AssistantChat/modelOpt
 import { getClaudeComposerEffortOptions } from '@/components/AssistantChat/claudeEffortOptions'
 import { useDshModelsForMachine } from '@/hooks/queries/useDshModels'
 import { useHermesModelsForMachine } from '@/hooks/queries/useHermesModels'
+import { buildHermesModelOptions } from '@/components/NewSession/hermesModelOptions'
 import { useOpencodeModelsForCwd } from '@/hooks/queries/useOpencodeModelsForCwd'
 import { useOpencodeModelVariants } from '@/hooks/queries/useOpencodeModelVariants'
 import { useGrokModelsForCwd } from '@/hooks/queries/useGrokModelsForCwd'
@@ -2614,10 +2615,7 @@ export function NewSession(props: {
                     model={hermesSelectedModel ?? 'auto'}
                     options={[
                         { value: 'auto', label: 'Default' },
-                        ...hermesModelsState.availableModels.map((entry) => ({
-                            value: entry.modelId,
-                            label: entry.name ?? entry.modelId
-                        }))
+                        ...buildHermesModelOptions(hermesModelsState.availableModels)
                     ]}
                     isDisabled={isFormDisabled}
                     isLoading={hermesModelsState.isLoading}

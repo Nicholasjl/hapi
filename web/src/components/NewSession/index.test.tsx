@@ -26,7 +26,7 @@ const mocks = vi.hoisted(() => ({
     agyModels: [{ modelId: 'gemini-3.6-flash-low', name: 'Gemini 3.6 Flash (Low)' }],
     dshModels: [] as Array<{ modelId: string; name?: string }>,
     dshModelsLoading: false,
-    hermesModels: [] as Array<{ modelId: string; name?: string }>,
+    hermesModels: [] as Array<{ modelId: string; name?: string; description?: string }>,
     directoryExists: undefined as boolean | undefined,
     copilotModels: [] as Array<{ modelId: string; name?: string }>,
     copilotModelsLoading: false,
@@ -2731,5 +2731,34 @@ describe('NewSession launch preferences', () => {
             agent: 'agy',
             model: 'hub-agy-model'
         }))
+    })
+
+    it('qualifies duplicate Hermes model labels with provider names', async () => {
+        localStorage.clear()
+        mocks.hermesModels = [
+            { modelId: 'custom:qwen-plus', name: 'qwen-plus', description: 'Provider: dashscope • current' },
+            { modelId: 'custom:openrouter:qwen-plus', name: 'qwen-plus', description: 'Provider: openrouter' },
+            { modelId: 'custom:unique-model', name: 'unique-model', description: 'Provider: openrouter' }
+        ]
+        const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        render(
+            <QueryClientProvider client={client}>
+                <NewSession
+                    api={api}
+                    machines={[machine]}
+                    initialMachineId="machine-1"
+                    initialDirectory="C:\\repo"
+                    onSuccess={mocks.onSuccess}
+                    onCancel={() => {}}
+                />
+            </QueryClientProvider>
+        )
+
+        fireEvent.click(screen.getByDisplayValue('hermes'))
+        await waitFor(() => {
+            expect(screen.getByTestId('model-options')).toHaveTextContent(
+                'Default,qwen-plus (dashscope),qwen-plus (openrouter),unique-model'
+            )
+        })
     })
 })

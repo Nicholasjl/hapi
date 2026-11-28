@@ -862,6 +862,59 @@ describe('ApiMachineClient SpawnHappySession handler', () => {
             client.shutdown()
         }
     })
+
+    it('preserves childStarted:false from spawnSession preflight errors on the RPC response', async () => {
+        const machine = makeMachine('machine-spawn-hermes-preflight')
+        const client = new ApiMachineClient('cli-token', machine, [workspaceRoot])
+        const spawnSession = vi.fn()
+            .mockResolvedValueOnce({
+                type: 'error' as const,
+                errorMessage: 'Hermes CLI not found',
+                code: 'agent_unavailable' as const,
+                agent: 'hermes' as const,
+                childStarted: false as const,
+            })
+            .mockResolvedValueOnce({
+                type: 'error' as const,
+                errorMessage: 'Hermes launch failed after spawn',
+                agent: 'hermes' as const,
+            })
+
+        client.setRPCHandlers({
+            spawnSession,
+            stopSession: vi.fn(async () => 'stopped' as const),
+            requestShutdown: vi.fn()
+        })
+
+        try {
+            const preflightResult = await callSpawnHappySession(client, machine.id, {
+                directory: workspaceRoot,
+                agent: 'hermes',
+                resumeSessionId: 'hermes-native-1',
+            })
+            expect(preflightResult).toEqual({
+                type: 'error',
+                errorMessage: 'Hermes CLI not found',
+                code: 'agent_unavailable',
+                agent: 'hermes',
+                childStarted: false,
+            })
+
+            const indeterminateResult = await callSpawnHappySession(client, machine.id, {
+                directory: workspaceRoot,
+                agent: 'hermes',
+                resumeSessionId: 'hermes-native-1',
+            })
+            expect(indeterminateResult).toEqual({
+                type: 'error',
+                errorMessage: 'Hermes launch failed after spawn',
+                agent: 'hermes',
+            })
+            expect(indeterminateResult).not.toHaveProperty('childStarted')
+        } finally {
+            client.shutdown()
+        }
+    })
 })
 
 describe('ApiMachineClient keepAlive lifecycle', () => {

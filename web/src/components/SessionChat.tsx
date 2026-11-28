@@ -139,6 +139,7 @@ import { useKimiModelsForSession } from '@/hooks/queries/useKimiModelsForSession
 import { useKimiReasoningEffortOptions } from '@/hooks/queries/useKimiReasoningEffortOptions'
 import { useDshModelsForSession } from '@/hooks/queries/useDshModels'
 import { useHermesModelsForSession } from '@/hooks/queries/useHermesModels'
+import { buildHermesModelOptions } from '@/components/NewSession/hermesModelOptions'
 import { buildKimiSessionModelOptions } from '@/components/NewSession/grokModels'
 import { useGrokReasoningEffortOptions } from '@/hooks/queries/useGrokReasoningEffortOptions'
 import { usePiModels } from '@/hooks/queries/usePiModels'
@@ -1374,10 +1375,7 @@ function SessionChatInner(props: SessionChatProps) {
         agentFlavor === 'hermes' && hermesModelsState.availableModels.length > 0
             ? [
                 { value: null, label: 'Default' },
-                ...hermesModelsState.availableModels.map((model) => ({
-                    value: model.modelId,
-                    label: model.name ?? model.modelId
-                }))
+                ...buildHermesModelOptions(hermesModelsState.availableModels)
             ]
             : undefined
     ), [agentFlavor, hermesModelsState.availableModels])

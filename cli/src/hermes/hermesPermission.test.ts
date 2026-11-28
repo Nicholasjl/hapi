@@ -240,4 +240,107 @@ describe('HermesRemoteLauncher real ACP permission handling', () => {
             await running
         }
     })
+
+    it('keeps execute and untyped command requests interactive in read-only mode while auto-approving known read-only requests', async () => {
+        const { session, handlers, getAgentState } = makeSession('read-only')
+        const running = new HermesRemoteLauncher(session as never).launch()
+
+        let releaseFirstPrompt!: () => void
+        try {
+            await vi.waitFor(() => expect(handlers.has('permission')).toBe(true))
+            const firstBackend = harness.backends[0]!
+
+            harness.nextPromptScript = async (backend, onUpdate) => {
+                // Known read-only request auto-approves once.
+                backend.permissionHandler!({
+                    id: 'perm-ro-read',
+                    sessionId: 'hermes-session-1',
+                    toolCallId: 'call-ro-read',
+                    title: 'Read file',
+                    kind: 'read',
+                    rawInput: { path: 'README.md' },
+                    options: [
+                        { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+                        { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+                    ]
+                })
+                // Command request (kind: 'execute') must stay interactive.
+                backend.permissionHandler!(makeCommandRequest('perm-ro-exec'))
+                // Untyped command request without kind must also stay interactive.
+                backend.permissionHandler!({
+                    id: 'perm-ro-untyped',
+                    sessionId: 'hermes-session-1',
+                    toolCallId: 'call-ro-untyped',
+                    title: 'Run shell command',
+                    rawInput: { command: 'touch pwned' },
+                    options: [
+                        { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+                        { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }
+                    ]
+                })
+                await new Promise<void>((resolve) => {
+                    releaseFirstPrompt = resolve
+                })
+                onUpdate({ type: 'text', text: 'done ro 1' })
+            }
+            session.queue.push('run in read-only', { permissionMode: 'read-only' })
+
+            await vi.waitFor(() => expect(firstBackend.respondToPermission).toHaveBeenCalledWith(
+                'hermes-session-1',
+                expect.objectContaining({ id: 'perm-ro-read' }),
+                { outcome: 'selected', optionId: 'allow_once' }
+            ))
+            await vi.waitFor(() => {
+                expect(getAgentState().requests?.['perm-ro-exec']).toBeDefined()
+                expect(getAgentState().requests?.['perm-ro-untyped']).toBeDefined()
+            })
+            expect(firstBackend.respondToPermission).toHaveBeenCalledTimes(1)
+
+            await handlers.get('permission')!({ id: 'perm-ro-exec', approved: false })
+            await handlers.get('permission')!({ id: 'perm-ro-untyped', approved: true })
+            await vi.waitFor(() => expect(firstBackend.respondToPermission).toHaveBeenCalledWith(
+                'hermes-session-1',
+                expect.objectContaining({ id: 'perm-ro-exec' }),
+                { outcome: 'selected', optionId: 'reject_once' }
+            ))
+            await vi.waitFor(() => expect(firstBackend.respondToPermission).toHaveBeenCalledWith(
+                'hermes-session-1',
+                expect.objectContaining({ id: 'perm-ro-untyped' }),
+                { outcome: 'selected', optionId: 'allow_once' }
+            ))
+            releaseFirstPrompt()
+
+            // Reconnect must also keep read-only execution requests interactive.
+            let releaseSecondPrompt!: () => void
+            try {
+                firstBackend.prompt.mockRejectedValueOnce(new Error('ACP transport is closed'))
+                harness.nextPromptScript = async (backend, onUpdate) => {
+                    backend.permissionHandler!(makeCommandRequest('perm-ro-reconnect'))
+                    await new Promise<void>((resolve) => {
+                        releaseSecondPrompt = resolve
+                    })
+                    onUpdate({ type: 'text', text: 'done ro 2' })
+                }
+                session.queue.push('second turn in read-only', { permissionMode: 'read-only' })
+
+                await vi.waitFor(() => expect(harness.backends).toHaveLength(2))
+                const secondBackend = harness.backends[1]!
+                await vi.waitFor(() => expect(getAgentState().requests?.['perm-ro-reconnect']).toBeDefined())
+                expect(secondBackend.respondToPermission).not.toHaveBeenCalled()
+
+                await handlers.get('permission')!({ id: 'perm-ro-reconnect', approved: true })
+                await vi.waitFor(() => expect(secondBackend.respondToPermission).toHaveBeenCalledWith(
+                    'hermes-session-1',
+                    expect.objectContaining({ id: 'perm-ro-reconnect' }),
+                    { outcome: 'selected', optionId: 'allow_once' }
+                ))
+            } finally {
+                releaseSecondPrompt?.()
+            }
+        } finally {
+            releaseFirstPrompt?.()
+            session.queue.close()
+            await running
+        }
+    })
 })

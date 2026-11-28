@@ -7,7 +7,8 @@ import { isAcpIndeterminateError } from '@/agent/backends/acp/AcpStdioTransport'
 import { buildHapiMcpBridge } from '@/codex/utils/buildHapiMcpBridge'
 import { logger } from '@/ui/logger'
 import { convertAgentMessage } from '@/agent/messageConverter'
-import type { AgentMessage, McpServerStdio, PromptContent } from '@/agent/types'
+import { deriveToolName } from '@/agent/utils'
+import type { AgentMessage, McpServerStdio, PermissionRequest, PromptContent } from '@/agent/types'
 import {
     RemoteLauncherBase,
     type RemoteLauncherDisplayContext,
@@ -18,6 +19,69 @@ import { AcpPermissionHandler } from '@/modules/common/permission/AcpPermissionH
 import { createHermesBackend } from './utils/hermesBackend'
 import { resolveHermesConfigModels } from './utils/hermesConfiguredModels'
 import type { HermesSession } from './session'
+
+const HERMES_READ_ONLY_TOOL_NAMES = new Set([
+    'read',
+    'read_file',
+    'read file',
+    'view_file',
+    'grep',
+    'grep_search',
+    'glob',
+    'search',
+    'find_by_name',
+    'list_files',
+    'list files',
+    'list_dir',
+    'list_peers',
+    'list peer sessions'
+])
+
+const HERMES_READ_ONLY_DISALLOWED_HINTS = [
+    'write',
+    'edit',
+    'create',
+    'delete',
+    'patch',
+    'fs-edit',
+    'ping_peer',
+    'ping peer',
+    'inspect_peer',
+    'inspect peer',
+    'spawn_peer',
+    'spawn peer',
+    'link_pr',
+    'link pull request',
+    'exec',
+    'shell',
+    'bash',
+    'terminal',
+    'command',
+    'run_command',
+    'run command'
+]
+
+/**
+ * Allows read-only auto-approval only for known read/search/think requests;
+ * shell execution and untyped command requests remain interactive.
+ */
+export function isHermesReadOnlyAutoApprovable(request: PermissionRequest): boolean {
+    const lowerTool = deriveToolName({
+        title: request.title,
+        kind: request.kind,
+        rawInput: request.rawInput
+    }).trim().toLowerCase()
+    if (HERMES_READ_ONLY_DISALLOWED_HINTS.some((hint) => lowerTool.includes(hint))) {
+        return false
+    }
+    if (request.kind === 'read' || request.kind === 'search' || request.kind === 'think') {
+        return true
+    }
+    if (request.kind == null && HERMES_READ_ONLY_TOOL_NAMES.has(lowerTool)) {
+        return true
+    }
+    return false
+}
 
 function mapPermissionModeToHermesAcpMode(mode: HermesPermissionMode | undefined): string {
     switch (mode) {
@@ -534,6 +598,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 return 'continue'
             }
 
+            const recoveringFailedSwitch = this.pendingModelFailure !== null || modelRetryState.failedSelection !== null
             const isStaleBatchModel = !bypassStaleCheck && effectiveModelRevision !== undefined && (
                 (this.currentBackendModelRevision !== undefined && effectiveModelRevision < this.currentBackendModelRevision)
                 || (this.slashOverridePickerRevision !== undefined && effectiveModelRevision <= this.slashOverridePickerRevision)
@@ -545,6 +610,9 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                             await backend.setModel(acpSessionId, this.initialBackendModel, { flavor: 'hermes' })
                             this.currentBackendModel = this.initialBackendModel
                             this.recordAppliedModelRevision(effectiveModelRevision)
+                            if (recoveringFailedSwitch) {
+                                this.opts.onModelChanged?.(null, effectiveModelRevision)
+                            }
                             this.messageBuffer.addMessage(`[MODEL:${this.initialBackendModel}]`, 'system')
                         } catch (err) {
                             if (isClosedTransportError(backend, err)) {
@@ -563,12 +631,18 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                         }
                     } else {
                         this.recordAppliedModelRevision(effectiveModelRevision)
+                        if (recoveringFailedSwitch) {
+                            this.opts.onModelChanged?.(null, effectiveModelRevision)
+                        }
                     }
                 } else if (requestedModel && requestedModel !== this.currentBackendModel) {
                     try {
                         await backend.setModel(acpSessionId, requestedModel, { flavor: 'hermes' })
                         this.currentBackendModel = requestedModel
                         this.recordAppliedModelRevision(effectiveModelRevision)
+                        if (recoveringFailedSwitch) {
+                            this.opts.onModelChanged?.(requestedModel, effectiveModelRevision)
+                        }
                         this.messageBuffer.addMessage(`[MODEL:${requestedModel}]`, 'system')
                     } catch (err) {
                         if (isClosedTransportError(backend, err)) {
@@ -587,6 +661,9 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                     }
                 } else {
                     this.recordAppliedModelRevision(effectiveModelRevision)
+                    if (recoveringFailedSwitch) {
+                        this.opts.onModelChanged?.(requestedModel ?? null, effectiveModelRevision)
+                    }
                 }
             }
             this.pendingModelFailure = null
@@ -756,6 +833,11 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         return nextBackend
     }
 
+    private getCurrentPermissionMode(): HermesPermissionMode | undefined {
+        return this.activeTurnPermissionMode
+            ?? (this.session.getPermissionMode() as HermesPermissionMode | undefined)
+    }
+
     private createPermissionHandler(
         backend: ReturnType<typeof createHermesBackend>
     ): AcpPermissionHandler {
@@ -763,11 +845,15 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             this.session.client,
             backend,
             () => {
-                const mode = this.activeTurnPermissionMode
-                    ?? (this.session.getPermissionMode() as HermesPermissionMode | undefined)
+                const mode = this.getCurrentPermissionMode()
                 // Hermes runs accept_edits natively in safe-yolo; keep any remaining
                 // ACP approval prompts interactive instead of auto-approving them.
                 return mode === 'safe-yolo' ? 'default' : mode
+            },
+            {
+                requiresUser: (request) =>
+                    this.getCurrentPermissionMode() === 'read-only'
+                    && !isHermesReadOnlyAutoApprovable(request)
             }
         )
     }

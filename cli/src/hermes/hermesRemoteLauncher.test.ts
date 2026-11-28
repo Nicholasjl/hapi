@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import { MessageQueue2 } from '@/utils/MessageQueue2'
+import { createHermesModelPreferenceController } from './runHermes'
 import type { HermesMode } from './types'
 
 const harness = vi.hoisted(() => ({
@@ -897,6 +898,111 @@ describe('HermesRemoteLauncher', () => {
             ])
             expect(harness.prompts[0]).toEqual([{ type: 'text', text: 'prompt queued with stale picker model' }])
         } finally {
+            session.queue.close()
+            await running
+        }
+    })
+
+    it('publishes recovered model and Default reset after transient setModel retry succeeds so next prompt stays on it', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-a', name: 'Model A' },
+                { modelId: 'model-b', name: 'Model B' }
+            ],
+            currentModelId: 'model-a'
+        }
+        let syncedModel: string | null = 'model-a'
+        const controller = createHermesModelPreferenceController('model-a', (model) => {
+            syncedModel = model
+        })
+        const onModelRollback = vi.fn((model: string | null, expectedRev?: number) => {
+            controller.rollbackModel(model, expectedRev)
+        })
+        const onModelChanged = vi.fn((model: string | null, expectedRev?: number) => {
+            return controller.applyBackendModelChange(model, expectedRev)
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const launcher = new HermesRemoteLauncher(session as never, {
+            initialModelRevision: controller.getRevision(),
+            getModelPreference: () => ({
+                model: controller.getModel(),
+                revision: controller.getRevision()
+            }),
+            onModelChanged,
+            onModelRollback
+        })
+        const running = launcher.launch()
+        try {
+            await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+
+            // 1. Transient failure switching to model-b rolls back controller to model-a at rev 1,
+            //    then automatic retry succeeds and publishes model-b back to controller.
+            let failModelB = true
+            harness.rejectModels = (model) => {
+                if (model === 'model-b' && failModelB) {
+                    failModelB = false
+                    return true
+                }
+                return false
+            }
+            const revB = controller.applyConfigModel('model-b')
+            session.queue.push('prompt recovering model-b', {
+                permissionMode: 'default',
+                model: 'model-b',
+                modelRevision: revB
+            }, 'p-retry-b')
+
+            await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-a', revB))
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1), { timeout: 4000 })
+            expect(onModelChanged).toHaveBeenCalledWith('model-b', revB)
+            expect(controller.getModel()).toBe('model-b')
+            expect(syncedModel).toBe('model-b')
+
+            // Second prompt pushed from controller state stays on model-b without reverting to model-a.
+            session.queue.push('second prompt after model-b recovery', {
+                permissionMode: 'default',
+                model: controller.getModel() ?? undefined,
+                modelRevision: controller.getRevision()
+            }, 'p-stay-b')
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(2))
+            expect(harness.setModelCalls).toEqual([{ sessionId: 'hermes-session-1', model: 'model-b' }])
+
+            // 2. Transient failure resetting to Default (null) rolls back to model-b, then automatic retry
+            //    publishes null back to controller so the next prompt stays on Default.
+            let failModelA = true
+            harness.rejectModels = (model) => {
+                if (model === 'model-a' && failModelA) {
+                    failModelA = false
+                    return true
+                }
+                return false
+            }
+            const revDefault = controller.applyConfigModel(null)
+            session.queue.push('prompt recovering default', {
+                permissionMode: 'default',
+                model: null,
+                modelRevision: revDefault
+            }, 'p-retry-default')
+
+            await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-b', revDefault))
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(3), { timeout: 4000 })
+            expect(onModelChanged).toHaveBeenCalledWith(null, revDefault)
+            expect(controller.getModel()).toBeNull()
+            expect(syncedModel).toBeNull()
+
+            session.queue.push('fourth prompt stays on default', {
+                permissionMode: 'default',
+                model: controller.getModel(),
+                modelRevision: controller.getRevision()
+            }, 'p-stay-default')
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(4))
+            expect(harness.setModelCalls).toEqual([
+                { sessionId: 'hermes-session-1', model: 'model-b' },
+                { sessionId: 'hermes-session-1', model: 'model-a' }
+            ])
+        } finally {
+            harness.rejectModels = null
             session.queue.close()
             await running
         }

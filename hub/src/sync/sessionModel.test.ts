@@ -4782,6 +4782,93 @@ describe('session model', () => {
         }
     })
 
+    it('keeps archived Hermes resume retryable after a preflight childStarted:false failure without quarantine', async () => {
+        const store = new Store(':memory:')
+        const engine = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        try {
+            const session = engine.getOrCreateSession(
+                'hermes-preflight-retry',
+                {
+                    path: '/remote/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'hermes',
+                    hermesSessionId: 'hermes-native-preflight',
+                    lifecycleState: 'archived',
+                    archivedBy: 'cli',
+                    archiveReason: 'Exited',
+                    lifecycleStateSince: 100
+                },
+                null,
+                'default'
+            )
+            engine.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            engine.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() })
+
+            let stopCalls = 0
+            let spawnAttempts = 0
+            ;(engine as any).rpcGateway.stopRunnerSession = async () => {
+                stopCalls += 1
+                return 'unknown'
+            }
+            ;(engine as any).rpcGateway.spawnSession = async () => {
+                spawnAttempts += 1
+                if (spawnAttempts === 1) {
+                    return {
+                        type: 'error',
+                        message: 'Hermes CLI not found',
+                        code: 'agent_unavailable',
+                        childStarted: false
+                    }
+                }
+                engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+                setTimeout(() => engine.handleSessionReady({ sid: session.id, time: Date.now() }), 20)
+                return { type: 'success', sessionId: session.id }
+            }
+
+            expect(await engine.resumeSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Hermes CLI not found',
+                code: 'resume_failed'
+            })
+            expect(stopCalls).toBe(0)
+            const afterFail = store.sessions.getSessionByNamespace(session.id, 'default')!
+            const afterFailMetadata = afterFail.metadata as {
+                hermesResumeAttempt?: unknown
+                lifecycleState?: string
+                archiveReason?: string
+            } | undefined
+            expect(afterFailMetadata?.hermesResumeAttempt).toBeUndefined()
+            expect(afterFailMetadata?.lifecycleState).toBe('archived')
+            expect(afterFailMetadata?.archiveReason).toBe('Exited')
+
+            // Subsequent retry after installing Hermes succeeds cleanly.
+            expect(await engine.reopenSession(session.id, 'default')).toEqual({
+                type: 'success',
+                sessionId: session.id,
+                resumed: true
+            })
+            expect(spawnAttempts).toBe(2)
+            expect((store.sessions.getSessionByNamespace(session.id, 'default')?.metadata as {
+                hermesResumeAttempt?: unknown
+            } | undefined)?.hermesResumeAttempt).toBeUndefined()
+        } finally {
+            engine.stop()
+        }
+    })
+
     it('resumeSession fresh-spawns when inactive cursor session has no agent id and no user messages', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(
