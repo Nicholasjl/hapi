@@ -4468,6 +4468,173 @@ describe('session model', () => {
         }
     })
 
+    it('preserves pending Hermes resume state across SyncEngine restarts until ready or confirmed stop', async () => {
+        const store = new Store(':memory:')
+        const first = new SyncEngine(
+            store,
+            {} as never,
+            new RpcRegistry(),
+            { broadcast() {} } as never
+        )
+
+        let sessionId: string
+        let restarted: SyncEngine | null = null
+        let secondRestarted: SyncEngine | null = null
+        try {
+            const session = first.getOrCreateSession(
+                'hermes-restart-pending',
+                {
+                    path: '/remote/project',
+                    host: 'localhost',
+                    machineId: 'machine-1',
+                    flavor: 'hermes',
+                    hermesSessionId: 'hermes-native-restart',
+                    lifecycleState: 'archived',
+                    archivedBy: 'cli',
+                    archiveReason: 'Exited',
+                    lifecycleStateSince: 100
+                },
+                null,
+                'default'
+            )
+            sessionId = session.id
+            first.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            first.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            first.handleSessionEnd({ sid: session.id, time: Date.now() })
+
+            // Simulate hub restart right while spawn/load is in flight before waitForSessionReady settles.
+            let persistedDuringSpawn = false
+            ;(first as any).rpcGateway.spawnSession = async () => {
+                persistedDuringSpawn = first.getSessionByNamespace(session.id, 'default')
+                    ?.metadata?.hermesResumeAttempt?.state === 'resuming'
+                first.handleSessionAlive({ sid: session.id, time: Date.now() })
+                return { type: 'success', sessionId: session.id }
+            }
+            ;(first as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+            ;(first as any).waitForSessionReady = async () => 'timeout'
+
+            expect(await first.reopenSession(session.id, 'default')).toMatchObject({
+                type: 'error',
+                code: 'resume_failed'
+            })
+            expect(persistedDuringSpawn).toBe(true)
+            first.stop()
+
+            // New SyncEngine over the same store receives a keepalive while Hermes is still loading.
+            restarted = new SyncEngine(
+                store,
+                {} as never,
+                new RpcRegistry(),
+                { broadcast() {} } as never
+            )
+            restarted.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            restarted.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            restarted.handleSessionAlive({ sid: session.id, time: Date.now() })
+
+            let restartedSpawnCount = 0
+            ;(restarted as any).rpcGateway.spawnSession = async () => {
+                restartedSpawnCount += 1
+                return { type: 'success', sessionId: session.id }
+            }
+            ;(restarted as any).rpcGateway.stopRunnerSession = async () => 'still_alive'
+
+            expect(await restarted.reopenSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Hermes native resume timed out and the child is still active',
+                code: 'resume_failed'
+            })
+            expect(await restarted.resumeSession(session.id, 'default')).toEqual({
+                type: 'error',
+                message: 'Hermes native resume timed out and the child is still active',
+                code: 'resume_failed',
+                rollbackSafe: false
+            })
+            expect(restartedSpawnCount).toBe(0)
+
+            // Late session-ready on the restarted hub clears the persisted attempt and unlocks active shortcuts.
+            restarted.handleSessionReady({ sid: session.id, time: Date.now() })
+            await flushAsyncWork()
+            expect(restarted.getSessionByNamespace(session.id, 'default')?.metadata?.hermesResumeAttempt).toBeUndefined()
+            expect(await restarted.reopenSession(session.id, 'default')).toEqual({
+                type: 'success',
+                sessionId: session.id,
+                resumed: false
+            })
+            expect(restartedSpawnCount).toBe(0)
+            restarted.stop()
+            restarted = null
+
+            // Verify a persisted pending attempt also clears and restores archive when stopRunnerSession reports already_gone.
+            store.sessions.updateSessionMetadata(
+                sessionId,
+                {
+                    ...store.sessions.getSessionByNamespace(sessionId, 'default')!.metadata as Record<string, unknown>,
+                    lifecycleState: 'running',
+                    hermesResumeAttempt: {
+                        state: 'resuming',
+                        machineId: 'machine-1',
+                        startedAt: 200,
+                        archiveSnapshot: {
+                            lifecycleState: 'archived',
+                            archivedBy: 'cli',
+                            archiveReason: 'Exited',
+                            lifecycleStateSince: 100
+                        }
+                    }
+                },
+                store.sessions.getSessionByNamespace(sessionId, 'default')!.metadataVersion,
+                'default'
+            )
+
+            secondRestarted = new SyncEngine(
+                store,
+                {} as never,
+                new RpcRegistry(),
+                { broadcast() {} } as never
+            )
+            secondRestarted.getOrCreateMachine(
+                'machine-1',
+                { host: 'localhost', platform: 'linux', happyCliVersion: '0.1.0' },
+                { status: 'running' },
+                'default'
+            )
+            secondRestarted.handleMachineAlive({ machineId: 'machine-1', time: Date.now() })
+            secondRestarted.handleSessionAlive({ sid: sessionId, time: Date.now() })
+            ;(secondRestarted as any).rpcGateway.stopRunnerSession = async () => 'already_gone'
+            let respawnCount = 0
+            ;(secondRestarted as any).rpcGateway.spawnSession = async () => {
+                respawnCount += 1
+                secondRestarted!.handleSessionAlive({ sid: sessionId, time: Date.now() })
+                setTimeout(() => {
+                    secondRestarted!.handleSessionReady({ sid: sessionId, time: Date.now() })
+                }, 20)
+                return { type: 'success', sessionId }
+            }
+
+            expect(await secondRestarted.reopenSession(sessionId, 'default')).toEqual({
+                type: 'success',
+                sessionId,
+                resumed: true
+            })
+            expect(respawnCount).toBe(1)
+            expect(secondRestarted.getSessionByNamespace(sessionId, 'default')?.metadata?.hermesResumeAttempt).toBeUndefined()
+        } finally {
+            secondRestarted?.stop()
+            restarted?.stop()
+            first.stop()
+        }
+    })
+
     it('resumeSession fresh-spawns when inactive cursor session has no agent id and no user messages', async () => {
         const store = new Store(':memory:')
         const engine = new SyncEngine(

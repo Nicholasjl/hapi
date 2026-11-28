@@ -87,6 +87,7 @@ const updateStateSchema = z.object({
 // (same strip/restore as supersededBySessionId — see sessionHandlers.test.ts).
 const HUB_OWNED_METADATA_KEYS = [
     'codexImportedAt',
+    'hermesResumeAttempt',
     'opencodeRewind',
     'supersededBySessionId',
     'opencodeClearOperation',

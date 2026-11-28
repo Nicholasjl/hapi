@@ -73,21 +73,66 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
     private abortController = new AbortController()
     private currentBackendModel: string | null = null
     private currentBackendModelRevision: number | undefined = undefined
+    private slashOverridePickerRevision: number | undefined = undefined
     private initialBackendModel: string | null = null
     private currentBackendAcpMode: string | null = null
     private activeTurnPermissionMode: HermesPermissionMode | undefined = undefined
+    private modelRetryWake: (() => void) | null = null
 
     constructor(
         private readonly session: HermesSession,
         private readonly opts: {
             model?: string
             initialModelRevision?: number
+            getModelPreference?: () => { model: string | null | undefined; revision: number }
             onModelRollback?: (model: string | null, revision?: number) => void
             onConfigDiscovered?: (model: string | null, revision?: number) => void
-            onModelChanged?: (model: string | null, revision?: number) => number | null | void
+            onModelChanged?: (model: string | null, revision?: number) => boolean | void
         } = {}
     ) {
         super(process.env.DEBUG ? session.logPath : undefined)
+    }
+
+    notifyModelPreferenceChanged(): void {
+        this.wakeModelRetry()
+    }
+
+    notifyQueueChanged(): void {
+        this.wakeModelRetry()
+    }
+
+    private wakeModelRetry(): void {
+        const wake = this.modelRetryWake
+        if (!wake) return
+        this.modelRetryWake = null
+        wake()
+    }
+
+    private waitForModelRetryOrWake(ms: number, signal: AbortSignal): Promise<void> {
+        if (signal.aborted) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+            let settled = false
+            const finish = () => {
+                if (settled) return
+                settled = true
+                clearTimeout(timer)
+                signal.removeEventListener('abort', finish)
+                if (this.modelRetryWake === finish) {
+                    this.modelRetryWake = null
+                }
+                resolve()
+            }
+            this.modelRetryWake = finish
+            const timer = setTimeout(finish, ms)
+            signal.addEventListener('abort', finish, { once: true })
+        })
+    }
+
+    private recordAppliedModelRevision(revision: number | undefined): void {
+        if (revision === undefined) return
+        this.currentBackendModelRevision = this.currentBackendModelRevision === undefined
+            ? revision
+            : Math.max(this.currentBackendModelRevision, revision)
     }
 
     async launch(): Promise<RemoteLauncherExitReason> {
@@ -226,6 +271,10 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
 
         let retryDelay = 1000
         let consecutiveReconnects = 0
+        const modelRetryState: {
+            failedSelection: { requestedModel: string | null | undefined; revision: number | undefined } | null
+            delayMs: number
+        } = { failedSelection: null, delayMs: 1000 }
         const recoverFromClosedTransport = async (
             cause: unknown,
             uncommittedBatch?: NonNullable<Awaited<ReturnType<HermesSession['queue']['waitForDeferredBatch']>>>
@@ -375,11 +424,12 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 consecutiveReconnects = 0
                 this.session.queue.commitBatch(batch)
                 this.currentBackendModel = slashModelTarget
-                const nextRev = this.opts.onModelChanged?.(slashModelTarget, batch.mode.modelRevision)
-                if (typeof nextRev === 'number') {
-                    this.currentBackendModelRevision = nextRev
-                } else if (batch.mode.modelRevision !== undefined) {
-                    this.currentBackendModelRevision = batch.mode.modelRevision
+                this.opts.onModelChanged?.(slashModelTarget, batch.mode.modelRevision)
+                this.recordAppliedModelRevision(batch.mode.modelRevision)
+                if (batch.mode.modelRevision !== undefined) {
+                    this.slashOverridePickerRevision = this.slashOverridePickerRevision === undefined
+                        ? batch.mode.modelRevision
+                        : Math.max(this.slashOverridePickerRevision, batch.mode.modelRevision)
                 }
                 this.messageBuffer.addMessage(batch.message, 'user')
                 this.messageBuffer.addMessage(`[MODEL:${slashModelTarget}]`, 'system')
@@ -390,19 +440,73 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 continue
             }
 
-            const requestedModel = batch.mode.model
-            const isStaleBatchModel = batch.mode.modelRevision !== undefined
-                && this.currentBackendModelRevision !== undefined
-                && batch.mode.modelRevision < this.currentBackendModelRevision
+            let requestedModel = batch.mode.model
+            let effectiveModelRevision = batch.mode.modelRevision
+            if (modelRetryState.failedSelection !== null) {
+                if (
+                    requestedModel === modelRetryState.failedSelection.requestedModel
+                    && effectiveModelRevision === modelRetryState.failedSelection.revision
+                ) {
+                    const livePref = this.opts.getModelPreference?.()
+                    if (livePref !== undefined && livePref.revision !== modelRetryState.failedSelection.revision) {
+                        requestedModel = livePref.model
+                        effectiveModelRevision = livePref.revision
+                        modelRetryState.failedSelection = null
+                        modelRetryState.delayMs = 1000
+                    }
+                } else {
+                    modelRetryState.failedSelection = null
+                    modelRetryState.delayMs = 1000
+                }
+            }
+
+            const handleRejectedModelSwitch = async (
+                requested: string | null,
+                label: string,
+                err: unknown
+            ): Promise<'break' | 'continue'> => {
+                const message = err instanceof Error ? err.message : String(err)
+                const prev = modelRetryState.failedSelection
+                const shouldNotify = prev === null
+                    || prev.requestedModel !== requested
+                    || prev.revision !== effectiveModelRevision
+                modelRetryState.failedSelection = { requestedModel: requested, revision: effectiveModelRevision }
+                this.opts.onModelRollback?.(this.currentBackendModel, effectiveModelRevision)
+                if (shouldNotify) {
+                    const notice = requested === null
+                        ? `Hermes model reset to Default (${label}) failed. Prompt remains queued — choose a usable model or cancel it: ${message}`
+                        : `Hermes model switch to ${label} failed. Prompt remains queued — choose a usable model or cancel it: ${message}`
+                    this.session.sendSessionEvent({ type: 'message', message: notice })
+                    this.messageBuffer.addMessage(notice, 'status')
+                }
+                if (this.shouldExit || this.session.queue.isClosed()) {
+                    this.session.queue.releaseBatch(batch)
+                    return 'break'
+                }
+                this.session.queue.unshiftBatch({
+                    ...batch,
+                    mode: {
+                        ...batch.mode,
+                        model: requested,
+                        modelRevision: effectiveModelRevision
+                    }
+                })
+                await this.waitForModelRetryOrWake(modelRetryState.delayMs, signal)
+                modelRetryState.delayMs = Math.min(modelRetryState.delayMs * 2, 10000)
+                return 'continue'
+            }
+
+            const isStaleBatchModel = effectiveModelRevision !== undefined && (
+                (this.currentBackendModelRevision !== undefined && effectiveModelRevision < this.currentBackendModelRevision)
+                || (this.slashOverridePickerRevision !== undefined && effectiveModelRevision <= this.slashOverridePickerRevision)
+            )
             if (!isStaleBatchModel) {
                 if (requestedModel === null) {
                     if (this.initialBackendModel && this.initialBackendModel !== this.currentBackendModel) {
                         try {
                             await backend.setModel(acpSessionId, this.initialBackendModel, { flavor: 'hermes' })
                             this.currentBackendModel = this.initialBackendModel
-                            if (batch.mode.modelRevision !== undefined) {
-                                this.currentBackendModelRevision = batch.mode.modelRevision
-                            }
+                            this.recordAppliedModelRevision(effectiveModelRevision)
                             this.messageBuffer.addMessage(`[MODEL:${this.initialBackendModel}]`, 'system')
                         } catch (err) {
                             if (isClosedTransportError(backend, err)) {
@@ -415,18 +519,18 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                                 continue
                             }
                             logger.debug('[hermes-acp] reset setModel failed', err)
-                            this.opts.onModelRollback?.(this.currentBackendModel, batch.mode.modelRevision)
+                            const action = await handleRejectedModelSwitch(null, this.initialBackendModel, err)
+                            if (action === 'break') break
+                            continue
                         }
-                    } else if (batch.mode.modelRevision !== undefined) {
-                        this.currentBackendModelRevision = batch.mode.modelRevision
+                    } else {
+                        this.recordAppliedModelRevision(effectiveModelRevision)
                     }
                 } else if (requestedModel && requestedModel !== this.currentBackendModel) {
                     try {
                         await backend.setModel(acpSessionId, requestedModel, { flavor: 'hermes' })
                         this.currentBackendModel = requestedModel
-                        if (batch.mode.modelRevision !== undefined) {
-                            this.currentBackendModelRevision = batch.mode.modelRevision
-                        }
+                        this.recordAppliedModelRevision(effectiveModelRevision)
                         this.messageBuffer.addMessage(`[MODEL:${requestedModel}]`, 'system')
                     } catch (err) {
                         if (isClosedTransportError(backend, err)) {
@@ -439,12 +543,16 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                             continue
                         }
                         logger.debug('[hermes-acp] setModel failed', err)
-                        this.opts.onModelRollback?.(this.currentBackendModel, batch.mode.modelRevision)
+                        const action = await handleRejectedModelSwitch(requestedModel, requestedModel, err)
+                        if (action === 'break') break
+                        continue
                     }
-                } else if (batch.mode.modelRevision !== undefined) {
-                    this.currentBackendModelRevision = batch.mode.modelRevision
+                } else {
+                    this.recordAppliedModelRevision(effectiveModelRevision)
                 }
             }
+            modelRetryState.failedSelection = null
+            modelRetryState.delayMs = 1000
 
             if (this.shouldExit) {
                 this.session.queue.releaseBatch(batch)
@@ -606,6 +714,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
 
     protected async cleanup(): Promise<void> {
         this.activeTurnPermissionMode = undefined
+        this.wakeModelRetry()
         this.clearAbortHandlers(this.session.client.rpcHandlerManager)
         await this.permissionHandler?.cancelAll('Session ended')
         this.permissionHandler = null

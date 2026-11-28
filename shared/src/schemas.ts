@@ -285,6 +285,17 @@ export const MetadataSchema = z.object({
             archiveReason: z.string().optional(),
         }).optional(),
     }).optional(),
+    hermesResumeAttempt: z.object({
+        state: z.enum(['resuming', 'quarantined']),
+        machineId: z.string(),
+        startedAt: z.number(),
+        archiveSnapshot: z.object({
+            lifecycleState: z.string().optional(),
+            lifecycleStateSince: z.number().optional(),
+            archivedBy: z.string().optional(),
+            archiveReason: z.string().optional(),
+        }).optional(),
+    }).optional(),
     tools: z.array(z.string()).optional(),
     slashCommands: z.array(z.string()).optional(),
     homeDir: z.string().optional(),

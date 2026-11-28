@@ -76,14 +76,13 @@ export function createHermesModelPreferenceController(
             onSync(currentModel)
             return true
         },
-        applyBackendModelChange(model: string | null, expectedRevision?: number): number | null {
+        applyBackendModelChange(model: string | null, expectedRevision?: number): boolean {
             if (expectedRevision !== undefined && expectedRevision !== revision) {
-                return null
+                return false
             }
             currentModel = model ?? null
-            revision += 1
             onSync(currentModel)
-            return revision
+            return true
         }
     }
 }
@@ -150,7 +149,13 @@ export async function runHermes(opts: {
             localId
         )
     })
-    session.onCancelQueuedMessage((localId) => queue.cancelByLocalId(localId))
+    session.onCancelQueuedMessage((localId) => {
+        const result = queue.cancelByLocalId(localId)
+        if (result === true) {
+            launcherRef.current?.notifyQueueChanged()
+        }
+        return result
+    })
 
     registerSessionConfigRpc<HermesPermissionMode>({
         rpcHandlerManager: session.rpcHandlerManager,
@@ -164,6 +169,7 @@ export async function runHermes(opts: {
             }
             if (config.model !== undefined) {
                 modelController.applyConfigModel(config.model)
+                launcherRef.current?.notifyModelPreferenceChanged()
             }
         },
         onAfterApply: () => syncSessionMode()
@@ -194,6 +200,10 @@ export async function runHermes(opts: {
     const launcher = new HermesRemoteLauncher(hermesSession, {
         model: opts.model,
         initialModelRevision: modelController.getRevision(),
+        getModelPreference: () => ({
+            model: modelController.getModel(),
+            revision: modelController.getRevision()
+        }),
         onModelRollback: (model, revision) => {
             modelController.rollbackModel(model, revision)
         },

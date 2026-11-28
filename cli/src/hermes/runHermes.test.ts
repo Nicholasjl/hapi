@@ -81,17 +81,23 @@ describe('createHermesModelPreferenceController', () => {
         expect(controller.getModel()).toBe('model-a')
         expect(synced).toEqual(['model-a'])
 
-        // Backend-driven /model change advances revision and syncs new model.
-        const revSlash = controller.applyBackendModelChange('model-c', revB)
-        expect(revSlash).toBe(2)
+        // Backend-driven /model change syncs new model without advancing the picker-edit revision.
+        expect(controller.applyBackendModelChange('model-c', revB)).toBe(true)
+        expect(controller.getRevision()).toBe(revB)
         expect(controller.getModel()).toBe('model-c')
         expect(synced).toEqual(['model-a', 'model-c'])
 
+        // Consecutive queued /model commands captured at the same picker revision both apply in order.
+        expect(controller.applyBackendModelChange('model-c2', revB)).toBe(true)
+        expect(controller.getRevision()).toBe(revB)
+        expect(controller.getModel()).toBe('model-c2')
+        expect(synced).toEqual(['model-a', 'model-c', 'model-c2'])
+
         // Stale /model completion must not overwrite a newer picker selection.
         const revD = controller.applyConfigModel('model-d')
-        expect(revD).toBe(3)
-        expect(controller.applyBackendModelChange('model-stale', revSlash!)).toBeNull()
+        expect(revD).toBe(2)
+        expect(controller.applyBackendModelChange('model-stale', revB)).toBe(false)
         expect(controller.getModel()).toBe('model-d')
-        expect(synced).toEqual(['model-a', 'model-c'])
+        expect(synced).toEqual(['model-a', 'model-c', 'model-c2'])
     })
 })

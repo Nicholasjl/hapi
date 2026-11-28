@@ -90,6 +90,7 @@ const SIMPLE_RESUME_TOKENS = [
 const HUB_OWNED_METADATA_FIELDS = [
     'codexArchivedFork',
     'codexResumePending',
+    'hermesResumeAttempt',
     'titleSuggestionAutoAttemptedAt',
     'titleSuggestionTurn',
     'promptTitle',

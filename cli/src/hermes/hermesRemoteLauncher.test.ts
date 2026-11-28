@@ -507,7 +507,7 @@ describe('HermesRemoteLauncher', () => {
             ],
             currentModelId: 'model-a'
         }
-        const onModelChanged = vi.fn(() => 1)
+        const onModelChanged = vi.fn(() => true)
         const onModelRollback = vi.fn()
         const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
         const launcher = new HermesRemoteLauncher(session as never, {
@@ -519,7 +519,7 @@ describe('HermesRemoteLauncher', () => {
         try {
             await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
 
-            // 1. /model model-b calls backend.setModel without backend.prompt and updates catalog + revision.
+            // 1. /model model-b calls backend.setModel without backend.prompt and updates catalog.
             session.queue.push('/model model-b', { permissionMode: 'default', model: 'model-a', modelRevision: 0 })
             await vi.waitFor(() => expect(onModelChanged).toHaveBeenCalledWith('model-b', 0))
             expect(harness.setModelCalls).toEqual([{ sessionId: 'hermes-session-1', model: 'model-b' }])
@@ -570,11 +570,10 @@ describe('HermesRemoteLauncher', () => {
         let pickerModel = 'model-init'
         const onModelChanged = vi.fn((model: string | null, expectedRev?: number) => {
             if (expectedRev !== undefined && expectedRev !== modelRevision) {
-                return null
+                return false
             }
-            modelRevision += 1
             pickerModel = model ?? 'model-init'
-            return modelRevision
+            return true
         })
 
         const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
@@ -618,5 +617,167 @@ describe('HermesRemoteLauncher', () => {
             session.queue.close()
             await running
         }
+    })
+
+    it('keeps consecutive queued /model commands in order before an already-queued prompt without reverting', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-init', name: 'Init' },
+                { modelId: 'model-a', name: 'Model A' },
+                { modelId: 'model-b', name: 'Model B' }
+            ],
+            currentModelId: 'model-init'
+        }
+        let releaseFirstSlash!: () => void
+        const pickerRevision = 0
+        let pickerModel = 'model-init'
+        const onModelChanged = vi.fn((model: string | null, expectedRev?: number) => {
+            if (expectedRev !== undefined && expectedRev !== pickerRevision) {
+                return false
+            }
+            pickerModel = model ?? 'model-init'
+            return true
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const running = new HermesRemoteLauncher(session as never, {
+            initialModelRevision: 0,
+            onModelChanged
+        }).launch()
+        try {
+            await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+            harness.backend!.setModel.mockImplementationOnce(async (sessionId: string, model: string) => {
+                harness.setModelCalls.push({ sessionId, model })
+                await new Promise<void>((resolve) => {
+                    releaseFirstSlash = resolve
+                })
+            })
+
+            session.queue.pushIsolated('/model model-a', { permissionMode: 'default', model: 'model-init', modelRevision: 0 })
+            await vi.waitFor(() => expect(releaseFirstSlash).toBeDefined())
+            session.queue.pushIsolated('/model model-b', { permissionMode: 'default', model: 'model-init', modelRevision: 0 })
+            session.queue.push('prompt behind both switches', { permissionMode: 'default', model: 'model-init', modelRevision: 0 })
+
+            releaseFirstSlash()
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+
+            expect(onModelChanged.mock.calls).toEqual([
+                ['model-a', 0],
+                ['model-b', 0]
+            ])
+            expect(pickerModel).toBe('model-b')
+            expect(harness.setModelCalls).toEqual([
+                { sessionId: 'hermes-session-1', model: 'model-a' },
+                { sessionId: 'hermes-session-1', model: 'model-b' }
+            ])
+            expect(harness.prompts).toEqual([[{ type: 'text', text: 'prompt behind both switches' }]])
+        } finally {
+            releaseFirstSlash?.()
+            session.queue.close()
+            await running
+        }
+    })
+
+    it('holds the prompt without calling backend.prompt when explicit setModel fails until user selects a usable model', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-init', name: 'Init' },
+                { modelId: 'model-good', name: 'Good' }
+            ],
+            currentModelId: 'model-init'
+        }
+        let pref: { model: string | null | undefined; revision: number } = { model: 'model-init', revision: 0 }
+        const onModelRollback = vi.fn((model: string | null) => {
+            pref = { ...pref, model }
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const launcher = new HermesRemoteLauncher(session as never, {
+            initialModelRevision: 0,
+            getModelPreference: () => pref,
+            onModelRollback
+        })
+        const running = launcher.launch()
+        try {
+            await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+            harness.backend!.setModel.mockImplementation(async (sessionId: string, model: string) => {
+                if (model === 'bad-model') {
+                    throw new Error('removed model')
+                }
+                harness.setModelCalls.push({ sessionId, model })
+            })
+
+            pref = { model: 'bad-model', revision: 1 }
+            session.queue.push('hold until usable model', { permissionMode: 'default', model: 'bad-model', modelRevision: 1 }, 'held-explicit')
+
+            await vi.waitFor(() => expect(session.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'message',
+                message: expect.stringContaining('Hermes model switch to bad-model failed')
+            }))
+            expect(onModelRollback).toHaveBeenCalledWith('model-init', 1)
+            expect(harness.prompts).toHaveLength(0)
+
+            // Picking a valid model updates preference revision and unparks the held prompt immediately.
+            pref = { model: 'model-good', revision: 2 }
+            launcher.notifyModelPreferenceChanged()
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+            expect(harness.setModelCalls).toEqual([{ sessionId: 'hermes-session-1', model: 'model-good' }])
+            expect(harness.prompts[0]).toEqual([{ type: 'text', text: 'hold until usable model' }])
+        } finally {
+            session.queue.close()
+            await running
+        }
+    })
+
+    it('holds the prompt and keeps it cancellable when resetting to Default fails', async () => {
+        harness.modelsMetadata = {
+            availableModels: [
+                { modelId: 'model-init', name: 'Init' },
+                { modelId: 'model-custom', name: 'Custom' }
+            ],
+            currentModelId: 'model-init'
+        }
+        let pref: { model: string | null | undefined; revision: number } = { model: 'model-custom', revision: 1 }
+        const onModelRollback = vi.fn((model: string | null) => {
+            pref = { ...pref, model }
+        })
+
+        const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+        const launcher = new HermesRemoteLauncher(session as never, {
+            initialModelRevision: 0,
+            getModelPreference: () => pref,
+            onModelRollback
+        })
+        const running = launcher.launch()
+        try {
+            await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+            session.queue.push('turn on custom', { permissionMode: 'default', model: 'model-custom', modelRevision: 1 }, 'ok-turn')
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+
+            harness.backend!.setModel.mockImplementation(async (sessionId: string, model: string) => {
+                if (model === 'model-init') {
+                    throw new Error('default provider unavailable')
+                }
+                harness.setModelCalls.push({ sessionId, model })
+            })
+
+            pref = { model: null, revision: 2 }
+            session.queue.push('turn on rejected default', { permissionMode: 'default', model: null, modelRevision: 2 }, 'held-default')
+
+            await vi.waitFor(() => expect(session.sendSessionEvent).toHaveBeenCalledWith({
+                type: 'message',
+                message: expect.stringContaining('Hermes model reset to Default (model-init) failed')
+            }))
+            expect(onModelRollback).toHaveBeenCalledWith('model-custom', 2)
+            expect(harness.prompts).toHaveLength(1)
+
+            expect(session.queue.cancelByLocalId('held-default')).toBe(true)
+            launcher.notifyQueueChanged()
+            await handlers.get('abort')!()
+        } finally {
+            session.queue.close()
+            await running
+        }
+        expect(harness.prompts).toHaveLength(1)
     })
 })
