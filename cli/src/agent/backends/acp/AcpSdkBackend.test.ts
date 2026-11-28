@@ -3262,4 +3262,73 @@ describe('AcpSdkBackend agentInfo.version and flushPendingMessageBuffers', () =>
             } finally { t.restore(); }
         });
     });
+
+    describe('loadSession validateResponse', () => {
+        it('rejects before mutating active session state or metadata when validateResponse throws', async () => {
+            const backend = new AcpSdkBackend({ command: 'hermes', args: ['acp'] });
+            const internal = backend as unknown as {
+                transport: {
+                    sendRequest: (method: string, params: unknown) => Promise<unknown>;
+                    close: () => Promise<void>;
+                } | null;
+                activeSessionId: string | null;
+            };
+            const retryOptions = (AcpSdkBackend as unknown as {
+                INIT_RETRY_OPTIONS: { maxAttempts: number };
+            }).INIT_RETRY_OPTIONS;
+            const originalMaxAttempts = retryOptions.maxAttempts;
+            retryOptions.maxAttempts = 1;
+
+            let mockResponse: unknown = {};
+            internal.transport = {
+                sendRequest: async () => mockResponse,
+                close: async () => {}
+            };
+
+            try {
+                await expect(backend.loadSession({
+                    sessionId: 'hermes-missing',
+                    cwd: '/tmp/project',
+                    mcpServers: [],
+                    validateResponse: (response) => {
+                        if (!response || Object.keys(response as Record<string, unknown>).length === 0) {
+                            throw new Error('empty session/load response');
+                        }
+                    }
+                })).rejects.toThrow('empty session/load response');
+                expect(internal.activeSessionId).toBeNull();
+                expect(backend.getSessionModelsMetadata('hermes-missing')).toBeUndefined();
+
+                mockResponse = {
+                    models: {
+                        currentModelId: 'custom:magpie:qwen-plus',
+                        availableModels: [{ modelId: 'custom:magpie:qwen-plus', name: 'qwen-plus' }]
+                    },
+                    modes: {
+                        currentModeId: 'default',
+                        availableModes: []
+                    }
+                };
+                const loadedId = await backend.loadSession({
+                    sessionId: 'hermes-ok',
+                    cwd: '/tmp/project',
+                    mcpServers: [],
+                    validateResponse: (response) => {
+                        if (!response || Object.keys(response as Record<string, unknown>).length === 0) {
+                            throw new Error('empty session/load response');
+                        }
+                    }
+                });
+                expect(loadedId).toBe('hermes-ok');
+                expect(internal.activeSessionId).toBe('hermes-ok');
+                expect(backend.getSessionModelsMetadata('hermes-ok')).toEqual({
+                    currentModelId: 'custom:magpie:qwen-plus',
+                    availableModels: [{ modelId: 'custom:magpie:qwen-plus', name: 'qwen-plus' }]
+                });
+            } finally {
+                retryOptions.maxAttempts = originalMaxAttempts;
+                await backend.disconnect();
+            }
+        });
+    });
 });

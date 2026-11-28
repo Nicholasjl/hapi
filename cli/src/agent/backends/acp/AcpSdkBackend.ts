@@ -543,7 +543,12 @@ export class AcpSdkBackend implements AgentBackend {
         return sessionId;
     }
 
-    async loadSession(config: AgentSessionConfig & { sessionId: string }): Promise<string> {
+    async loadSession(
+        config: AgentSessionConfig & {
+            sessionId: string;
+            validateResponse?: (response: unknown) => void;
+        }
+    ): Promise<string> {
         if (!this.transport) {
             throw new Error('ACP transport not initialized');
         }
@@ -562,6 +567,8 @@ export class AcpSdkBackend implements AgentBackend {
                 }
             }
         );
+
+        config.validateResponse?.(response);
 
         const loadedSessionId = isObject(response) ? asString(response.sessionId) : null;
         const sessionId = loadedSessionId ?? config.sessionId;

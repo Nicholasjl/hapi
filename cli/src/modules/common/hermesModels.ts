@@ -1,6 +1,9 @@
 import type { HermesModelsResponse } from '@hapi/protocol/apiTypes'
 import { createHermesBackend } from '@/hermes/utils/hermesBackend'
-import { resolveHermesConfigModels } from '@/hermes/utils/hermesConfiguredModels'
+import {
+    normalizeHermesCurrentModelId,
+    resolveHermesConfigModels
+} from '@/hermes/utils/hermesConfiguredModels'
 
 export type ListHermesModelsForMachineResponse = HermesModelsResponse
 
@@ -31,7 +34,11 @@ async function runHermesModelsProbe(): Promise<ListHermesModelsForMachineRespons
                     mcpServers: []
                 })
                 const metadata = backend.getSessionModelsMetadata(sessionId)
-                const configuredModels = resolveHermesConfigModels(undefined, metadata?.currentModelId)
+                const configuredModels = resolveHermesConfigModels(
+                    undefined,
+                    metadata?.currentModelId,
+                    metadata?.availableModels
+                )
                 const availableModels = configuredModels ?? metadata?.availableModels ?? []
                 if (availableModels.length === 0) {
                     return {
@@ -39,10 +46,11 @@ async function runHermesModelsProbe(): Promise<ListHermesModelsForMachineRespons
                         error: 'Hermes did not expose any models through ACP'
                     } satisfies ListHermesModelsForMachineResponse
                 }
+                const currentModelId = normalizeHermesCurrentModelId(metadata?.currentModelId, availableModels)
                 return {
                     success: true,
                     availableModels,
-                    currentModelId: metadata?.currentModelId ?? availableModels[0]?.modelId ?? null
+                    currentModelId: currentModelId ?? availableModels[0]?.modelId ?? null
                 } satisfies ListHermesModelsForMachineResponse
             })(),
             new Promise<never>((_, reject) => {

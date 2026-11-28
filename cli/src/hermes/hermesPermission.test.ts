@@ -29,7 +29,8 @@ const harness = vi.hoisted(() => ({
 }))
 
 vi.mock('./utils/hermesConfiguredModels', () => ({
-    resolveHermesConfigModels: vi.fn(() => null)
+    resolveHermesConfigModels: vi.fn(() => null),
+    normalizeHermesCurrentModelId: vi.fn((currentModelId: string | null | undefined) => currentModelId ?? null)
 }))
 
 vi.mock('./utils/hermesBackend', () => ({
@@ -339,6 +340,87 @@ describe('HermesRemoteLauncher real ACP permission handling', () => {
             }
         } finally {
             releaseFirstPrompt?.()
+            session.queue.close()
+            await running
+        }
+    })
+
+    it('surfaces model confirmation permission requests issued during startup and reconnect setModel', async () => {
+        const { session, handlers, getAgentState } = makeSession('default')
+        let startupPhase = true
+        let nextBackend = harness.backends[0]
+        const confirmPermissionDuringSetModel = async (backend: FakeHermesBackend, permId: string) => {
+            await new Promise<void>((resolve, reject) => {
+                if (!backend.permissionHandler) {
+                    reject(new Error('permission handler was not registered before setModel'))
+                    return
+                }
+                backend.respondToPermission.mockImplementationOnce(async (_sid, req, response) => {
+                    expect(req.id).toBe(permId)
+                    expect(response).toEqual({ outcome: 'selected', optionId: 'allow_once' })
+                    resolve()
+                })
+                backend.permissionHandler({
+                    id: permId,
+                    sessionId: 'hermes-session-1',
+                    toolCallId: `call-${permId}`,
+                    title: 'Switch model',
+                    kind: 'other',
+                    rawInput: { model: 'custom:magpie:qwen-plus' },
+                    options: [
+                        { optionId: 'allow_once', name: 'Switch anyway', kind: 'allow_once' },
+                        { optionId: 'deny', name: 'Cancel', kind: 'reject_once' }
+                    ]
+                })
+            })
+        }
+
+        const { createHermesBackend } = await import('./utils/hermesBackend')
+        const createSpy = vi.mocked(createHermesBackend)
+        const baseImpl = createSpy.getMockImplementation()!
+        createSpy.mockImplementation(() => {
+            const created = baseImpl() as unknown as FakeHermesBackend
+            nextBackend = created
+            created.getSessionModelsMetadata.mockImplementation(() => ({
+                availableModels: [
+                    { modelId: 'custom:magpie:initial', name: 'initial' },
+                    { modelId: 'custom:magpie:qwen-plus', name: 'qwen-plus' }
+                ],
+                currentModelId: 'custom:magpie:initial'
+            }))
+            if (startupPhase) {
+                startupPhase = false
+                created.setModel.mockImplementationOnce(async () => {
+                    await confirmPermissionDuringSetModel(created, 'perm-startup-model')
+                })
+            } else {
+                created.setModel.mockImplementationOnce(async () => {
+                    await confirmPermissionDuringSetModel(created, 'perm-reconnect-model')
+                })
+            }
+            return created as unknown as ReturnType<typeof createHermesBackend>
+        })
+
+        const running = new HermesRemoteLauncher(session as never, {
+            model: 'custom:magpie:qwen-plus'
+        }).launch()
+
+        try {
+            await vi.waitFor(() => expect(getAgentState().requests?.['perm-startup-model']).toBeDefined())
+            expect(session.client.emitSessionReady).not.toHaveBeenCalled()
+            await handlers.get('permission')!({ id: 'perm-startup-model', approved: true })
+            await vi.waitFor(() => expect(session.client.emitSessionReady).toHaveBeenCalledOnce())
+
+            // Trigger transport close -> reconnect, which restores custom:magpie:qwen-plus via setModel.
+            nextBackend!.prompt.mockRejectedValueOnce(new Error('ACP transport is closed'))
+            session.queue.push('after reconnect', { permissionMode: 'default', model: 'custom:magpie:qwen-plus' })
+
+            await vi.waitFor(() => expect(getAgentState().requests?.['perm-reconnect-model']).toBeDefined())
+            await handlers.get('permission')!({ id: 'perm-reconnect-model', approved: true })
+            await vi.waitFor(() => expect(harness.backends).toHaveLength(2))
+            await vi.waitFor(() => expect(harness.backends[1]!.prompt).toHaveBeenCalledTimes(1))
+        } finally {
+            createSpy.mockImplementation(baseImpl)
             session.queue.close()
             await running
         }

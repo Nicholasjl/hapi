@@ -672,6 +672,22 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Rewrites queued item modes matching the updater and recomputes their
+     * mode hashes so batch coalescing stays consistent with the updated mode.
+     */
+    updateQueuedModes(updater: (mode: T) => T | null): number {
+        let updated = 0;
+        for (const item of this.queue) {
+            const nextMode = updater(item.mode);
+            if (nextMode === null) continue;
+            item.mode = nextMode;
+            item.modeHash = this.modeHasher(nextMode);
+            updated += 1;
+        }
+        return updated;
+    }
+
+    /**
      * Close the queue - no more messages can be pushed
      */
     close(): void {

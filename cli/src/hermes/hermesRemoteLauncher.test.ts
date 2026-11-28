@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import { AcpSdkBackend } from '@/agent/backends/acp/AcpSdkBackend'
 import { MessageQueue2 } from '@/utils/MessageQueue2'
 import { createHermesModelPreferenceController } from './runHermes'
 import type { HermesMode } from './types'
@@ -8,6 +12,8 @@ const harness = vi.hoisted(() => ({
     backend: null as Record<string, ReturnType<typeof vi.fn>> | null,
     newSessionConfig: null as unknown,
     loadSessionError: null as Error | null,
+    loadSessionResponse: { modes: { currentModeId: 'default', availableModes: [] } } as unknown,
+    configuredModelsResolver: null as ((currentModelId?: string | null, acpModels?: unknown) => unknown) | null,
     rejectModels: null as ((model: string) => boolean) | null,
     prompts: [] as unknown[][],
     modelsMetadata: null as {
@@ -22,9 +28,31 @@ const harness = vi.hoisted(() => ({
     happyServerStopped: false
 }))
 
-vi.mock('./utils/hermesConfiguredModels', () => ({
-    resolveHermesConfigModels: vi.fn(() => null)
-}))
+vi.mock('./utils/hermesConfiguredModels', async () => {
+    const actual = await vi.importActual<typeof import('./utils/hermesConfiguredModels')>('./utils/hermesConfiguredModels')
+    return {
+        ...actual,
+        resolveHermesConfigModels: vi.fn((
+            _configPath?: string,
+            currentModelId?: string | null,
+            acpModels?: unknown
+        ) => {
+            if (harness.configuredModelsResolver) {
+                return harness.configuredModelsResolver(currentModelId, acpModels)
+            }
+            return null
+        }),
+        normalizeHermesCurrentModelId: vi.fn((
+            currentModelId: string | null | undefined,
+            availableModels: Parameters<typeof actual.normalizeHermesCurrentModelId>[1]
+        ) => {
+            if (harness.configuredModelsResolver) {
+                return actual.normalizeHermesCurrentModelId(currentModelId, availableModels)
+            }
+            return currentModelId ?? null
+        })
+    }
+})
 
 vi.mock('./utils/hermesBackend', () => ({
     createHermesBackend: vi.fn(() => {
@@ -37,8 +65,9 @@ vi.mock('./utils/hermesBackend', () => ({
                 }
                 return 'hermes-session-1'
             }),
-            loadSession: vi.fn(async (config: { sessionId: string }) => {
+            loadSession: vi.fn(async (config: { sessionId: string; validateResponse?: (res: unknown) => void }) => {
                 if (harness.loadSessionError) throw harness.loadSessionError
+                config.validateResponse?.(harness.loadSessionResponse)
                 return config.sessionId
             }),
             prompt: vi.fn(async (
@@ -109,7 +138,10 @@ vi.mock('@/modules/common/permission/AcpPermissionHandler', () => ({
 vi.mock('@/ui/ink/RemoteModeDisplay', () => ({ RemoteModeDisplay: () => null }))
 vi.mock('@/ui/logger', () => ({ logger: { debug: vi.fn(), warn: vi.fn() } }))
 
-import { HermesRemoteLauncher } from './hermesRemoteLauncher'
+import {
+    HermesRemoteLauncher,
+    validateHermesLoadSessionResponse
+} from './hermesRemoteLauncher'
 
 function createSessionWithBatches(
     batches: Array<[string, HermesMode]>,
@@ -163,6 +195,8 @@ describe('HermesRemoteLauncher', () => {
         harness.backend = null
         harness.newSessionConfig = null
         harness.loadSessionError = null
+        harness.loadSessionResponse = { modes: { currentModeId: 'default', availableModes: [] } }
+        harness.configuredModelsResolver = null
         harness.rejectModels = null
         harness.prompts = []
         harness.modelsMetadata = null
@@ -937,7 +971,8 @@ describe('HermesRemoteLauncher', () => {
             await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
 
             // 1. Transient failure switching to model-b rolls back controller to model-a at rev 1,
-            //    then automatic retry succeeds and publishes model-b back to controller.
+            //    user queues a second prompt during the retry delay capturing model-a at rev 1,
+            //    then automatic retry succeeds, publishes model-b, and keeps the second prompt on model-b.
             let failModelB = true
             harness.rejectModels = (model) => {
                 if (model === 'model-b' && failModelB) {
@@ -954,22 +989,28 @@ describe('HermesRemoteLauncher', () => {
             }, 'p-retry-b')
 
             await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-a', revB))
-            await vi.waitFor(() => expect(harness.prompts).toHaveLength(1), { timeout: 4000 })
+            // Queued during the retry delay (same revision, temporary rollback model).
+            session.queue.push('queued during retry delay (b)', {
+                permissionMode: 'default',
+                model: controller.getModel() ?? undefined,
+                modelRevision: controller.getRevision()
+            }, 'p-during-retry-b')
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(2), { timeout: 4000 })
             expect(onModelChanged).toHaveBeenCalledWith('model-b', revB)
             expect(controller.getModel()).toBe('model-b')
             expect(syncedModel).toBe('model-b')
 
-            // Second prompt pushed from controller state stays on model-b without reverting to model-a.
-            session.queue.push('second prompt after model-b recovery', {
+            // Third prompt pushed from controller state stays on model-b without reverting to model-a.
+            session.queue.push('third prompt after model-b recovery', {
                 permissionMode: 'default',
                 model: controller.getModel() ?? undefined,
                 modelRevision: controller.getRevision()
             }, 'p-stay-b')
-            await vi.waitFor(() => expect(harness.prompts).toHaveLength(2))
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(3))
             expect(harness.setModelCalls).toEqual([{ sessionId: 'hermes-session-1', model: 'model-b' }])
 
-            // 2. Transient failure resetting to Default (null) rolls back to model-b, then automatic retry
-            //    publishes null back to controller so the next prompt stays on Default.
+            // 2. Transient failure resetting to Default (null) rolls back to model-b,
+            //    a prompt queued during retry delay captures model-b at revDefault, and recovery keeps both on Default.
             let failModelA = true
             harness.rejectModels = (model) => {
                 if (model === 'model-a' && failModelA) {
@@ -986,17 +1027,22 @@ describe('HermesRemoteLauncher', () => {
             }, 'p-retry-default')
 
             await vi.waitFor(() => expect(onModelRollback).toHaveBeenCalledWith('model-b', revDefault))
-            await vi.waitFor(() => expect(harness.prompts).toHaveLength(3), { timeout: 4000 })
+            session.queue.push('queued during retry delay (default)', {
+                permissionMode: 'default',
+                model: controller.getModel() ?? undefined,
+                modelRevision: controller.getRevision()
+            }, 'p-during-retry-default')
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(5), { timeout: 4000 })
             expect(onModelChanged).toHaveBeenCalledWith(null, revDefault)
             expect(controller.getModel()).toBeNull()
             expect(syncedModel).toBeNull()
 
-            session.queue.push('fourth prompt stays on default', {
+            session.queue.push('sixth prompt stays on default', {
                 permissionMode: 'default',
                 model: controller.getModel(),
                 modelRevision: controller.getRevision()
             }, 'p-stay-default')
-            await vi.waitFor(() => expect(harness.prompts).toHaveLength(4))
+            await vi.waitFor(() => expect(harness.prompts).toHaveLength(6))
             expect(harness.setModelCalls).toEqual([
                 { sessionId: 'hermes-session-1', model: 'model-b' },
                 { sessionId: 'hermes-session-1', model: 'model-a' }
@@ -1005,6 +1051,133 @@ describe('HermesRemoteLauncher', () => {
             harness.rejectModels = null
             session.queue.close()
             await running
+        }
+    })
+
+    it('rejects empty successful ACP session/load responses on startup, reconnect, and real AcpSdkBackend', async () => {
+        harness.loadSessionResponse = {}
+        const { session: emptyStartupSession } = createSessionWithBatches([], { sessionId: 'deleted-hermes-id' })
+        await expect(new HermesRemoteLauncher(emptyStartupSession as never).launch()).rejects.toThrow(
+            'empty session/load response'
+        )
+        expect(emptyStartupSession.onSessionFound).not.toHaveBeenCalled()
+        expect(emptyStartupSession.client.emitSessionReady).not.toHaveBeenCalled()
+        expect(emptyStartupSession.sendSessionEvent).toHaveBeenCalledWith({
+            type: 'message',
+            message: expect.stringContaining('Hermes resume failed:')
+        })
+
+        // Reconnect must also reject empty session/load results.
+        harness.loadSessionResponse = { modes: { currentModeId: 'default', availableModes: [] } }
+        const { session: reconnectSession } = createSessionWithBatches([['first', { permissionMode: 'default' }]], {
+            keepQueueOpen: true
+        })
+        const running = new HermesRemoteLauncher(reconnectSession as never).launch()
+        await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+        harness.backend!.setMode.mockRejectedValueOnce(new Error('ACP transport is closed'))
+        harness.loadSessionResponse = null
+        reconnectSession.queue.push('reconnect fail', { permissionMode: 'yolo' })
+        await expect(running).rejects.toThrow('empty session/load response')
+        expect(harness.prompts).toHaveLength(1)
+
+        // End-to-end check against real AcpSdkBackend returning `{}` for session/load.
+        const realBackend = new AcpSdkBackend({ command: 'hermes', args: ['acp'] })
+        const internal = realBackend as unknown as {
+            transport: { sendRequest: () => Promise<unknown>; close: () => Promise<void> } | null
+            activeSessionId: string | null
+        }
+        const retryOptions = (AcpSdkBackend as unknown as { INIT_RETRY_OPTIONS: { maxAttempts: number } }).INIT_RETRY_OPTIONS
+        const origMaxAttempts = retryOptions.maxAttempts
+        retryOptions.maxAttempts = 1
+        internal.transport = {
+            sendRequest: async () => ({}),
+            close: async () => {}
+        }
+        try {
+            await expect(realBackend.loadSession({
+                sessionId: 'deleted-hermes-id',
+                cwd: '/tmp/project',
+                mcpServers: [],
+                validateResponse: (res) => validateHermesLoadSessionResponse(res, 'deleted-hermes-id')
+            })).rejects.toThrow('empty session/load response')
+            expect(internal.activeSessionId).toBeNull()
+        } finally {
+            retryOptions.maxAttempts = origMaxAttempts
+            await realBackend.disconnect()
+        }
+    })
+
+    it('keeps named provider identity when switching from a second provider back to the default provider with the same model name', async () => {
+        const tempDir = mkdtempSync(join(tmpdir(), 'hermes-switch-'))
+        const configPath = join(tempDir, 'config.yaml')
+        writeFileSync(configPath, `
+model:
+  provider: magpie
+  default: qwen-plus
+providers:
+  magpie:
+    models:
+      - qwen-plus
+  backup:
+    models:
+      - qwen-plus
+`, 'utf8')
+
+        try {
+            const actualConfigured = await vi.importActual<typeof import('./utils/hermesConfiguredModels')>(
+                './utils/hermesConfiguredModels'
+            )
+            harness.configuredModelsResolver = (currentModelId, acpModels) =>
+                actualConfigured.resolveHermesConfigModels(
+                    configPath,
+                    currentModelId,
+                    acpModels as Parameters<typeof actualConfigured.resolveHermesConfigModels>[2]
+                )
+            harness.modelsMetadata = {
+                availableModels: [],
+                currentModelId: 'custom:magpie:qwen-plus'
+            }
+
+            const { session, handlers } = createSessionWithBatches([], { keepQueueOpen: true })
+            const running = new HermesRemoteLauncher(session as never).launch()
+            try {
+                await vi.waitFor(() => expect(handlers.has(RPC_METHODS.ListHermesModels)).toBe(true))
+                const catalog = await handlers.get(RPC_METHODS.ListHermesModels)!() as {
+                    success: boolean
+                    availableModels: Array<{ modelId: string; name?: string }>
+                    currentModelId: string | null
+                }
+                expect(catalog.success).toBe(true)
+                expect(catalog.availableModels.map((m) => m.modelId)).toEqual([
+                    'custom:magpie:qwen-plus',
+                    'custom:backup:qwen-plus'
+                ])
+                expect(catalog.currentModelId).toBe('custom:magpie:qwen-plus')
+
+                session.queue.push('use backup', {
+                    permissionMode: 'default',
+                    model: catalog.availableModels[1]!.modelId,
+                    modelRevision: 1
+                })
+                await vi.waitFor(() => expect(harness.prompts).toHaveLength(1))
+
+                session.queue.push('back to default named provider', {
+                    permissionMode: 'default',
+                    model: catalog.availableModels[0]!.modelId,
+                    modelRevision: 2
+                })
+                await vi.waitFor(() => expect(harness.prompts).toHaveLength(2))
+
+                expect(harness.setModelCalls).toEqual([
+                    { sessionId: 'hermes-session-1', model: 'custom:backup:qwen-plus' },
+                    { sessionId: 'hermes-session-1', model: 'custom:magpie:qwen-plus' }
+                ])
+            } finally {
+                session.queue.close()
+                await running
+            }
+        } finally {
+            rmSync(tempDir, { recursive: true, force: true })
         }
     })
 })

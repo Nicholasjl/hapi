@@ -17,7 +17,10 @@ import {
 import { RemoteModeDisplay } from '@/ui/ink/RemoteModeDisplay'
 import { AcpPermissionHandler } from '@/modules/common/permission/AcpPermissionHandler'
 import { createHermesBackend } from './utils/hermesBackend'
-import { resolveHermesConfigModels } from './utils/hermesConfiguredModels'
+import {
+    normalizeHermesCurrentModelId,
+    resolveHermesConfigModels
+} from './utils/hermesConfiguredModels'
 import type { HermesSession } from './session'
 
 const HERMES_READ_ONLY_TOOL_NAMES = new Set([
@@ -119,6 +122,57 @@ function isClosedTransportError(
         || message.includes('acp transport not initialized')
         || message.includes('acp transport closed')
         || message.includes('acp process exited')
+}
+
+function hasNonEmptyStringField(obj: Record<string, unknown>, ...keys: string[]): boolean {
+    return keys.some((key) => typeof obj[key] === 'string' && (obj[key] as string).trim().length > 0)
+}
+
+function hasNonEmptyArrayField(obj: Record<string, unknown>, ...keys: string[]): boolean {
+    return keys.some((key) => Array.isArray(obj[key]) && (obj[key] as unknown[]).length > 0)
+}
+
+/**
+ * Hermes v0.22.0 returns an empty successful `session/load` result when the native
+ * session no longer exists. Require at least one valid ACP session payload field
+ * (and matching sessionId if returned) before accepting the resume.
+ */
+export function validateHermesLoadSessionResponse(response: unknown, requestedSessionId: string): void {
+    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+        throw new Error(`Hermes native session ${requestedSessionId} could not be resumed: empty session/load response`)
+    }
+    const record = response as Record<string, unknown>
+    const returnedSessionId = typeof record.sessionId === 'string'
+        ? record.sessionId.trim()
+        : typeof record.session_id === 'string'
+            ? record.session_id.trim()
+            : ''
+    if (returnedSessionId && returnedSessionId !== requestedSessionId) {
+        throw new Error(`Hermes resumed unexpected session ${returnedSessionId} instead of ${requestedSessionId}`)
+    }
+    if (returnedSessionId === requestedSessionId) {
+        return
+    }
+    const models = record.models && typeof record.models === 'object' && !Array.isArray(record.models)
+        ? record.models as Record<string, unknown>
+        : null
+    const modes = record.modes && typeof record.modes === 'object' && !Array.isArray(record.modes)
+        ? record.modes as Record<string, unknown>
+        : null
+    const hasModels = Boolean(models && (
+        hasNonEmptyStringField(models, 'currentModelId', 'current_model_id')
+        || hasNonEmptyArrayField(models, 'availableModels', 'available_models')
+    ))
+    const hasTopLevelModels = hasNonEmptyStringField(record, 'currentModelId', 'current_model_id')
+        || hasNonEmptyArrayField(record, 'availableModels', 'available_models')
+    const hasModes = Boolean(modes && (
+        hasNonEmptyStringField(modes, 'currentModeId', 'current_mode_id')
+        || hasNonEmptyArrayField(modes, 'availableModes', 'available_modes')
+    ))
+    const hasConfigOptions = hasNonEmptyArrayField(record, 'configOptions', 'config_options')
+    if (!hasModels && !hasTopLevelModels && !hasModes && !hasConfigOptions) {
+        throw new Error(`Hermes native session ${requestedSessionId} could not be resumed: empty session/load response`)
+    }
 }
 
 export function parseHermesModelSlashCommand(text: string): string | null {
@@ -247,9 +301,10 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             }
             const activeBackend = this.backend ?? backend
             const metadata = activeBackend.getSessionModelsMetadata(acpSessionId)
-            const currentModelId = this.currentBackendModel ?? metadata?.currentModelId ?? null
-            const configuredModels = resolveHermesConfigModels(undefined, currentModelId)
+            const rawCurrentModelId = this.currentBackendModel ?? metadata?.currentModelId ?? null
+            const configuredModels = resolveHermesConfigModels(undefined, rawCurrentModelId, metadata?.availableModels)
             const availableModels = configuredModels ?? metadata?.availableModels ?? []
+            const currentModelId = normalizeHermesCurrentModelId(rawCurrentModelId, availableModels)
             if (availableModels.length === 0) {
                 return { success: false, error: 'Hermes model metadata is not available' }
             }
@@ -268,12 +323,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             const resumeSessionId = this.session.sessionId
             if (resumeSessionId) {
                 try {
-                    await backend.loadSession({
-                        sessionId: resumeSessionId,
-                        cwd: this.session.path,
-                        mcpServers: acpMcpServers
-                    })
-                    acpSessionId = resumeSessionId
+                    acpSessionId = await this.loadHermesSession(backend, resumeSessionId, acpMcpServers)
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error)
                     logger.warn('[hermes-acp] loadSession failed', error)
@@ -301,6 +351,10 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         this.initialBackendModel = discoveredModel
         this.currentBackendModel = discoveredModel
         this.currentBackendModelRevision = initialRevision
+
+        // Register ACP approval handling before restoring the requested model so any
+        // model-switch confirmation prompt from Hermes is surfaced instead of cancelled.
+        this.permissionHandler = this.createPermissionHandler(backend)
 
         if (this.opts.model && this.opts.model !== discoveredModel) {
             try {
@@ -330,7 +384,6 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             this.session.client.emitSessionReady()
         }
 
-        this.permissionHandler = this.createPermissionHandler(backend)
         this.setupAbortHandlers(this.session.client.rpcHandlerManager, {
             onAbort: () => this.handleAbort(),
             onSwitch: () => this.handleExitFromUi()
@@ -343,7 +396,11 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         let retryDelay = 1000
         let consecutiveReconnects = 0
         const modelRetryState: {
-            failedSelection: { requestedModel: string | null | undefined; revision: number | undefined } | null
+            failedSelection: {
+                requestedModel: string | null | undefined
+                revision: number | undefined
+                rollbackModel?: string | null
+            } | null
             delayMs: number
         } = { failedSelection: null, delayMs: 1000 }
         const recoverFromClosedTransport = async (
@@ -572,8 +629,13 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 const shouldNotify = prev === null
                     || prev.requestedModel !== requested
                     || prev.revision !== effectiveModelRevision
-                modelRetryState.failedSelection = { requestedModel: requested, revision: effectiveModelRevision }
-                this.opts.onModelRollback?.(this.currentBackendModel, effectiveModelRevision)
+                const rollbackModel = this.currentBackendModel
+                modelRetryState.failedSelection = {
+                    requestedModel: requested,
+                    revision: effectiveModelRevision,
+                    rollbackModel
+                }
+                this.opts.onModelRollback?.(rollbackModel, effectiveModelRevision)
                 if (shouldNotify) {
                     const notice = requested === null
                         ? `Hermes model reset to Default (${label}) failed. Prompt remains queued — choose a usable model or cancel it: ${message}`
@@ -599,6 +661,30 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
             }
 
             const recoveringFailedSwitch = this.pendingModelFailure !== null || modelRetryState.failedSelection !== null
+            const publishRecoveredModel = (recoveredModel: string | null) => {
+                if (!recoveringFailedSwitch) return
+                this.opts.onModelChanged?.(recoveredModel, effectiveModelRevision)
+                const failedRollback = modelRetryState.failedSelection
+                if (
+                    effectiveModelRevision !== undefined
+                    && failedRollback?.revision === effectiveModelRevision
+                    && failedRollback.rollbackModel !== undefined
+                ) {
+                    this.session.queue.updateQueuedModes((queuedMode) => {
+                        const queuedModel = queuedMode.model ?? null
+                        if (
+                            queuedMode.modelRevision === effectiveModelRevision
+                            && queuedModel === failedRollback.rollbackModel
+                        ) {
+                            return {
+                                ...queuedMode,
+                                model: recoveredModel
+                            }
+                        }
+                        return null
+                    })
+                }
+            }
             const isStaleBatchModel = !bypassStaleCheck && effectiveModelRevision !== undefined && (
                 (this.currentBackendModelRevision !== undefined && effectiveModelRevision < this.currentBackendModelRevision)
                 || (this.slashOverridePickerRevision !== undefined && effectiveModelRevision <= this.slashOverridePickerRevision)
@@ -610,9 +696,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                             await backend.setModel(acpSessionId, this.initialBackendModel, { flavor: 'hermes' })
                             this.currentBackendModel = this.initialBackendModel
                             this.recordAppliedModelRevision(effectiveModelRevision)
-                            if (recoveringFailedSwitch) {
-                                this.opts.onModelChanged?.(null, effectiveModelRevision)
-                            }
+                            publishRecoveredModel(null)
                             this.messageBuffer.addMessage(`[MODEL:${this.initialBackendModel}]`, 'system')
                         } catch (err) {
                             if (isClosedTransportError(backend, err)) {
@@ -631,18 +715,14 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                         }
                     } else {
                         this.recordAppliedModelRevision(effectiveModelRevision)
-                        if (recoveringFailedSwitch) {
-                            this.opts.onModelChanged?.(null, effectiveModelRevision)
-                        }
+                        publishRecoveredModel(null)
                     }
                 } else if (requestedModel && requestedModel !== this.currentBackendModel) {
                     try {
                         await backend.setModel(acpSessionId, requestedModel, { flavor: 'hermes' })
                         this.currentBackendModel = requestedModel
                         this.recordAppliedModelRevision(effectiveModelRevision)
-                        if (recoveringFailedSwitch) {
-                            this.opts.onModelChanged?.(requestedModel, effectiveModelRevision)
-                        }
+                        publishRecoveredModel(requestedModel)
                         this.messageBuffer.addMessage(`[MODEL:${requestedModel}]`, 'system')
                     } catch (err) {
                         if (isClosedTransportError(backend, err)) {
@@ -661,9 +741,7 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                     }
                 } else {
                     this.recordAppliedModelRevision(effectiveModelRevision)
-                    if (recoveringFailedSwitch) {
-                        this.opts.onModelChanged?.(requestedModel ?? null, effectiveModelRevision)
-                    }
+                    publishRecoveredModel(requestedModel ?? null)
                 }
             }
             this.pendingModelFailure = null
@@ -787,6 +865,23 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         })
     }
 
+    private async loadHermesSession(
+        backend: ReturnType<typeof createHermesBackend>,
+        sessionId: string,
+        acpMcpServers: McpServerStdio[]
+    ): Promise<string> {
+        const loadedSessionId = await backend.loadSession({
+            sessionId,
+            cwd: this.session.path,
+            mcpServers: acpMcpServers,
+            validateResponse: (response) => validateHermesLoadSessionResponse(response, sessionId)
+        })
+        if (loadedSessionId !== sessionId) {
+            throw new Error(`Hermes resumed unexpected session ${loadedSessionId} instead of ${sessionId}`)
+        }
+        return loadedSessionId
+    }
+
     private async reconnectBackend(
         acpSessionId: string,
         acpMcpServers: McpServerStdio[],
@@ -803,14 +898,11 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
         this.backend = nextBackend
         this.attachBackendListeners(nextBackend, titleSync)
         await nextBackend.initialize()
-        await nextBackend.loadSession({
-            sessionId: acpSessionId,
-            cwd: this.session.path,
-            mcpServers: acpMcpServers
-        })
+        await this.loadHermesSession(nextBackend, acpSessionId, acpMcpServers)
         const discoveredModel = nextBackend.getSessionModelsMetadata(acpSessionId)?.currentModelId ?? null
         const desiredModel = this.currentBackendModel
         this.currentBackendModel = discoveredModel
+        this.permissionHandler = this.createPermissionHandler(nextBackend)
         if (desiredModel && desiredModel !== discoveredModel) {
             try {
                 await nextBackend.setModel(acpSessionId, desiredModel, { flavor: 'hermes' })
@@ -829,7 +921,6 @@ export class HermesRemoteLauncher extends RemoteLauncherBase {
                 this.messageBuffer.addMessage(notice, 'status')
             }
         }
-        this.permissionHandler = this.createPermissionHandler(nextBackend)
         return nextBackend
     }
 
